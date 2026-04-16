@@ -14,4 +14,5 @@ tmp_*.sqlite3
 node_modules/
 .next/
 frontend/.next/
+*.tsbuildinfo
 2026-04-15-201450-you-are-an-expert-frontend-ui-designer-the-curre.txt
