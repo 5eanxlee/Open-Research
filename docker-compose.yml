@@ -1,0 +1,133 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: open_research
+      POSTGRES_USER: open_research
+      POSTGRES_PASSWORD: open_research
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U open_research -d open_research"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  temporal:
+    image: temporalio/auto-setup:1.27
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB: postgresql
+      DB_PORT: 5432
+      POSTGRES_USER: open_research
+      POSTGRES_PWD: open_research
+      POSTGRES_SEEDS: postgres
+    ports:
+      - "7233:7233"
+
+  temporal-ui:
+    image: temporalio/ui:2.37.2
+    depends_on:
+      - temporal
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+    ports:
+      - "8088:8080"
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.120.0
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./deploy/otel-collector.yaml:/etc/otel-collector-config.yaml:ro
+    ports:
+      - "4318:4318"
+
+  api:
+    build:
+      context: .
+    command: ["uvicorn", "open_research.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      temporal:
+        condition: service_started
+      otel-collector:
+        condition: service_started
+    environment:
+      OPEN_RESEARCH_PROCESS_ROLE: api
+      OPEN_RESEARCH_DATABASE_URL: postgresql+asyncpg://open_research:open_research@postgres:5432/open_research
+      OPEN_RESEARCH_WORKFLOW_BACKEND: temporal
+      OPEN_RESEARCH_TEMPORAL_TARGET_URL: temporal:7233
+      OPEN_RESEARCH_DATABASE_BOOTSTRAP_MODE: alembic
+      OPEN_RESEARCH_OTLP_ENDPOINT: http://otel-collector:4318/v1/traces
+      OPEN_RESEARCH_ARTIFACT_STORE_BACKEND: local
+      OPEN_RESEARCH_ARTIFACT_STORE_PATH: /app/data/artifacts
+    ports:
+      - "8000:8000"
+    read_only: true
+    tmpfs:
+      - /tmp
+    volumes:
+      - artifacts-data:/app/data
+    healthcheck:
+      test: ["CMD-SHELL", "python - <<'PY'\nimport urllib.request\nurllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=3)\nPY"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  frontend:
+    build:
+      context: ./frontend
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: http://api:8000
+    ports:
+      - "3000:3000"
+    read_only: true
+    tmpfs:
+      - /tmp
+
+  worker:
+    build:
+      context: .
+    command: ["python", "-m", "open_research.worker_main"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      temporal:
+        condition: service_started
+      otel-collector:
+        condition: service_started
+    environment:
+      OPEN_RESEARCH_PROCESS_ROLE: worker
+      OPEN_RESEARCH_DATABASE_URL: postgresql+asyncpg://open_research:open_research@postgres:5432/open_research
+      OPEN_RESEARCH_WORKFLOW_BACKEND: temporal
+      OPEN_RESEARCH_TEMPORAL_TARGET_URL: temporal:7233
+      OPEN_RESEARCH_DATABASE_BOOTSTRAP_MODE: alembic
+      OPEN_RESEARCH_OTLP_ENDPOINT: http://otel-collector:4318/v1/traces
+      OPEN_RESEARCH_ARTIFACT_STORE_BACKEND: local
+      OPEN_RESEARCH_ARTIFACT_STORE_PATH: /app/data/artifacts
+    read_only: true
+    tmpfs:
+      - /tmp
+    volumes:
+      - artifacts-data:/app/data
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    profiles: ["observability"]
+    command: ["--config.file=/etc/prometheus/prometheus.yml"]
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+
+volumes:
+  postgres-data:
+  artifacts-data:

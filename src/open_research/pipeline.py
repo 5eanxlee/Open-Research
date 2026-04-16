@@ -1,0 +1,3686 @@
+from __future__ import annotations
+
+import asyncio
+from abc import ABC, abstractmethod
+from collections import Counter, defaultdict
+from collections.abc import Sequence
+from time import perf_counter
+from typing import Any
+
+from langgraph.graph import END, START, StateGraph
+from pydantic import BaseModel
+from typing_extensions import TypedDict
+
+from .artifacts import ArtifactPayload, ArtifactStore
+from .citations import (
+    CitationCandidate,
+    audit_citation_candidates,
+    build_citation_key,
+)
+from .config import Settings
+from .db import ResearchStore
+from .domain import (
+    AgentConfig,
+    BudgetPolicy,
+    BudgetRecommendationRationale,
+    CitationAuditDecision,
+    CitationRecord,
+    CitationSupportLabel,
+    ClaimVerification,
+    ContextPack,
+    ContextPhase,
+    DraftReport,
+    ExecutionMode,
+    FetchedDocument,
+    FinalReport,
+    GapAnalysis,
+    MemoryInfluencePolicy,
+    ModelConfig,
+    NoteDraft,
+    PlanningArtifact,
+    PlanningDiscoveryRecord,
+    PlanningStage,
+    PlanPreview,
+    RecommendedBudget,
+    ResearchAssetRecord,
+    ResearchAssetType,
+    ResearchAssetUsage,
+    ReportSection,
+    ResearchPlan,
+    ResearchStreamPlan,
+    ResearchStreamView,
+    RetrievalMethod,
+    RetrievedPassage,
+    RunStatus,
+    SourceKind,
+    StreamStatus,
+    TaskStatus,
+    resolve_model_config,
+)
+from .events import RunEventService
+from .memory import (
+    BehaviorJudge,
+    ContextAssembler,
+    MemoryCompiler,
+    query_hints_from_pack,
+    render_context_pack,
+)
+from .observability import ResearchTelemetry
+from .prompting import (
+    SOURCE_TRUST_POLICY_VERSION,
+    assess_source_trust,
+    build_source_prompt_context,
+    claim_verifier_system_prompt,
+    note_writer_system_prompt,
+    planner_system_prompt,
+    report_writer_system_prompt,
+    resolve_agent_config,
+)
+from .providers import (
+    EmbeddingProvider,
+    FetchProvider,
+    GenerationResult,
+    OpenAIJsonClient,
+    PassageReranker,
+    SearchProvider,
+    UsageInfo,
+)
+from .utils import (
+    chunk_text,
+    clean_text,
+    dedupe_preserve_order,
+    domain_for_url,
+    extract_sentences,
+    normalize_url,
+    tokenize,
+)
+
+
+class Planner(ABC):
+    @abstractmethod
+    async def create_plan(
+        self,
+        question: str,
+        budget: BudgetPolicy,
+        *,
+        planning_stage: PlanningStage = PlanningStage.EXECUTION,
+        agent_config: AgentConfig | None = None,
+        model_config: ModelConfig | None = None,
+        prior_notes: Sequence[dict[str, Any]] | None = None,
+        context_pack: ContextPack | None = None,
+        replan_count: int = 0,
+        approved_plan: ResearchPlan | None = None,
+        available_documents: Sequence[ResearchAssetRecord] | None = None,
+        source_selection: Sequence[str] | None = None,
+        min_total_sources_retrieved: int = 0,
+        min_total_cited_sources: int = 0,
+    ) -> GenerationResult[ResearchPlan]:
+        raise NotImplementedError
+
+
+class NoteWriter(ABC):
+    @abstractmethod
+    async def write_note(
+        self,
+        *,
+        question: str,
+        stream: ResearchStreamPlan,
+        document: FetchedDocument,
+        agent_config: AgentConfig | None = None,
+        model_config: ModelConfig | None = None,
+        context_pack: ContextPack | None = None,
+    ) -> GenerationResult[NoteDraft]:
+        raise NotImplementedError
+
+
+class GapAnalyzer(ABC):
+    @abstractmethod
+    async def analyze(
+        self,
+        *,
+        question: str,
+        plan: ResearchPlan,
+        notes: Sequence[dict[str, Any]],
+        budget: BudgetPolicy,
+        replan_count: int,
+        model_config: ModelConfig | None = None,
+    ) -> GenerationResult[GapAnalysis]:
+        raise NotImplementedError
+
+
+class ReportWriter(ABC):
+    @abstractmethod
+    async def write_report(
+        self,
+        *,
+        question: str,
+        plan: ResearchPlan,
+        notes: Sequence[dict[str, Any]],
+        agent_config: AgentConfig | None = None,
+        model_config: ModelConfig | None = None,
+        context_pack: ContextPack | None = None,
+    ) -> GenerationResult[DraftReport]:
+        raise NotImplementedError
+
+
+class ClaimVerifier(ABC):
+    @abstractmethod
+    async def verify(
+        self,
+        *,
+        claim: str,
+        candidates: Sequence[RetrievedPassage],
+        agent_config: AgentConfig | None = None,
+        model_config: ModelConfig | None = None,
+    ) -> GenerationResult[ClaimVerification]:
+        raise NotImplementedError
+
+
+class RunCancelledError(RuntimeError):
+    pass
+
+
+def _default_model_config(settings: Settings) -> ModelConfig:
+    return ModelConfig(
+        lead_model=settings.lead_model,
+        planner_model=settings.planner_model,
+        worker_model=settings.worker_model,
+        verifier_model=settings.verifier_model,
+        embedding_model=settings.embedding_model,
+        reranker_model=settings.reranker_model,
+    )
+
+
+def _derive_recommended_budget(
+    *,
+    question: str,
+    budget: BudgetPolicy,
+    stream_count: int,
+    replan_count: int,
+    prior_notes: Sequence[dict[str, Any]] | None = None,
+) -> tuple[RecommendedBudget, BudgetRecommendationRationale, list[str], ExecutionMode]:
+    lowered = clean_text(question).lower()
+    complexity_factors: list[str] = []
+    if any(token in lowered for token in ("compare", "vs", "versus", "tradeoff", "benchmark")):
+        complexity_factors.append("comparative_analysis")
+    if any(token in lowered for token in ("latest", "recent", "today", "current", "news")):
+        complexity_factors.append("recency_sensitive")
+    if any(token in lowered for token in ("risk", "failure", "security", "compliance", "audit")):
+        complexity_factors.append("adversarial_checks")
+    if any(token in lowered for token in ("global", "regional", "enterprise", "stakeholder")):
+        complexity_factors.append("multi_axis_scope")
+    if len(lowered.split()) > 18:
+        complexity_factors.append("broad_question")
+    unresolved = [
+        item
+        for note in (prior_notes or [])
+        for item in note.get("open_questions", [])
+        if item
+    ]
+    if unresolved:
+        complexity_factors.append("open_gaps")
+
+    recommended_streams = min(
+        budget.max_streams,
+        max(stream_count, 3 + len(complexity_factors)),
+    )
+    recommended_queries = min(
+        budget.max_queries_per_stream,
+        max(3, 3 + min(len(complexity_factors), 4)),
+    )
+    recommended_sources = min(
+        budget.max_sources_per_stream,
+        max(3, 2 + min(len(complexity_factors), 3)),
+    )
+    execution_mode = (
+        ExecutionMode.DEEP if len(complexity_factors) >= 2 or recommended_streams >= 6 else ExecutionMode.STANDARD
+    )
+    rationale = BudgetRecommendationRationale(
+        summary=(
+            "Recommended budget expands when the question needs comparison, recency, "
+            "adversarial checks, or wider source diversity."
+        ),
+        coverage_axes=list(complexity_factors),
+        evidence_gaps=dedupe_preserve_order(unresolved)[:5],
+        source_diversity_reasoning=(
+            "Multiple streams and higher source caps are warranted when disagreement or "
+            "multi-axis coverage is likely."
+        ),
+        grounding_difficulty=(
+            "Higher complexity increases the chance that claims need narrower evidence and "
+            "more retrieval candidates."
+        ),
+    )
+    recommended_budget = RecommendedBudget(
+        max_streams=recommended_streams,
+        max_replans=min(budget.max_replans, max(1 if unresolved else 0, replan_count)),
+        max_queries_per_stream=recommended_queries,
+        max_results_per_query=budget.max_results_per_query,
+        max_sources_per_stream=recommended_sources,
+        per_domain_limit=min(budget.per_domain_limit, 3),
+        rationale_summary=rationale.summary,
+    )
+    return recommended_budget, rationale, complexity_factors, execution_mode
+
+
+def _summarize_available_documents(
+    assets: Sequence[ResearchAssetRecord] | None,
+) -> list[str]:
+    summaries: list[str] = []
+    for asset in assets or []:
+        location = "project corpus" if asset.project_id else "run attachment"
+        descriptor = f"{asset.label} ({location}, {asset.usage.value})"
+        if asset.description:
+            descriptor += f": {asset.description}"
+        elif asset.preview_excerpt:
+            descriptor += f": {asset.preview_excerpt}"
+        summaries.append(descriptor)
+    return summaries
+
+
+def _build_discovery_queries(
+    *,
+    question: str,
+    budget: BudgetPolicy,
+    approved_plan: ResearchPlan | None,
+    available_documents: Sequence[ResearchAssetRecord] | None,
+    max_queries: int,
+) -> list[str]:
+    queries = [question]
+    if approved_plan is not None:
+        for stream in approved_plan.streams:
+            if stream.objective not in queries:
+                queries.append(stream.objective)
+            for query in stream.queries:
+                if query not in queries:
+                    queries.append(query)
+    document_terms = [
+        asset.label
+        for asset in available_documents or []
+        if asset.usage == ResearchAssetUsage.PLANNING_CONTEXT
+    ]
+    if document_terms:
+        queries.append(f"{question} {' '.join(document_terms[:3])}".strip())
+    queries.extend(
+        [
+            f"{question} official documentation",
+            f"{question} recent developments",
+            f"{question} disagreement analysis",
+        ]
+    )
+    return dedupe_preserve_order(queries)[: max(1, min(max_queries, budget.max_queries_per_stream))]
+
+
+def _derive_source_floor_targets(
+    *,
+    budget: BudgetPolicy,
+    stream_count: int,
+    minimum_retrieved: int,
+    minimum_cited: int,
+) -> tuple[int, int]:
+    max_possible_sources = max(1, budget.max_streams * budget.max_sources_per_stream)
+    retrieved_target = max(stream_count * 2, minimum_retrieved)
+    retrieved_floor = min(max_possible_sources, max(1, retrieved_target))
+    cited_floor = min(
+        retrieved_floor,
+        max(1, max(minimum_cited, min(max(stream_count, 3), retrieved_floor))),
+    )
+    return retrieved_floor, cited_floor
+
+
+def _build_planning_artifact(
+    *,
+    stage: PlanningStage,
+    question: str,
+    plan: ResearchPlan,
+    available_documents: Sequence[ResearchAssetRecord] | None,
+    discovery_records: Sequence[PlanningDiscoveryRecord],
+    source_selection: Sequence[str] | None,
+    min_total_sources_retrieved: int,
+    min_total_cited_sources: int,
+    approved_preview_version: int | None = None,
+) -> PlanningArtifact:
+    toc = dedupe_preserve_order(
+        [stream.name for stream in plan.streams]
+        + list(plan.success_criteria)
+    )[:8]
+    constraints = dedupe_preserve_order(
+        [
+            "Respect runtime budget caps and source selection.",
+            "Use uploaded planning context to shape stream priorities.",
+            "Maintain enough source diversity for later grounding and citation audit.",
+            *(
+                plan.budget_rationale.coverage_axes
+                if plan.budget_rationale is not None
+                else []
+            ),
+        ]
+    )[:10]
+    deliverables = dedupe_preserve_order(
+        [
+            "Validated execution plan",
+            "Parallel research streams",
+            "Grounded report sections",
+            "Audited citations",
+            *plan.success_criteria,
+        ]
+    )[:10]
+    key_questions = dedupe_preserve_order(
+        [question, *plan.complexity_factors]
+        + [stream.objective for stream in plan.streams]
+    )[:12]
+    validation_checks = [
+        "Each stream has a distinct objective and at least one executable query.",
+        "Planning artifact reflects uploaded documents and source constraints.",
+        "Discovery evidence supports the chosen coverage axes.",
+        "Recommended budget is consistent with stream breadth and query depth.",
+        "Source floors are feasible under runtime caps.",
+    ]
+    return PlanningArtifact(
+        stage=stage,
+        approved_preview_version=approved_preview_version,
+        task_breakdown=(
+            "Search-before-plan discovery, stream design, query packaging, and validation "
+            "before research execution."
+        ),
+        table_of_contents=toc,
+        constraints=constraints,
+        planned_deliverables=deliverables,
+        key_questions=key_questions,
+        available_documents=_summarize_available_documents(available_documents),
+        discovery_queries=[record.query for record in discovery_records],
+        discovery_records=list(discovery_records),
+        source_selection=list(source_selection or []),
+        min_total_sources_retrieved=min_total_sources_retrieved,
+        min_total_cited_sources=min_total_cited_sources,
+        validation_checks=validation_checks,
+    )
+
+
+def _bound_streams_to_budget(
+    streams: Sequence[ResearchStreamPlan],
+    *,
+    budget: BudgetPolicy,
+    worker_model: str,
+    stream_limit: int | None = None,
+) -> list[ResearchStreamPlan]:
+    bounded_streams: list[ResearchStreamPlan] = []
+    max_streams = min(budget.max_streams, stream_limit or budget.max_streams)
+    for stream in streams[:max_streams]:
+        queries = dedupe_preserve_order([query.strip() for query in stream.queries if query.strip()])
+        bounded_queries = queries[: budget.max_queries_per_stream]
+        if not bounded_queries:
+            fallback_query = clean_text(stream.objective) or clean_text(stream.name) or "research"
+            bounded_queries = [fallback_query]
+        bounded_streams.append(
+            stream.model_copy(
+                update={
+                    "queries": bounded_queries,
+                    "model": stream.model or worker_model,
+                }
+            )
+        )
+    return bounded_streams
+
+
+def _validate_research_plan(
+    *,
+    plan: ResearchPlan,
+    budget: BudgetPolicy,
+    stage: PlanningStage,
+    min_total_sources_retrieved: int,
+    min_total_cited_sources: int,
+) -> list[str]:
+    issues: list[str] = []
+    if not plan.summary.strip():
+        issues.append("Plan summary is empty.")
+    if not plan.hypothesis.strip():
+        issues.append("Plan hypothesis is empty.")
+    if not plan.streams:
+        issues.append("Plan must contain at least one stream.")
+    seen_stream_names: set[str] = set()
+    for stream in plan.streams:
+        if not stream.name.strip():
+            issues.append("Every stream must have a name.")
+        if stream.name in seen_stream_names:
+            issues.append(f"Duplicate stream name: {stream.name}")
+        seen_stream_names.add(stream.name)
+        if not stream.objective.strip():
+            issues.append(f"Stream {stream.name!r} is missing an objective.")
+        if not stream.queries:
+            issues.append(f"Stream {stream.name!r} must include at least one query.")
+        if len(stream.queries) > budget.max_queries_per_stream:
+            issues.append(
+                f"Stream {stream.name!r} exceeds max_queries_per_stream={budget.max_queries_per_stream}."
+            )
+    if len(plan.streams) > budget.max_streams:
+        issues.append(f"Plan exceeds max_streams={budget.max_streams}.")
+    if len(plan.success_criteria) < 2:
+        issues.append("Plan should declare at least two success criteria.")
+    artifact = plan.planning_artifact
+    if artifact is None:
+        issues.append("Plan is missing a planning artifact.")
+    else:
+        if artifact.stage != stage:
+            issues.append(
+                f"Planning artifact stage {artifact.stage.value!r} does not match {stage.value!r}."
+            )
+        if stage in {PlanningStage.EXECUTION, PlanningStage.REPLAN}:
+            if not artifact.discovery_queries:
+                issues.append("Execution planning must record discovery queries.")
+            if not artifact.discovery_records:
+                issues.append("Execution planning must record discovery findings.")
+            if not artifact.constraints:
+                issues.append("Execution planning must include constraints.")
+            if not artifact.table_of_contents:
+                issues.append("Execution planning must include a table of contents.")
+        if artifact.min_total_sources_retrieved < min_total_sources_retrieved:
+            issues.append("Planning artifact undershoots the minimum retrieved-source floor.")
+        if artifact.min_total_cited_sources < min_total_cited_sources:
+            issues.append("Planning artifact undershoots the minimum cited-source floor.")
+    return dedupe_preserve_order(issues)
+
+
+class HeuristicPlanner(Planner):
+    def __init__(self, *, worker_model: str, max_streams: int) -> None:
+        self.worker_model = worker_model
+        self.max_streams = max_streams
+
+    async def create_plan(
+        self,
+        question: str,
+        budget: BudgetPolicy,
+        *,
+        planning_stage: PlanningStage = PlanningStage.EXECUTION,
+        agent_config: AgentConfig | None = None,
+        model_config: ModelConfig | None = None,
+        prior_notes: Sequence[dict[str, Any]] | None = None,
+        context_pack: ContextPack | None = None,
+        replan_count: int = 0,
+        approved_plan: ResearchPlan | None = None,
+        available_documents: Sequence[ResearchAssetRecord] | None = None,
+        source_selection: Sequence[str] | None = None,
+        min_total_sources_retrieved: int = 0,
+        min_total_cited_sources: int = 0,
+    ) -> GenerationResult[ResearchPlan]:
+        prior_notes = prior_notes or []
+        core = clean_text(question.rstrip("?"))
+        query_hints = query_hints_from_pack(context_pack)
+        worker_model = model_config.worker_model if model_config is not None else self.worker_model
+        streams: list[ResearchStreamPlan] = [
+            ResearchStreamPlan(
+                name="Core facts",
+                objective=(f"Establish the baseline facts and definitions relevant to: {core}."),
+                queries=[
+                    question,
+                    f"{core} official documentation",
+                    query_hints[0] if query_hints else f"{core} primary source",
+                ],
+                model=worker_model,
+            ),
+            ResearchStreamPlan(
+                name="Recent developments",
+                objective=(
+                    f"Find recent developments, updates, or changed assumptions about: {core}."
+                ),
+                queries=[
+                    f"{core} recent changes",
+                    f"{core} release notes",
+                    f"{core} latest official update",
+                ],
+                model=worker_model,
+            ),
+            ResearchStreamPlan(
+                name="Cross-checks",
+                objective=(
+                    "Collect corroborating sources and identify disagreements or open "
+                    f"questions for: {core}."
+                ),
+                queries=[
+                    query_hints[1] if len(query_hints) > 1 else f"{core} comparison analysis",
+                    f"{core} technical blog",
+                    f"{core} evidence",
+                ],
+                model=worker_model,
+            ),
+        ]
+
+        unresolved = dedupe_preserve_order(
+            question
+            for note in prior_notes
+            for question in note.get("open_questions", [])
+            if question
+        )
+        if unresolved and replan_count < budget.max_replans:
+            streams.append(
+                ResearchStreamPlan(
+                    name=f"Gap closure {replan_count + 1}",
+                    objective=(
+                        "Close the highest-value unresolved questions from the first research pass."
+                    ),
+                    queries=unresolved[: budget.max_queries_per_stream],
+                    model=worker_model,
+                )
+            )
+
+        streams = _bound_streams_to_budget(
+            streams,
+            budget=budget,
+            worker_model=worker_model,
+            stream_limit=self.max_streams,
+        )
+        recommended_budget, budget_rationale, complexity_factors, execution_mode = (
+            _derive_recommended_budget(
+                question=question,
+                budget=budget,
+                stream_count=len(streams),
+                replan_count=replan_count,
+                prior_notes=prior_notes,
+            )
+        )
+        retrieved_floor, cited_floor = _derive_source_floor_targets(
+            budget=budget,
+            stream_count=len(streams),
+            minimum_retrieved=max(4, min_total_sources_retrieved),
+            minimum_cited=max(3, min_total_cited_sources),
+        )
+        artifact = _build_planning_artifact(
+            stage=planning_stage,
+            question=question,
+            plan=ResearchPlan(
+                summary="placeholder",
+                hypothesis="placeholder",
+                streams=streams,
+                success_criteria=[
+                    "Every section should be supported by multiple grounded notes.",
+                    "The final report should surface remaining uncertainty explicitly.",
+                    "Recent or changed facts should be isolated from background context.",
+                ],
+                recommended_budget=recommended_budget,
+                budget_rationale=budget_rationale,
+                recommended_execution_mode=execution_mode,
+                approval_required=execution_mode == ExecutionMode.DEEP,
+                complexity_factors=complexity_factors,
+            ),
+            available_documents=available_documents,
+            discovery_records=[
+                PlanningDiscoveryRecord(
+                    query=query,
+                    provider="heuristic",
+                    result_count=0,
+                    summary="Heuristic planner seeded this query for later execution.",
+                )
+                for query in _build_discovery_queries(
+                    question=question,
+                    budget=budget,
+                    approved_plan=approved_plan,
+                    available_documents=available_documents,
+                    max_queries=max(2, min(4, budget.max_queries_per_stream)),
+                )
+            ]
+            if planning_stage != PlanningStage.PREVIEW
+            else [],
+            source_selection=source_selection,
+            min_total_sources_retrieved=retrieved_floor,
+            min_total_cited_sources=cited_floor,
+            approved_preview_version=approved_plan.planning_artifact.approved_preview_version
+            if approved_plan and approved_plan.planning_artifact
+            else None,
+        )
+        success_criteria = [
+            "Every section should be supported by multiple grounded notes.",
+            "The final report should surface remaining uncertainty explicitly.",
+            "Recent or changed facts should be isolated from background context.",
+        ]
+        return GenerationResult(
+            value=ResearchPlan(
+                summary=(
+                    f"Research {core} using parallel source streams with explicit cross-checking."
+                ),
+                hypothesis=(
+                    f"A reliable answer about {core} requires both baseline facts "
+                    "and current evidence."
+                ),
+                streams=streams,
+                success_criteria=success_criteria,
+                planning_artifact=artifact,
+                recommended_budget=recommended_budget,
+                budget_rationale=budget_rationale,
+                recommended_execution_mode=execution_mode,
+                approval_required=execution_mode == ExecutionMode.DEEP,
+                complexity_factors=complexity_factors,
+            ),
+            usage=UsageInfo(),
+        )
+
+
+class OpenAIPlanner(Planner):
+    def __init__(
+        self,
+        client: OpenAIJsonClient,
+        *,
+        planner_model: str,
+        worker_model: str,
+        search_provider: SearchProvider,
+        settings: Settings,
+    ) -> None:
+        self.client = client
+        self.planner_model = planner_model
+        self.worker_model = worker_model
+        self.search_provider = search_provider
+        self.settings = settings
+
+    async def _planning_discovery(
+        self,
+        *,
+        question: str,
+        budget: BudgetPolicy,
+        approved_plan: ResearchPlan | None,
+        available_documents: Sequence[ResearchAssetRecord] | None,
+        source_selection: Sequence[str] | None,
+    ) -> list[PlanningDiscoveryRecord]:
+        selected = set(source_selection or [])
+        allowed_search = selected or None
+        queries = _build_discovery_queries(
+            question=question,
+            budget=budget,
+            approved_plan=approved_plan,
+            available_documents=available_documents,
+            max_queries=self.settings.planner_max_discovery_queries,
+        )
+        queries = queries[: max(self.settings.planner_min_discovery_queries, len(queries))]
+        providers = getattr(self.search_provider, "providers", None)
+        discovery_records: list[PlanningDiscoveryRecord] = []
+        for query in queries[: self.settings.planner_max_discovery_queries]:
+            collected = []
+            if providers:
+                seen_urls: set[str] = set()
+                for provider in providers:
+                    if allowed_search is not None and provider.provider_name not in allowed_search:
+                        continue
+                    results = await provider.search(
+                        query,
+                        max_results=min(5, budget.max_results_per_query),
+                    )
+                    for result in results:
+                        normalized = normalize_url(str(result.url))
+                        if normalized in seen_urls:
+                            continue
+                        seen_urls.add(normalized)
+                        collected.append(result)
+                    if len(collected) >= min(5, budget.max_results_per_query):
+                        break
+            else:
+                if allowed_search is None or self.search_provider.provider_name in allowed_search:
+                    collected = await self.search_provider.search(
+                        query,
+                        max_results=min(5, budget.max_results_per_query),
+                    )
+            discovery_records.append(
+                PlanningDiscoveryRecord(
+                    query=query,
+                    provider=(
+                        ",".join(
+                            dedupe_preserve_order(result.provider for result in collected if result.provider)
+                        )
+                        if collected
+                        else None
+                    ),
+                    result_count=len(collected),
+                    titles=[result.title for result in collected[:3]],
+                    urls=[str(result.url) for result in collected[:3]],
+                    summary=(
+                        "No search results were retrieved during planner discovery."
+                        if not collected
+                        else " | ".join(
+                            f"{result.title} ({result.provider})" for result in collected[:3]
+                        )
+                    ),
+                )
+            )
+        return discovery_records
+
+    async def create_plan(
+        self,
+        question: str,
+        budget: BudgetPolicy,
+        *,
+        planning_stage: PlanningStage = PlanningStage.EXECUTION,
+        agent_config: AgentConfig | None = None,
+        model_config: ModelConfig | None = None,
+        prior_notes: Sequence[dict[str, Any]] | None = None,
+        context_pack: ContextPack | None = None,
+        replan_count: int = 0,
+        approved_plan: ResearchPlan | None = None,
+        available_documents: Sequence[ResearchAssetRecord] | None = None,
+        source_selection: Sequence[str] | None = None,
+        min_total_sources_retrieved: int = 0,
+        min_total_cited_sources: int = 0,
+    ) -> GenerationResult[ResearchPlan]:
+        effective_model_config = model_config or _default_model_config(self.settings)
+        effective_worker_model = effective_model_config.worker_model
+        effective_planner_model = effective_model_config.planner_model
+        note_context = _render_notes(prior_notes or [])
+        discovery_records = (
+            await self._planning_discovery(
+                question=question,
+                budget=budget,
+                approved_plan=approved_plan,
+                available_documents=available_documents,
+                source_selection=source_selection,
+            )
+            if planning_stage != PlanningStage.PREVIEW
+            else []
+        )
+        retrieved_floor, cited_floor = _derive_source_floor_targets(
+            budget=budget,
+            stream_count=max(len(approved_plan.streams), 1) if approved_plan is not None else 1,
+            minimum_retrieved=max(
+                self.settings.planner_min_total_sources_retrieved,
+                min_total_sources_retrieved,
+            ),
+            minimum_cited=max(
+                self.settings.planner_min_total_cited_sources,
+                min_total_cited_sources,
+            ),
+        )
+        prompt_bundle = planner_system_prompt(
+            settings=self.settings,
+            planner_model=effective_planner_model,
+            worker_model=effective_worker_model,
+            planning_stage=planning_stage,
+            available_documents=_summarize_available_documents(available_documents),
+            discovery_digest="\n".join(
+                f"- {record.query}: {record.summary or 'No summary'}"
+                for record in discovery_records
+            ),
+            source_selection=list(source_selection or []),
+            min_total_sources_retrieved=retrieved_floor,
+            min_total_cited_sources=cited_floor,
+            approved_plan_summary=(
+                approved_plan.model_dump_json(indent=2)
+                if approved_plan is not None
+                else None
+            ),
+            agent_config=agent_config,
+        )
+        available_documents_text = (
+            "\n".join(_summarize_available_documents(available_documents)) or "- none"
+        )
+        discovery_text = (
+            "\n".join(
+                f"- {record.query}: {record.summary or 'No summary'}"
+                for record in discovery_records
+            )
+            or "- no discovery performed"
+        )
+        approved_plan_text = (
+            approved_plan.model_dump_json(indent=2) if approved_plan is not None else "None"
+        )
+        prompt = (
+            f"Question:\n{question}\n\n"
+            f"Budget:\n{budget.model_dump_json(indent=2)}\n\n"
+            f"Prior notes:\n{note_context}\n\n"
+            f"Retrieved memory:\n{render_context_pack(context_pack)}\n\n"
+            f"Planning stage: {planning_stage.value}\n\n"
+            f"Selected sources: {list(source_selection or [])}\n\n"
+            f"Available documents:\n{available_documents_text}\n\n"
+            f"Planner discovery:\n{discovery_text}\n\n"
+            f"Minimum source floors:\n"
+            f"- Retrieved: {retrieved_floor}\n"
+            f"- Cited: {cited_floor}\n\n"
+            f"Approved plan context:\n{approved_plan_text}\n\n"
+            f"Replan count: {replan_count}\n"
+            f"Use worker model `{effective_worker_model}` for every stream."
+        )
+        plan_result = await self.client.generate_json(
+            model=effective_planner_model,
+            system_prompt=prompt_bundle.system_prompt,
+            user_prompt=prompt,
+            schema_model=ResearchPlan,
+            reasoning_effort="medium",
+        )
+        plan = plan_result.value
+        bounded_streams = _bound_streams_to_budget(
+            plan.streams,
+            budget=budget,
+            worker_model=effective_worker_model,
+        )
+        recommended_budget = plan.recommended_budget or RecommendedBudget(
+            max_streams=min(
+                budget.max_streams,
+                max(len(bounded_streams), min(len(bounded_streams) + 2, budget.max_streams)),
+            ),
+            max_replans=budget.max_replans,
+            max_queries_per_stream=min(
+                budget.max_queries_per_stream,
+                max((max(len(stream.queries) for stream in bounded_streams) if bounded_streams else 1), 3),
+            ),
+            max_results_per_query=budget.max_results_per_query,
+            max_sources_per_stream=budget.max_sources_per_stream,
+            per_domain_limit=budget.per_domain_limit,
+            rationale_summary="Planner-sized execution budget derived from the approved plan.",
+        )
+        budget_rationale = plan.budget_rationale or BudgetRecommendationRationale(
+            summary="Planner-sized execution budget derived from the approved plan.",
+            coverage_axes=plan.complexity_factors or ["plan_scoped_coverage"],
+            evidence_gaps=[],
+            source_diversity_reasoning="Stream count and query depth follow the plan breadth.",
+            grounding_difficulty="Claims should remain narrow enough for downstream verification.",
+        )
+        recommended_execution_mode = plan.recommended_execution_mode or (
+            ExecutionMode.DEEP
+            if len(bounded_streams) >= 6 or recommended_budget.max_queries_per_stream >= 6
+            else ExecutionMode.STANDARD
+        )
+        artifact = (
+            plan.planning_artifact.model_copy(
+                update={
+                    "stage": planning_stage,
+                    "approved_preview_version": (
+                        approved_plan.planning_artifact.approved_preview_version
+                        if approved_plan and approved_plan.planning_artifact is not None
+                        else plan.planning_artifact.approved_preview_version
+                    ),
+                    "available_documents": (
+                        plan.planning_artifact.available_documents
+                        or _summarize_available_documents(available_documents)
+                    ),
+                    "discovery_queries": (
+                        plan.planning_artifact.discovery_queries
+                        or [record.query for record in discovery_records]
+                    ),
+                    "discovery_records": (
+                        plan.planning_artifact.discovery_records or list(discovery_records)
+                    ),
+                    "source_selection": (
+                        plan.planning_artifact.source_selection or list(source_selection or [])
+                    ),
+                    "min_total_sources_retrieved": max(
+                        plan.planning_artifact.min_total_sources_retrieved,
+                        retrieved_floor,
+                    ),
+                    "min_total_cited_sources": max(
+                        plan.planning_artifact.min_total_cited_sources,
+                        cited_floor,
+                    ),
+                }
+            )
+            if plan.planning_artifact is not None
+            else _build_planning_artifact(
+                stage=planning_stage,
+                question=question,
+                plan=plan.model_copy(update={"streams": bounded_streams}),
+                available_documents=available_documents,
+                discovery_records=discovery_records,
+                source_selection=source_selection,
+                min_total_sources_retrieved=retrieved_floor,
+                min_total_cited_sources=cited_floor,
+                approved_preview_version=(
+                    approved_plan.planning_artifact.approved_preview_version
+                    if approved_plan and approved_plan.planning_artifact is not None
+                    else None
+                ),
+            )
+        )
+        return GenerationResult(
+            value=plan.model_copy(
+                update={
+                    "streams": bounded_streams,
+                    "planning_artifact": artifact,
+                    "recommended_budget": recommended_budget,
+                    "budget_rationale": budget_rationale,
+                    "recommended_execution_mode": recommended_execution_mode,
+                    "approval_required": plan.approval_required
+                    or recommended_execution_mode == ExecutionMode.DEEP,
+                    "complexity_factors": plan.complexity_factors
+                    or ["multi_stream_plan" if len(bounded_streams) > 1 else "single_stream_plan"],
+                }
+            ),
+            usage=plan_result.usage,
+            metadata={
+                **prompt_bundle.metadata(),
+                "planning_stage": planning_stage.value,
+                "discovery_query_count": len(discovery_records),
+            },
+        )
+
+
+class HeuristicNoteWriter(NoteWriter):
+    async def write_note(
+        self,
+        *,
+        question: str,
+        stream: ResearchStreamPlan,
+        document: FetchedDocument,
+        agent_config: AgentConfig | None = None,
+        model_config: ModelConfig | None = None,
+        context_pack: ContextPack | None = None,
+    ) -> GenerationResult[NoteDraft]:
+        sentences = extract_sentences(document.content, max_sentences=8)
+        key_facts = dedupe_preserve_order(sentences[:4])
+        summary = sentences[0] if sentences else clean_text(document.content[:280])
+        open_questions: list[str] = []
+        if len(key_facts) < 2:
+            open_questions.append(f"Find stronger corroboration for {stream.objective.lower()}")
+        return GenerationResult(
+            value=NoteDraft(
+                summary=summary,
+                key_facts=key_facts,
+                open_questions=open_questions,
+                confidence=min(0.9, 0.55 + (0.1 * len(key_facts))),
+            ),
+            usage=UsageInfo(),
+        )
+
+
+class OpenAINoteWriter(NoteWriter):
+    def __init__(self, client: OpenAIJsonClient, *, worker_model: str, settings: Settings) -> None:
+        self.client = client
+        self.worker_model = worker_model
+        self.settings = settings
+
+    async def write_note(
+        self,
+        *,
+        question: str,
+        stream: ResearchStreamPlan,
+        document: FetchedDocument,
+        agent_config: AgentConfig | None = None,
+        model_config: ModelConfig | None = None,
+        context_pack: ContextPack | None = None,
+    ) -> GenerationResult[NoteDraft]:
+        effective_worker_model = (
+            stream.model
+            or (model_config.worker_model if model_config is not None else self.worker_model)
+        )
+        source_context = build_source_prompt_context(document)
+        prompt_bundle = note_writer_system_prompt(
+            settings=self.settings,
+            agent_config=agent_config,
+            source_context=source_context,
+        )
+        prompt = (
+            f"Research question:\n{question}\n\n"
+            f"Stream objective:\n{stream.objective}\n\n"
+            f"Operational context:\n{render_context_pack(context_pack)}\n\n"
+            f"Source title: {document.title}\n"
+            f"Source URL: {document.canonical_url}\n\n"
+            f"Source content:\n{document.content[:12000]}"
+        )
+        note_result = await self.client.generate_json(
+            model=effective_worker_model,
+            system_prompt=prompt_bundle.system_prompt,
+            user_prompt=prompt,
+            schema_model=NoteDraft,
+            reasoning_effort="minimal",
+        )
+        note = note_result.value
+        return GenerationResult(
+            value=note.model_copy(
+                update={
+                    "key_facts": dedupe_preserve_order(note.key_facts)[:5],
+                    "open_questions": dedupe_preserve_order(note.open_questions)[:5],
+                }
+            ),
+            usage=note_result.usage,
+            metadata=prompt_bundle.metadata(),
+        )
+
+
+class HeuristicGapAnalyzer(GapAnalyzer):
+    def __init__(self, *, worker_model: str) -> None:
+        self.worker_model = worker_model
+
+    async def analyze(
+        self,
+        *,
+        question: str,
+        plan: ResearchPlan,
+        notes: Sequence[dict[str, Any]],
+        budget: BudgetPolicy,
+        replan_count: int,
+        model_config: ModelConfig | None = None,
+    ) -> GenerationResult[GapAnalysis]:
+        worker_model = model_config.worker_model if model_config is not None else self.worker_model
+        notes_by_stream: dict[str, int] = Counter(
+            note["stream_name"] for note in notes if note.get("stream_name")
+        )
+        unresolved = dedupe_preserve_order(
+            question for note in notes for question in note.get("open_questions", []) if question
+        )
+        if replan_count >= budget.max_replans:
+            return GenerationResult(
+                value=GapAnalysis(should_replan=False, rationale="Replan budget exhausted."),
+                usage=UsageInfo(),
+            )
+
+        if not notes:
+            return GenerationResult(
+                value=GapAnalysis(
+                    should_replan=True,
+                    rationale="The first pass did not produce any notes.",
+                    additional_streams=[
+                        ResearchStreamPlan(
+                            name=f"Gap closure {replan_count + 1}",
+                            objective=(
+                                "Recover from a weak first pass with broader evidence gathering."
+                            ),
+                            queries=[
+                                question,
+                                f"{question} official source",
+                                f"{question} documentation",
+                            ][: budget.max_queries_per_stream],
+                            model=worker_model,
+                        )
+                    ],
+                ),
+                usage=UsageInfo(),
+            )
+
+        weak_streams = []
+        for stream in plan.streams:
+            if notes_by_stream.get(stream.name, 0) == 0:
+                weak_streams.append(stream.objective)
+
+        if weak_streams or unresolved:
+            queries = unresolved[: budget.max_queries_per_stream]
+            if not queries:
+                queries = [f"{question} unresolved risks", f"{question} edge cases"]
+            return GenerationResult(
+                value=GapAnalysis(
+                    should_replan=True,
+                    rationale="Some streams produced weak coverage or left unresolved questions.",
+                    additional_streams=[
+                        ResearchStreamPlan(
+                            name=f"Gap closure {replan_count + 1}",
+                            objective=(
+                                "Resolve the most important missing evidence from the first pass."
+                            ),
+                            queries=queries,
+                            model=worker_model,
+                        )
+                    ],
+                ),
+                usage=UsageInfo(),
+            )
+
+        return GenerationResult(
+            value=GapAnalysis(
+                should_replan=False,
+                rationale="Coverage looks sufficient for synthesis.",
+            ),
+            usage=UsageInfo(),
+        )
+
+
+class HeuristicReportWriter(ReportWriter):
+    async def write_report(
+        self,
+        *,
+        question: str,
+        plan: ResearchPlan,
+        notes: Sequence[dict[str, Any]],
+        agent_config: AgentConfig | None = None,
+        model_config: ModelConfig | None = None,
+        context_pack: ContextPack | None = None,
+    ) -> GenerationResult[DraftReport]:
+        notes_by_stream: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for note in notes:
+            notes_by_stream[note.get("stream_name") or "Findings"].append(note)
+
+        sections: list[ReportSection] = []
+        all_facts: list[str] = []
+        open_questions: list[str] = []
+        for stream in plan.streams:
+            stream_notes = notes_by_stream.get(stream.name, [])
+            facts = dedupe_preserve_order(
+                fact for note in stream_notes for fact in note.get("key_facts", []) if fact
+            )[:4]
+            if not facts:
+                continue
+            all_facts.extend(facts)
+            open_questions.extend(
+                question for note in stream_notes for question in note.get("open_questions", [])
+            )
+            sections.append(
+                ReportSection(
+                    title=stream.name,
+                    overview=stream.objective,
+                    claims=facts,
+                )
+            )
+
+        known_streams = {stream.name for stream in plan.streams}
+        for stream_name, stream_notes in notes_by_stream.items():
+            if stream_name in known_streams:
+                continue
+            facts = dedupe_preserve_order(
+                fact for note in stream_notes for fact in note.get("key_facts", []) if fact
+            )[:4]
+            if not facts:
+                continue
+            sections.append(
+                ReportSection(
+                    title=stream_name,
+                    overview=(
+                        stream_notes[0].get("stream_objective") or f"Findings for {stream_name}."
+                    ),
+                    claims=facts,
+                )
+            )
+            all_facts.extend(facts)
+            open_questions.extend(
+                question for note in stream_notes for question in note.get("open_questions", [])
+            )
+
+        if not sections:
+            fallback_claims = [note["summary"] for note in notes[:4] if note.get("summary")]
+            sections.append(
+                ReportSection(
+                    title="Findings",
+                    overview=f"Initial findings for {question}.",
+                    claims=(
+                        fallback_claims or [f"No grounded findings were produced for: {question}."]
+                    ),
+                )
+            )
+            all_facts.extend(fallback_claims)
+
+        executive_summary = " ".join(dedupe_preserve_order(all_facts)[:3]) or sections[0].overview
+        if context_pack is not None:
+            preferred_style = next(
+                (
+                    fragment.metadata.get("profile_id")
+                    for fragment in context_pack.fragments
+                    if fragment.kind.value == "preference"
+                ),
+                None,
+            )
+            if preferred_style:
+                executive_summary = f"Profile {preferred_style}: {executive_summary}"
+        return GenerationResult(
+            value=DraftReport(
+                executive_summary=executive_summary,
+                sections=sections,
+                open_questions=dedupe_preserve_order(open_questions)[:6],
+            ),
+            usage=UsageInfo(),
+        )
+
+
+class OpenAIReportWriter(ReportWriter):
+    def __init__(self, client: OpenAIJsonClient, *, lead_model: str, settings: Settings) -> None:
+        self.client = client
+        self.lead_model = lead_model
+        self.settings = settings
+
+    async def write_report(
+        self,
+        *,
+        question: str,
+        plan: ResearchPlan,
+        notes: Sequence[dict[str, Any]],
+        agent_config: AgentConfig | None = None,
+        model_config: ModelConfig | None = None,
+        context_pack: ContextPack | None = None,
+    ) -> GenerationResult[DraftReport]:
+        effective_lead_model = (
+            model_config.lead_model if model_config is not None else self.lead_model
+        )
+        prompt_bundle = report_writer_system_prompt(
+            settings=self.settings,
+            agent_config=agent_config,
+        )
+        prompt = (
+            f"Question:\n{question}\n\n"
+            f"Plan:\n{plan.model_dump_json(indent=2)}\n\n"
+            f"Retrieved memory:\n{render_context_pack(context_pack)}\n\n"
+            f"Notes:\n{_render_notes(notes)}"
+        )
+        report_result = await self.client.generate_json(
+            model=effective_lead_model,
+            system_prompt=prompt_bundle.system_prompt,
+            user_prompt=prompt,
+            schema_model=DraftReport,
+            reasoning_effort="medium",
+        )
+        report = report_result.value
+        bounded_sections = [
+            section.model_copy(update={"claims": dedupe_preserve_order(section.claims)[:5]})
+            for section in report.sections[:8]
+        ]
+        return GenerationResult(
+            value=report.model_copy(
+                update={
+                    "sections": bounded_sections,
+                    "open_questions": dedupe_preserve_order(report.open_questions)[:8],
+                }
+            ),
+            usage=report_result.usage,
+            metadata=prompt_bundle.metadata(),
+        )
+
+
+class HeuristicClaimVerifier(ClaimVerifier):
+    async def verify(
+        self,
+        *,
+        claim: str,
+        candidates: Sequence[RetrievedPassage],
+        agent_config: AgentConfig | None = None,
+        model_config: ModelConfig | None = None,
+    ) -> GenerationResult[ClaimVerification]:
+        if not candidates:
+            return GenerationResult(
+                value=ClaimVerification(
+                    support_label=CitationSupportLabel.UNSUPPORTED,
+                    reason="No candidate passages were retrieved for this claim.",
+                    confidence=0.0,
+                ),
+                usage=UsageInfo(),
+            )
+        candidate = candidates[0]
+        if candidate.score >= 0.55:
+            label = CitationSupportLabel.SUPPORTED
+        elif candidate.score >= 0.3:
+            label = CitationSupportLabel.PARTIAL
+        else:
+            label = CitationSupportLabel.UNSUPPORTED
+        return GenerationResult(
+            value=ClaimVerification(
+                support_label=label,
+                reason=f"Top lexical overlap score: {candidate.score:.2f}",
+                selected_source_id=candidate.source_id,
+                selected_passage_index=candidate.passage_index,
+                quote=candidate.text[:240],
+                confidence=min(0.99, candidate.score),
+            ),
+            usage=UsageInfo(),
+        )
+
+
+class _ClaimVerificationSchema(BaseModel):
+    support_label: CitationSupportLabel
+    reason: str
+    selected_source_id: str | None = None
+    selected_passage_index: int | None = None
+    quote: str | None = None
+    confidence: float
+
+
+class OpenAIClaimVerifier(ClaimVerifier):
+    def __init__(
+        self,
+        client: OpenAIJsonClient,
+        *,
+        verifier_model: str,
+        settings: Settings,
+    ) -> None:
+        self.client = client
+        self.verifier_model = verifier_model
+        self.settings = settings
+
+    async def verify(
+        self,
+        *,
+        claim: str,
+        candidates: Sequence[RetrievedPassage],
+        agent_config: AgentConfig | None = None,
+        model_config: ModelConfig | None = None,
+    ) -> GenerationResult[ClaimVerification]:
+        if not candidates:
+            return GenerationResult(
+                value=ClaimVerification(
+                    support_label=CitationSupportLabel.UNSUPPORTED,
+                    reason="No candidate passages were available.",
+                    confidence=0.0,
+                ),
+                usage=UsageInfo(),
+            )
+        rendered_candidates = []
+        for candidate in candidates[:5]:
+            rendered_candidates.append(
+                {
+                    "source_id": candidate.source_id,
+                    "source_title": candidate.source_title,
+                    "source_url": str(candidate.source_url),
+                    "passage_index": candidate.passage_index,
+                    "score": candidate.score,
+                    "source_kind": (
+                        candidate.source_kind.value if candidate.source_kind is not None else None
+                    ),
+                    "retrieval_method": (
+                        candidate.retrieval_method.value
+                        if candidate.retrieval_method is not None
+                        else None
+                    ),
+                    "trust_tier": (
+                        candidate.trust_tier.value if candidate.trust_tier is not None else None
+                    ),
+                    "trust_rationale": candidate.trust_rationale,
+                    "text": candidate.text[:900],
+                }
+            )
+        prompt_bundle = claim_verifier_system_prompt(
+            settings=self.settings,
+            agent_config=agent_config,
+        )
+        effective_verifier_model = (
+            model_config.verifier_model if model_config is not None else self.verifier_model
+        )
+        result = await self.client.generate_json(
+            model=effective_verifier_model,
+            system_prompt=prompt_bundle.system_prompt,
+            user_prompt=f"Claim:\n{claim}\n\nCandidates:\n{rendered_candidates}",
+            schema_model=_ClaimVerificationSchema,
+            reasoning_effort="minimal",
+        )
+        return GenerationResult(
+            value=ClaimVerification.model_validate(result.value.model_dump(mode="json")),
+            usage=result.usage,
+            metadata=prompt_bundle.metadata(),
+        )
+
+
+class PassageRetriever:
+    def retrieve(
+        self,
+        claim: str,
+        passages: Sequence[dict[str, Any]],
+        *,
+        top_k: int = 5,
+    ) -> list[RetrievedPassage]:
+        claim_tokens = set(tokenize(claim))
+        if not claim_tokens:
+            return []
+        ranked: list[RetrievedPassage] = []
+        for passage in passages:
+            passage_tokens = set(tokenize(passage["text"]))
+            if not passage_tokens:
+                continue
+            overlap = len(claim_tokens & passage_tokens) / max(len(claim_tokens), 1)
+            density = len(claim_tokens & passage_tokens) / max(len(passage_tokens), 1)
+            exact_bonus = 0.2 if clean_text(claim).lower() in passage["text"].lower() else 0.0
+            score = round((0.75 * overlap) + (0.25 * density) + exact_bonus, 4)
+            if score <= 0:
+                continue
+            ranked.append(
+                RetrievedPassage(
+                    source_id=passage["source_id"],
+                    source_title=passage["source_title"],
+                    source_url=passage["source_url"],
+                    passage_index=passage["passage_index"],
+                    text=passage["text"],
+                    score=score,
+                )
+            )
+        return sorted(ranked, key=lambda item: item.score, reverse=True)[:top_k]
+
+
+class ResearchWorker:
+    def __init__(
+        self,
+        *,
+        store: ResearchStore,
+        events: RunEventService,
+        search_provider: SearchProvider,
+        fetch_provider: FetchProvider,
+        note_writer: NoteWriter,
+        artifact_store: ArtifactStore | None,
+        embedding_provider: EmbeddingProvider | None,
+        settings: Settings,
+        telemetry: ResearchTelemetry | None = None,
+        context_assembler: ContextAssembler | None = None,
+        memory_compiler: MemoryCompiler | None = None,
+    ) -> None:
+        self.store = store
+        self.events = events
+        self.search_provider = search_provider
+        self.fetch_provider = fetch_provider
+        self.note_writer = note_writer
+        self.artifact_store = artifact_store
+        self.embedding_provider = embedding_provider
+        self.settings = settings
+        self.telemetry = telemetry
+        self.context_assembler = context_assembler
+        self.memory_compiler = memory_compiler
+
+    async def _get_agent_config(self, run_id: str) -> AgentConfig:
+        state = await self.store.get_run_execution_state(run_id)
+        if state is None:
+            raise KeyError(f"Run {run_id} not found")
+        return resolve_agent_config(state.agent_config or state.metadata.get("agent_config"))
+
+    async def _get_model_config(self, run_id: str) -> ModelConfig:
+        state = await self.store.get_run_execution_state(run_id)
+        if state is None:
+            raise KeyError(f"Run {run_id} not found")
+        return resolve_model_config(
+            state.metadata.get("model_config") or state.metadata.get("model_config_override"),
+            defaults=_default_model_config(self.settings),
+        )
+
+    async def _get_run_profile(self, run_id: str) -> tuple[str, MemoryInfluencePolicy]:
+        state = await self.store.get_run_execution_state(run_id)
+        if state is None:
+            raise KeyError(f"Run {run_id} not found")
+        profile_id = state.profile_id or str(state.metadata.get("profile_id", "default"))
+        profile = await self.store.get_profile(profile_id)
+        base_policy = (
+            profile.preferences.memory_policy if profile is not None else MemoryInfluencePolicy()
+        )
+        override = state.metadata.get("memory_policy_override")
+        if override is not None:
+            return profile_id, MemoryInfluencePolicy.model_validate(override)
+        return profile_id, base_policy
+
+    async def _get_source_selection(
+        self,
+        run_id: str,
+    ) -> tuple[set[str] | None, set[str] | None]:
+        state = await self.store.get_run_execution_state(run_id)
+        if state is None:
+            raise KeyError(f"Run {run_id} not found")
+        selected = set(state.metadata.get("source_selection") or [])
+        if not selected:
+            return None, None
+        search_allowed = {
+            provider.provider_name
+            for provider in getattr(self.search_provider, "providers", [])
+            if provider.provider_name in selected
+        }
+        if not search_allowed and self.search_provider.provider_name in selected:
+            search_allowed = {self.search_provider.provider_name}
+        fetch_allowed = {
+            provider.provider_name
+            for provider in getattr(self.fetch_provider, "providers", [])
+            if provider.provider_name in selected
+        }
+        if not fetch_allowed and self.fetch_provider.provider_name in selected:
+            fetch_allowed = {self.fetch_provider.provider_name}
+        return search_allowed or None, fetch_allowed or None
+
+    async def _search(
+        self,
+        *,
+        run_id: str,
+        query: str,
+        max_results: int,
+        allowed_search: set[str] | None,
+    ) -> list[Any]:
+        providers = getattr(self.search_provider, "providers", None)
+        if providers:
+            aggregated: list[Any] = []
+            seen_urls: set[str] = set()
+            for provider in providers:
+                if allowed_search is not None and provider.provider_name not in allowed_search:
+                    continue
+                results = await provider.search(query, max_results=max_results)
+                for result in results:
+                    normalized = normalize_url(str(result.url))
+                    if normalized in seen_urls:
+                        continue
+                    seen_urls.add(normalized)
+                    aggregated.append(result)
+                    if len(aggregated) >= max_results:
+                        return aggregated
+            return aggregated
+        if allowed_search is not None and self.search_provider.provider_name not in allowed_search:
+            raise RuntimeError("Active search provider is not enabled for this run.")
+        return await self.search_provider.search(query, max_results=max_results)
+
+    async def _fetch(
+        self,
+        *,
+        run_id: str,
+        url: str,
+        allowed_fetch: set[str] | None,
+    ) -> FetchedDocument:
+        providers = getattr(self.fetch_provider, "providers", None)
+        if providers:
+            errors: list[str] = []
+            for provider in providers:
+                if allowed_fetch is not None and provider.provider_name not in allowed_fetch:
+                    continue
+                try:
+                    return await provider.fetch(url)
+                except Exception as exc:
+                    errors.append(f"{provider.provider_name}: {exc}")
+                    continue
+            raise RuntimeError("; ".join(errors) or "No fetch providers enabled for this run.")
+        if allowed_fetch is not None and self.fetch_provider.provider_name not in allowed_fetch:
+            raise RuntimeError("Active fetch provider is not enabled for this run.")
+        return await self.fetch_provider.fetch(url)
+
+    def _annotate_document_with_trust(self, document: FetchedDocument) -> FetchedDocument:
+        assessment = assess_source_trust(
+            url=str(document.canonical_url),
+            source_kind=document.source_kind,
+            title=document.title,
+            metadata=dict(document.metadata),
+        )
+        metadata = dict(document.metadata)
+        metadata["trust_tier"] = assessment.tier.value
+        metadata["trust_rationale"] = assessment.rationale
+        metadata["source_trust_policy_version"] = SOURCE_TRUST_POLICY_VERSION
+        return document.model_copy(update={"metadata": metadata})
+
+    async def _ensure_run_active(self, run_id: str) -> None:
+        state = await self.store.get_run_execution_state(run_id)
+        if state is None:
+            raise KeyError(f"Run {run_id} not found")
+        if state.cancel_requested:
+            raise RunCancelledError("Run cancellation was requested.")
+
+    async def _record_request_cost(
+        self,
+        *,
+        run_id: str,
+        category: str,
+        delta: int,
+        amount_usd: float,
+        metadata: dict[str, Any],
+        stream_id: str | None = None,
+    ) -> None:
+        event_metadata = dict(metadata)
+        if amount_usd:
+            event_metadata["estimated_cost_usd"] = amount_usd
+        await self.store.record_budget_event(run_id, category, delta, event_metadata)
+        await self.store.add_run_cost(run_id, amount_usd)
+        if stream_id is not None:
+            await self.store.add_stream_cost(stream_id, amount_usd)
+
+    async def _record_llm_usage(
+        self,
+        *,
+        run_id: str,
+        stream_id: str | None,
+        phase: str,
+        model: str,
+        usage: UsageInfo,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        if usage.total_tokens:
+            event_metadata = {
+                "phase": phase,
+                "model": model,
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+                "reasoning_tokens": usage.reasoning_tokens,
+                "estimated_cost_usd": usage.estimated_cost_usd,
+            }
+            if metadata:
+                event_metadata.update(metadata)
+            await self.store.record_budget_event(
+                run_id,
+                "llm_tokens",
+                usage.total_tokens,
+                event_metadata,
+            )
+        await self.store.add_run_cost(run_id, usage.estimated_cost_usd)
+        if stream_id is not None:
+            await self.store.add_stream_cost(stream_id, usage.estimated_cost_usd)
+
+    async def _embed_passages(
+        self,
+        *,
+        run_id: str,
+        stream_id: str | None,
+        source_id: str | None,
+        passages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        if not passages or self.embedding_provider is None:
+            return passages
+        embedding_result = await self.embedding_provider.embed_texts(
+            [passage["text"] for passage in passages]
+        )
+        await self._record_llm_usage(
+            run_id=run_id,
+            stream_id=stream_id,
+            phase="passage_embed",
+            model=getattr(
+                self.embedding_provider,
+                "model",
+                self.embedding_provider.provider_name,
+            ),
+            usage=embedding_result.usage,
+            metadata={"source_id": source_id},
+        )
+        vectors = embedding_result.value
+        if len(vectors) != len(passages):
+            raise RuntimeError("Embedding provider returned the wrong number of vectors.")
+        return [
+            {**passage, "embedding_vector": vector}
+            for passage, vector in zip(passages, vectors, strict=True)
+        ]
+
+    def _extract_artifact_payloads(
+        self,
+        document: FetchedDocument,
+    ) -> tuple[FetchedDocument, list[ArtifactPayload]]:
+        metadata = dict(document.metadata)
+        payloads = metadata.pop("_artifact_payloads", [])
+        artifact_payloads: list[ArtifactPayload] = [
+            payload for payload in payloads if isinstance(payload, ArtifactPayload)
+        ]
+        sanitized = document.model_copy(update={"metadata": metadata})
+        return sanitized, artifact_payloads
+
+    async def _register_search_results(
+        self,
+        *,
+        run_id: str,
+        query: str,
+        results: Sequence[Any],
+    ) -> None:
+        entries = [
+            {
+                "url": str(result.url),
+                "canonical_url": normalize_url(str(result.url)),
+                "normalized_url": normalize_url(str(result.url)),
+                "citation_key": build_citation_key(result.title, str(result.url)),
+                "title": result.title,
+                "provider": getattr(result, "provider", self.search_provider.provider_name),
+                "discovered_via": "search",
+                "metadata": {
+                    "query": query,
+                    "snippet": getattr(result, "snippet", ""),
+                    "score": getattr(result, "score", 0.0),
+                    "discovered_stage": "search",
+                },
+            }
+            for result in results
+        ]
+        await self.store.register_source_registry_entries(run_id, entries)
+
+    async def _register_source_document(
+        self,
+        *,
+        run_id: str,
+        source_id: str,
+        document: FetchedDocument,
+        discovered_via: str,
+        asset_id: str | None = None,
+        asset_origin: str | None = None,
+    ) -> None:
+        await self.store.register_source_registry_entries(
+            run_id,
+            [
+                {
+                    "source_id": source_id,
+                    "url": str(document.url),
+                    "canonical_url": str(document.canonical_url),
+                    "normalized_url": normalize_url(str(document.canonical_url)),
+                    "citation_key": build_citation_key(document.title, str(document.canonical_url)),
+                    "title": document.title,
+                    "provider": str(document.metadata.get("provider", "")) or None,
+                    "discovered_via": discovered_via,
+                    "metadata": {
+                        **dict(document.metadata),
+                        "fetched_stage": discovered_via,
+                        "asset_id": asset_id,
+                        "asset_origin": asset_origin,
+                        "user_supplied": asset_id is not None,
+                    },
+                }
+            ],
+        )
+
+    async def _persist_source_artifacts(
+        self,
+        *,
+        run_id: str,
+        source_id: str,
+        document: FetchedDocument,
+        artifact_payloads: Sequence[ArtifactPayload],
+    ) -> list[dict[str, Any]]:
+        if self.artifact_store is None:
+            return []
+        payloads = [
+            ArtifactPayload(
+                kind="normalized-text",
+                extension="txt",
+                content_type="text/plain",
+                data=document.content.encode("utf-8"),
+            ),
+            *artifact_payloads,
+        ]
+        artifacts: list[dict[str, Any]] = []
+        for payload in payloads:
+            reference = await self.artifact_store.save_artifact(
+                run_id=run_id,
+                source_id=source_id,
+                payload=payload,
+            )
+            await self.store.save_artifact_record(
+                run_id=run_id,
+                source_id=source_id,
+                kind=reference.kind,
+                uri=reference.uri,
+                content_type=reference.content_type,
+                size_bytes=reference.size_bytes,
+                sha256_digest=reference.sha256,
+            )
+            artifacts.append(reference.as_metadata())
+        return artifacts
+
+    async def _ingest_document_into_stream(
+        self,
+        *,
+        run_id: str,
+        question: str,
+        stream_view: ResearchStreamView,
+        stream_plan: ResearchStreamPlan,
+        document: FetchedDocument,
+        agent_config: AgentConfig,
+        model_config: ModelConfig,
+        context_pack: ContextPack | None = None,
+        discovered_via: str,
+        asset_id: str | None = None,
+        asset_origin: str | None = None,
+    ) -> dict[str, Any] | None:
+        document, artifact_payloads = self._extract_artifact_payloads(document)
+        document = self._annotate_document_with_trust(document)
+        document_provider = str(document.metadata.get("provider", self.fetch_provider.provider_name))
+        await self._record_request_cost(
+            run_id=run_id,
+            category="source_fetch",
+            delta=1,
+            amount_usd=self.settings.fetch_request_cost_usd,
+            metadata={
+                "provider": document_provider,
+                "url": str(document.canonical_url),
+                "discovered_via": discovered_via,
+            },
+            stream_id=stream_view.id,
+        )
+        source_id, is_new = await self.store.save_source(run_id, stream_view.id, document)
+        if not is_new:
+            return None
+        await self._register_source_document(
+            run_id=run_id,
+            source_id=source_id,
+            document=document,
+            discovered_via=discovered_via,
+            asset_id=asset_id,
+            asset_origin=asset_origin,
+        )
+        artifacts = await self._persist_source_artifacts(
+            run_id=run_id,
+            source_id=source_id,
+            document=document,
+            artifact_payloads=artifact_payloads,
+        )
+        if artifacts:
+            await self.store.update_source_metadata(source_id, {"artifacts": artifacts})
+        passages = [
+            {
+                "passage_index": index,
+                "text": chunk["text"],
+                "start_offset": chunk["start_offset"],
+                "end_offset": chunk["end_offset"],
+                "token_count": len(tokenize(chunk["text"])),
+            }
+            for index, chunk in enumerate(chunk_text(document.content))
+        ]
+        passages = await self._embed_passages(
+            run_id=run_id,
+            stream_id=stream_view.id,
+            source_id=source_id,
+            passages=passages,
+        )
+        await self.store.save_passages(run_id, source_id, passages)
+        note_result = await self.note_writer.write_note(
+            question=question,
+            stream=stream_plan,
+            document=document,
+            agent_config=agent_config,
+            model_config=model_config,
+            context_pack=context_pack,
+        )
+        note = note_result.value
+        await self._record_llm_usage(
+            run_id=run_id,
+            stream_id=stream_view.id,
+            phase="note_write",
+            model=stream_plan.model,
+            usage=note_result.usage,
+            metadata={
+                "source_id": source_id,
+                **(note_result.metadata or {}),
+            },
+        )
+        await self.store.save_note(
+            run_id,
+            stream_view.id,
+            source_id,
+            summary=note.summary,
+            key_facts=note.key_facts,
+            open_questions=note.open_questions,
+            confidence=note.confidence,
+        )
+        await self.events.publish(
+            run_id,
+            "source.fetched",
+            {
+                "stream_id": stream_view.id,
+                "stream_name": stream_view.name,
+                "source_id": source_id,
+                "title": document.title,
+                "url": str(document.canonical_url),
+                "provider": document_provider,
+                "trust_tier": str(document.metadata.get("trust_tier", "")) or None,
+                "artifact_count": len(artifacts),
+                "discovered_via": discovered_via,
+            },
+        )
+        await self.events.publish(
+            run_id,
+            "note.saved",
+            {
+                "stream_id": stream_view.id,
+                "source_id": source_id,
+                "summary": note.summary,
+                "confidence": note.confidence,
+                "trust_tier": str(document.metadata.get("trust_tier", "")) or None,
+            },
+        )
+        return {
+            "source_id": source_id,
+            "confidence": note.confidence,
+            "artifacts": artifacts,
+        }
+
+    async def ingest_input_assets(
+        self,
+        *,
+        run_id: str,
+        question: str,
+        assets: Sequence[ResearchAssetRecord],
+    ) -> None:
+        reference_assets = [
+            asset for asset in assets if asset.usage == ResearchAssetUsage.REFERENCE_SOURCE
+        ]
+        if not reference_assets:
+            return
+        agent_config = await self._get_agent_config(run_id)
+        model_config = await self._get_model_config(run_id)
+        _, allowed_fetch = await self._get_source_selection(run_id)
+        started = perf_counter()
+        stream_plan = ResearchStreamPlan(
+            name="Provided references",
+            objective="Read and incorporate user-provided reference materials.",
+            queries=[asset.label for asset in reference_assets],
+            model=model_config.worker_model,
+        )
+        stream_view = await self.store.create_manual_stream(
+            run_id=run_id,
+            name=stream_plan.name,
+            objective=stream_plan.objective,
+            model=stream_plan.model,
+            queries=stream_plan.queries,
+        )
+        ingested = 0
+        total_confidence = 0.0
+        for asset in reference_assets:
+            await self._ensure_run_active(run_id)
+            if asset.source_type == ResearchAssetType.URL:
+                if asset.url is None:
+                    continue
+                fetched_document = await self._fetch(
+                    run_id=run_id,
+                    url=str(asset.url),
+                    allowed_fetch=allowed_fetch,
+                )
+                result = await self._ingest_document_into_stream(
+                    run_id=run_id,
+                    question=question,
+                    stream_view=stream_view,
+                    stream_plan=stream_plan,
+                    document=fetched_document,
+                    agent_config=agent_config,
+                    model_config=model_config,
+                    discovered_via="user_input_url",
+                    asset_id=asset.id,
+                    asset_origin="project" if asset.project_id else "run",
+                )
+            else:
+                extracted_text = asset.extracted_text or asset.content_text
+                if not extracted_text:
+                    continue
+                safe_name = (asset.file_name or f"{asset.label}.txt").replace(" ", "-")
+                synthetic_url = f"https://open-research.local/user-input/{run_id}/{safe_name}"
+                document = FetchedDocument(
+                    url=synthetic_url,
+                    canonical_url=synthetic_url,
+                    title=asset.label,
+                    content=extracted_text,
+                    source_kind=SourceKind.DOCS,
+                    retrieval_method=RetrievalMethod.API_NATIVE,
+                    metadata={
+                        "provider": "user-upload",
+                        "content_type": asset.content_type,
+                        "file_name": safe_name,
+                    },
+                )
+                result = await self._ingest_document_into_stream(
+                    run_id=run_id,
+                    question=question,
+                    stream_view=stream_view,
+                    stream_plan=stream_plan,
+                    document=document,
+                    agent_config=agent_config,
+                    model_config=model_config,
+                    discovered_via="user_input_file",
+                    asset_id=asset.id,
+                    asset_origin="project" if asset.project_id else "run",
+                )
+            if result is None:
+                continue
+            ingested += 1
+            total_confidence += float(result["confidence"])
+        await self.store.update_stream(
+            stream_view.id,
+            status=StreamStatus.COMPLETED,
+            sources_examined=ingested,
+            elapsed_ms=int((perf_counter() - started) * 1000),
+            confidence=round(total_confidence / max(ingested, 1), 3) if ingested else 0.0,
+        )
+        task = await self.store.get_task_for_stream(stream_view.id)
+        if task is not None:
+            await self.store.update_task_status(
+                task["id"],
+                TaskStatus.COMPLETED,
+                output_json={"notes_written": ingested, "sources_examined": ingested},
+            )
+        await self.events.publish(
+            run_id,
+            "input_assets.ingested",
+            {"count": ingested, "stream_id": stream_view.id},
+        )
+
+    async def execute_stream(
+        self,
+        *,
+        run_id: str,
+        question: str,
+        stream_view: ResearchStreamView,
+        stream_plan: ResearchStreamPlan,
+        budget: BudgetPolicy,
+        context_pack: ContextPack | None = None,
+    ) -> dict[str, Any]:
+        telemetry_context = (
+            self.telemetry.span(
+                "stream.execute",
+                run_id=run_id,
+                stream_id=stream_view.id,
+                stream_name=stream_view.name,
+            )
+            if self.telemetry is not None
+            else None
+        )
+        if telemetry_context is None:
+            return await self._execute_stream_impl(
+                run_id=run_id,
+                question=question,
+                stream_view=stream_view,
+                stream_plan=stream_plan,
+                budget=budget,
+                context_pack=context_pack,
+            )
+        with telemetry_context:
+            return await self._execute_stream_impl(
+                run_id=run_id,
+                question=question,
+                stream_view=stream_view,
+                stream_plan=stream_plan,
+                budget=budget,
+                context_pack=context_pack,
+            )
+
+    async def _execute_stream_impl(
+        self,
+        *,
+        run_id: str,
+        question: str,
+        stream_view: ResearchStreamView,
+        stream_plan: ResearchStreamPlan,
+        budget: BudgetPolicy,
+        context_pack: ContextPack | None = None,
+    ) -> dict[str, Any]:
+        task = await self.store.get_task_for_stream(stream_view.id)
+        if task is None:
+            raise KeyError(f"No task exists for stream {stream_view.id}")
+
+        await self.store.update_stream(stream_view.id, status=StreamStatus.RUNNING)
+        await self.store.update_task_status(task["id"], TaskStatus.RUNNING)
+        await self.events.publish(
+            run_id,
+            "task.started",
+            {
+                "stream_id": stream_view.id,
+                "stream_name": stream_view.name,
+                "objective": stream_view.objective,
+            },
+        )
+
+        attempt_id = await self.store.create_task_attempt(
+            task["id"],
+            provider=f"{self.search_provider.provider_name}+{self.fetch_provider.provider_name}",
+        )
+
+        selected_results: list[Any] = []
+        seen_urls: set[str] = set()
+        domain_counts: Counter[str] = Counter()
+        started = perf_counter()
+        notes_written = 0
+        sources_examined = 0
+        confidence_total = 0.0
+        result_providers_seen: list[str] = []
+
+        await self._ensure_run_active(run_id)
+        agent_config = await self._get_agent_config(run_id)
+        model_config = await self._get_model_config(run_id)
+        profile_id, _ = await self._get_run_profile(run_id)
+        allowed_search, allowed_fetch = await self._get_source_selection(run_id)
+        merged_queries = list(task["input_json"].get("queries", []))
+        for hint in query_hints_from_pack(context_pack):
+            if hint not in merged_queries:
+                merged_queries.append(hint)
+
+        try:
+            for query in merged_queries[: budget.max_queries_per_stream]:
+                await self._ensure_run_active(run_id)
+                results = await self._search(
+                    run_id=run_id,
+                    query=query,
+                    max_results=budget.max_results_per_query,
+                    allowed_search=allowed_search,
+                )
+                await self._register_search_results(run_id=run_id, query=query, results=results)
+                result_providers = dedupe_preserve_order(result.provider for result in results)
+                result_providers_seen.extend(result_providers)
+                await self._record_request_cost(
+                    run_id=run_id,
+                    category="search_query",
+                    delta=1,
+                    amount_usd=self.settings.search_request_cost_usd,
+                    metadata={
+                        "query": query,
+                        "provider": self.search_provider.provider_name,
+                        "result_providers": result_providers,
+                    },
+                    stream_id=stream_view.id,
+                )
+                await self.events.publish(
+                    run_id,
+                    "search.performed",
+                    {
+                        "stream_id": stream_view.id,
+                        "query": query,
+                        "provider": self.search_provider.provider_name,
+                        "result_providers": result_providers,
+                        "result_count": len(results),
+                    },
+                )
+                for result in results:
+                    canonical_url = normalize_url(str(result.url))
+                    domain = domain_for_url(canonical_url)
+                    if canonical_url in seen_urls:
+                        continue
+                    if domain_counts[domain] >= budget.per_domain_limit:
+                        continue
+                    if await self.store.has_source(run_id, canonical_url):
+                        continue
+                    seen_urls.add(canonical_url)
+                    domain_counts[domain] += 1
+                    selected_results.append(result)
+                    if len(selected_results) >= budget.max_sources_per_stream:
+                        break
+                if len(selected_results) >= budget.max_sources_per_stream:
+                    break
+
+            for result in selected_results:
+                await self._ensure_run_active(run_id)
+                fetch_started = perf_counter()
+                fetched_document = await self._fetch(
+                    run_id=run_id,
+                    url=str(result.url),
+                    allowed_fetch=allowed_fetch,
+                )
+                if self.telemetry is not None:
+                    fetch_provider = str(
+                        fetched_document.metadata.get("provider", self.fetch_provider.provider_name)
+                    )
+                    self.telemetry.record_fetch_latency(
+                        provider=fetch_provider,
+                        seconds=perf_counter() - fetch_started,
+                    )
+                document, artifact_payloads = self._extract_artifact_payloads(fetched_document)
+                document = self._annotate_document_with_trust(document)
+                document_provider = str(
+                    document.metadata.get("provider", self.fetch_provider.provider_name)
+                )
+                await self._record_request_cost(
+                    run_id=run_id,
+                    category="source_fetch",
+                    delta=1,
+                    amount_usd=self.settings.fetch_request_cost_usd,
+                    metadata={
+                        "provider": document_provider,
+                        "url": str(document.canonical_url),
+                    },
+                    stream_id=stream_view.id,
+                )
+                source_id, is_new = await self.store.save_source(run_id, stream_view.id, document)
+                if not is_new:
+                    continue
+                await self._register_source_document(
+                    run_id=run_id,
+                    source_id=source_id,
+                    document=document,
+                    discovered_via="fetch",
+                )
+                artifacts = await self._persist_source_artifacts(
+                    run_id=run_id,
+                    source_id=source_id,
+                    document=document,
+                    artifact_payloads=artifact_payloads,
+                )
+                if artifacts:
+                    await self.store.update_source_metadata(source_id, {"artifacts": artifacts})
+                passages = [
+                    {
+                        "passage_index": index,
+                        "text": chunk["text"],
+                        "start_offset": chunk["start_offset"],
+                        "end_offset": chunk["end_offset"],
+                        "token_count": len(tokenize(chunk["text"])),
+                    }
+                    for index, chunk in enumerate(chunk_text(document.content))
+                ]
+                passages = await self._embed_passages(
+                    run_id=run_id,
+                    stream_id=stream_view.id,
+                    source_id=source_id,
+                    passages=passages,
+                )
+                await self.store.save_passages(run_id, source_id, passages)
+                note_result = await self.note_writer.write_note(
+                    question=question,
+                    stream=stream_plan,
+                    document=document,
+                    agent_config=agent_config,
+                    model_config=model_config,
+                    context_pack=context_pack,
+                )
+                note = note_result.value
+                await self._record_llm_usage(
+                    run_id=run_id,
+                    stream_id=stream_view.id,
+                    phase="note_write",
+                    model=stream_plan.model,
+                    usage=note_result.usage,
+                    metadata={
+                        "source_id": source_id,
+                        **(note_result.metadata or {}),
+                    },
+                )
+                await self.store.save_note(
+                    run_id,
+                    stream_view.id,
+                    source_id,
+                    summary=note.summary,
+                    key_facts=note.key_facts,
+                    open_questions=note.open_questions,
+                    confidence=note.confidence,
+                )
+                await self.events.publish(
+                    run_id,
+                    "source.fetched",
+                    {
+                        "stream_id": stream_view.id,
+                        "stream_name": stream_view.name,
+                        "source_id": source_id,
+                        "title": document.title,
+                        "url": str(document.canonical_url),
+                        "provider": document_provider,
+                        "trust_tier": str(document.metadata.get("trust_tier", "")) or None,
+                        "artifact_count": len(artifacts),
+                    },
+                )
+                await self.events.publish(
+                    run_id,
+                    "note.saved",
+                    {
+                        "stream_id": stream_view.id,
+                        "source_id": source_id,
+                        "summary": note.summary,
+                        "confidence": note.confidence,
+                        "trust_tier": str(document.metadata.get("trust_tier", "")) or None,
+                    },
+                )
+                notes_written += 1
+                sources_examined += 1
+                confidence_total += note.confidence
+
+            elapsed_ms = int((perf_counter() - started) * 1000)
+            confidence = (
+                round(confidence_total / max(notes_written, 1), 3) if notes_written else 0.0
+            )
+            await self.store.update_stream(
+                stream_view.id,
+                status=StreamStatus.COMPLETED,
+                sources_examined=sources_examined,
+                elapsed_ms=elapsed_ms,
+                confidence=confidence,
+            )
+            await self.store.update_task_status(
+                task["id"],
+                TaskStatus.COMPLETED,
+                output_json={
+                    "notes_written": notes_written,
+                    "sources_examined": sources_examined,
+                    "elapsed_ms": elapsed_ms,
+                },
+            )
+            await self.store.finish_task_attempt(
+                attempt_id,
+                TaskStatus.COMPLETED,
+                metadata={"sources_examined": sources_examined, "notes_written": notes_written},
+            )
+            if self.memory_compiler is not None and self.settings.profile_memory_enabled:
+                await self.memory_compiler.compile_stream(
+                    run_id=run_id,
+                    profile_id=profile_id,
+                    stream_name=stream_view.name,
+                    stream_objective=stream_view.objective,
+                    queries=merged_queries[: budget.max_queries_per_stream],
+                    providers=dedupe_preserve_order(result_providers_seen),
+                    sources_examined=sources_examined,
+                    notes_written=notes_written,
+                    confidence=confidence,
+                )
+            return {
+                "stream_id": stream_view.id,
+                "sources_examined": sources_examined,
+                "notes_written": notes_written,
+                "confidence": confidence,
+            }
+        except RunCancelledError as exc:
+            await self.store.update_stream(stream_view.id, status=StreamStatus.QUEUED)
+            await self.store.update_task_status(task["id"], TaskStatus.QUEUED)
+            await self.store.finish_task_attempt(
+                attempt_id,
+                TaskStatus.FAILED,
+                error_message=str(exc),
+            )
+            await self.events.publish(
+                run_id,
+                "stream.cancelled",
+                {
+                    "stream_id": stream_view.id,
+                    "stream_name": stream_view.name,
+                },
+            )
+            raise
+        except Exception as exc:
+            await self.store.update_stream(stream_view.id, status=StreamStatus.FAILED)
+            await self.store.update_task_status(task["id"], TaskStatus.FAILED)
+            await self.store.finish_task_attempt(
+                attempt_id,
+                TaskStatus.FAILED,
+                error_message=str(exc),
+            )
+            await self.events.publish(
+                run_id,
+                "stream.failed",
+                {
+                    "stream_id": stream_view.id,
+                    "stream_name": stream_view.name,
+                    "error": str(exc),
+                },
+            )
+            return {
+                "stream_id": stream_view.id,
+                "sources_examined": 0,
+                "notes_written": 0,
+                "confidence": 0.0,
+            }
+
+    async def collect_supporting_passages(
+        self,
+        *,
+        run_id: str,
+        claim: str,
+        section_title: str,
+    ) -> list[dict[str, Any]]:
+        telemetry_context = (
+            self.telemetry.span(
+                "claim.repair",
+                run_id=run_id,
+                section_title=section_title,
+            )
+            if self.telemetry is not None
+            else None
+        )
+        if telemetry_context is None:
+            return await self._collect_supporting_passages_impl(
+                run_id=run_id,
+                claim=claim,
+                section_title=section_title,
+            )
+        with telemetry_context:
+            return await self._collect_supporting_passages_impl(
+                run_id=run_id,
+                claim=claim,
+                section_title=section_title,
+            )
+
+    async def _collect_supporting_passages_impl(
+        self,
+        *,
+        run_id: str,
+        claim: str,
+        section_title: str,
+    ) -> list[dict[str, Any]]:
+        await self._ensure_run_active(run_id)
+        queries = dedupe_preserve_order(
+            [
+                claim,
+                f"{section_title} {claim}",
+                f"{claim} official source",
+            ]
+        )
+        selected_results: list[Any] = []
+        seen_urls: set[str] = set()
+        domain_counts: Counter[str] = Counter()
+        max_results = max(1, self.settings.claim_repair_max_results)
+        allowed_search, allowed_fetch = await self._get_source_selection(run_id)
+
+        await self.events.publish(
+            run_id,
+            "claim.repair.started",
+            {"section_title": section_title, "claim": claim},
+        )
+
+        for query in queries[:2]:
+            await self._ensure_run_active(run_id)
+            results = await self._search(
+                run_id=run_id,
+                query=query,
+                max_results=max_results,
+                allowed_search=allowed_search,
+            )
+            await self._register_search_results(run_id=run_id, query=query, results=results)
+            result_providers = dedupe_preserve_order(result.provider for result in results)
+            await self._record_request_cost(
+                run_id=run_id,
+                category="claim_repair_search",
+                delta=1,
+                amount_usd=self.settings.search_request_cost_usd,
+                metadata={
+                    "query": query,
+                    "provider": self.search_provider.provider_name,
+                    "result_providers": result_providers,
+                },
+            )
+            await self.events.publish(
+                run_id,
+                "claim.repair.search_performed",
+                {
+                    "claim": claim,
+                    "query": query,
+                    "provider": self.search_provider.provider_name,
+                    "result_providers": result_providers,
+                    "result_count": len(results),
+                },
+            )
+            for result in results:
+                canonical_url = normalize_url(str(result.url))
+                domain = domain_for_url(canonical_url)
+                if canonical_url in seen_urls:
+                    continue
+                if domain_counts[domain] >= 1:
+                    continue
+                seen_urls.add(canonical_url)
+                domain_counts[domain] += 1
+                selected_results.append(result)
+                if len(selected_results) >= max_results:
+                    break
+            if len(selected_results) >= max_results:
+                break
+
+        new_passages: list[dict[str, Any]] = []
+        for result in selected_results:
+            await self._ensure_run_active(run_id)
+            fetch_started = perf_counter()
+            fetched_document = await self._fetch(
+                run_id=run_id,
+                url=str(result.url),
+                allowed_fetch=allowed_fetch,
+            )
+            if self.telemetry is not None:
+                fetch_provider = str(
+                    fetched_document.metadata.get("provider", self.fetch_provider.provider_name)
+                )
+                self.telemetry.record_fetch_latency(
+                    provider=fetch_provider,
+                    seconds=perf_counter() - fetch_started,
+                )
+            document, artifact_payloads = self._extract_artifact_payloads(fetched_document)
+            document = self._annotate_document_with_trust(document)
+            document_provider = str(
+                document.metadata.get("provider", self.fetch_provider.provider_name)
+            )
+            await self._record_request_cost(
+                run_id=run_id,
+                category="claim_repair_fetch",
+                delta=1,
+                amount_usd=self.settings.fetch_request_cost_usd,
+                metadata={
+                    "provider": document_provider,
+                    "url": str(document.canonical_url),
+                },
+            )
+            source_id, is_new = await self.store.save_source(run_id, None, document)
+            if not is_new:
+                continue
+            await self._register_source_document(
+                run_id=run_id,
+                source_id=source_id,
+                document=document,
+                discovered_via="claim_repair_fetch",
+            )
+            artifacts = await self._persist_source_artifacts(
+                run_id=run_id,
+                source_id=source_id,
+                document=document,
+                artifact_payloads=artifact_payloads,
+            )
+            if artifacts:
+                await self.store.update_source_metadata(source_id, {"artifacts": artifacts})
+            passages = [
+                {
+                    "passage_index": index,
+                    "text": chunk["text"],
+                    "start_offset": chunk["start_offset"],
+                    "end_offset": chunk["end_offset"],
+                    "token_count": len(tokenize(chunk["text"])),
+                }
+                for index, chunk in enumerate(chunk_text(document.content))
+            ]
+            passages = await self._embed_passages(
+                run_id=run_id,
+                stream_id=None,
+                source_id=source_id,
+                passages=passages,
+            )
+            await self.store.save_passages(run_id, source_id, passages)
+            new_passages.extend(
+                [
+                    {
+                        "source_id": source_id,
+                        "source_title": document.title,
+                        "source_url": str(document.canonical_url),
+                        "passage_index": passage["passage_index"],
+                        "text": passage["text"],
+                        "start_offset": passage["start_offset"],
+                        "end_offset": passage["end_offset"],
+                        "token_count": passage["token_count"],
+                        "source_kind": document.source_kind.value,
+                        "retrieval_method": document.retrieval_method.value,
+                        "trust_tier": str(document.metadata.get("trust_tier", "")) or None,
+                        "trust_rationale": (
+                            str(document.metadata.get("trust_rationale", "")) or None
+                        ),
+                    }
+                    for passage in passages
+                ]
+            )
+            await self.events.publish(
+                run_id,
+                "claim.repair.source_fetched",
+                {
+                    "claim": claim,
+                    "source_id": source_id,
+                    "title": document.title,
+                    "url": str(document.canonical_url),
+                    "provider": document_provider,
+                    "trust_tier": str(document.metadata.get("trust_tier", "")) or None,
+                    "artifact_count": len(artifacts),
+                },
+            )
+
+        await self.events.publish(
+            run_id,
+            "claim.repair.completed",
+            {"claim": claim, "new_passages": len(new_passages)},
+        )
+        return new_passages
+
+
+class ResearchGraphState(TypedDict):
+    run_id: str
+    question: str
+    replan_count: int
+    should_replan: bool
+    budget: dict[str, Any]
+    resume_from: str
+
+
+class ResearchOrchestrator:
+    def __init__(
+        self,
+        *,
+        store: ResearchStore,
+        events: RunEventService,
+        planner: Planner,
+        gap_analyzer: GapAnalyzer,
+        report_writer: ReportWriter,
+        verifier: ClaimVerifier,
+        worker: ResearchWorker,
+        embedding_provider: EmbeddingProvider | None = None,
+        reranker: PassageReranker | None = None,
+        telemetry: ResearchTelemetry | None = None,
+        context_assembler: ContextAssembler | None = None,
+        memory_compiler: MemoryCompiler | None = None,
+        behavior_judge: BehaviorJudge | None = None,
+    ) -> None:
+        self.store = store
+        self.events = events
+        self.planner = planner
+        self.gap_analyzer = gap_analyzer
+        self.report_writer = report_writer
+        self.verifier = verifier
+        self.worker = worker
+        self.settings = worker.settings
+        self.embedding_provider = embedding_provider
+        self.reranker = reranker
+        self.telemetry = telemetry
+        self.context_assembler = context_assembler
+        self.memory_compiler = memory_compiler
+        self.behavior_judge = behavior_judge
+        self.graph = self._build_graph()
+
+    def _build_graph(self):
+        graph = StateGraph(ResearchGraphState)
+        graph.add_node("plan", self._plan_node)
+        graph.add_node("research", self._research_node)
+        graph.add_node("assess", self._assess_node)
+        graph.add_node("replan", self._replan_node)
+        graph.add_node("synthesize", self._synthesize_node)
+        graph.add_node("ground", self._ground_node)
+        graph.add_conditional_edges(
+            START,
+            self._route_from_start,
+            {
+                "plan": "plan",
+                "research": "research",
+                "assess": "assess",
+                "ground": "ground",
+            },
+        )
+        graph.add_edge("plan", "research")
+        graph.add_edge("research", "assess")
+        graph.add_conditional_edges(
+            "assess",
+            self._route_after_assess,
+            {
+                "replan": "replan",
+                "synthesize": "synthesize",
+            },
+        )
+        graph.add_edge("replan", "research")
+        graph.add_edge("synthesize", "ground")
+        graph.add_edge("ground", END)
+        return graph.compile()
+
+    async def execute(self, *, run_id: str, question: str, budget: BudgetPolicy) -> None:
+        state = await self.store.get_run_execution_state(run_id)
+        if state is None:
+            raise KeyError(f"Run {run_id} not found")
+        await self._ensure_run_active(run_id)
+        if state.has_final_report:
+            return
+        telemetry_context = (
+            self.telemetry.span("graph.execute", run_id=run_id)
+            if self.telemetry is not None
+            else None
+        )
+        if telemetry_context is None:
+            await self.graph.ainvoke(
+                {
+                    "run_id": run_id,
+                    "question": question,
+                    "replan_count": max(state.latest_plan_version - 1, 0),
+                    "should_replan": False,
+                    "budget": budget.model_dump(mode="json"),
+                    "resume_from": self._determine_start_node(state),
+                }
+            )
+            return
+        with telemetry_context:
+            await self.graph.ainvoke(
+                {
+                    "run_id": run_id,
+                    "question": question,
+                    "replan_count": max(state.latest_plan_version - 1, 0),
+                    "should_replan": False,
+                    "budget": budget.model_dump(mode="json"),
+                    "resume_from": self._determine_start_node(state),
+                }
+            )
+
+    async def _ensure_run_active(self, run_id: str) -> None:
+        state = await self.store.get_run_execution_state(run_id)
+        if state is None:
+            raise KeyError(f"Run {run_id} not found")
+        if state.cancel_requested:
+            raise RunCancelledError("Run cancellation was requested.")
+
+    async def _get_agent_config(self, run_id: str) -> AgentConfig:
+        state = await self.store.get_run_execution_state(run_id)
+        if state is None:
+            raise KeyError(f"Run {run_id} not found")
+        return resolve_agent_config(state.agent_config or state.metadata.get("agent_config"))
+
+    async def _get_model_config(self, run_id: str) -> ModelConfig:
+        state = await self.store.get_run_execution_state(run_id)
+        if state is None:
+            raise KeyError(f"Run {run_id} not found")
+        return resolve_model_config(
+            state.metadata.get("model_config") or state.metadata.get("model_config_override"),
+            defaults=_default_model_config(self.worker.settings),
+        )
+
+    async def _get_run_profile(self, run_id: str) -> tuple[str, MemoryInfluencePolicy]:
+        state = await self.store.get_run_execution_state(run_id)
+        if state is None:
+            raise KeyError(f"Run {run_id} not found")
+        profile_id = state.profile_id or str(state.metadata.get("profile_id", "default"))
+        profile = await self.store.get_profile(profile_id)
+        base_policy = (
+            profile.preferences.memory_policy if profile is not None else MemoryInfluencePolicy()
+        )
+        override = state.metadata.get("memory_policy_override")
+        if override is not None:
+            return profile_id, MemoryInfluencePolicy.model_validate(override)
+        return profile_id, base_policy
+
+    async def _record_llm_usage(
+        self,
+        *,
+        run_id: str,
+        phase: str,
+        model: str,
+        usage: UsageInfo,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        if usage.total_tokens:
+            event_metadata = {
+                "phase": phase,
+                "model": model,
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+                "reasoning_tokens": usage.reasoning_tokens,
+                "estimated_cost_usd": usage.estimated_cost_usd,
+            }
+            if metadata:
+                event_metadata.update(metadata)
+            await self.store.record_budget_event(
+                run_id,
+                "llm_tokens",
+                usage.total_tokens,
+                event_metadata,
+            )
+        await self.store.add_run_cost(run_id, usage.estimated_cost_usd)
+
+    async def _retrieve_supporting_passages(
+        self,
+        *,
+        run_id: str,
+        claim: str,
+        limit: int = 5,
+    ) -> list[RetrievedPassage]:
+        telemetry_context = (
+            self.telemetry.span("passages.retrieve", run_id=run_id)
+            if self.telemetry is not None
+            else None
+        )
+        if telemetry_context is None:
+            return await self._retrieve_supporting_passages_impl(
+                run_id=run_id,
+                claim=claim,
+                limit=limit,
+            )
+        with telemetry_context:
+            return await self._retrieve_supporting_passages_impl(
+                run_id=run_id,
+                claim=claim,
+                limit=limit,
+            )
+
+    async def _retrieve_supporting_passages_impl(
+        self,
+        *,
+        run_id: str,
+        claim: str,
+        limit: int = 5,
+    ) -> list[RetrievedPassage]:
+        query_embedding: list[float] | None = None
+        if self.embedding_provider is not None:
+            embedding_result = await self.embedding_provider.embed_texts([claim])
+            await self._record_llm_usage(
+                run_id=run_id,
+                phase="query_embed",
+                model=getattr(
+                    self.embedding_provider,
+                    "model",
+                    self.embedding_provider.provider_name,
+                ),
+                usage=embedding_result.usage,
+                metadata={"claim": claim[:200]},
+            )
+            if embedding_result.value:
+                query_embedding = embedding_result.value[0]
+
+        matches = await self.store.search_passages(
+            run_id,
+            claim,
+            limit=max(limit, self.worker.settings.grounding_candidate_limit),
+            query_embedding=query_embedding,
+        )
+        candidates = [
+            RetrievedPassage(
+                source_id=match["source_id"],
+                source_title=match["source_title"],
+                source_url=match["source_url"],
+                passage_index=match["passage_index"],
+                text=match["text"],
+                score=float(match.get("score", 0.0)),
+                source_kind=match.get("source_kind"),
+                retrieval_method=match.get("retrieval_method"),
+                trust_tier=match.get("trust_tier"),
+                trust_rationale=match.get("trust_rationale"),
+            )
+            for match in matches
+        ]
+        if self.reranker is None:
+            return candidates[:limit]
+        reranked = await self.reranker.rerank(
+            query=claim,
+            passages=candidates,
+            top_k=limit,
+        )
+        await self.events.publish(
+            run_id,
+            "passages.reranked",
+            {
+                "claim": claim,
+                "provider": self.reranker.provider_name,
+                "candidate_count": len(candidates),
+                "returned_count": len(reranked),
+            },
+        )
+        return reranked
+
+    @staticmethod
+    def _determine_start_node(state) -> str:
+        if state.latest_plan_version == 0:
+            return "plan"
+        if state.has_draft_report:
+            return "ground"
+        if state.queued_streams > 0 or state.active_streams > 0 or state.failed_streams > 0:
+            return "research"
+        return "assess"
+
+    def _route_from_start(self, state: ResearchGraphState) -> str:
+        return state["resume_from"]
+
+    async def _plan_node(self, state: ResearchGraphState) -> dict[str, Any]:
+        run_id = state["run_id"]
+        budget = BudgetPolicy.model_validate(state["budget"])
+        replan_count = state["replan_count"]
+        agent_config = await self._get_agent_config(run_id)
+        model_config = await self._get_model_config(run_id)
+        profile_id, memory_policy = await self._get_run_profile(run_id)
+        await self._ensure_run_active(run_id)
+        await self.store.update_run_status(run_id, RunStatus.PLANNING)
+        run_state = await self.store.get_run_execution_state(run_id)
+        preview_raw = run_state.metadata.get("plan_preview") if run_state is not None else None
+        approval_status = (
+            run_state.metadata.get("approval_status") if run_state is not None else None
+        )
+        prior_notes = await self.store.list_notes(run_id)
+        context_pack = (
+            await self.context_assembler.assemble(
+                run_id=run_id,
+                question=state["question"],
+                profile_id=profile_id,
+                phase=ContextPhase.PLAN,
+                memory_policy=memory_policy,
+            )
+            if self.context_assembler is not None and memory_policy.enabled
+            else None
+        )
+        project_assets = (
+            await self.store.list_research_assets(project_id=run_state.project_id)
+            if run_state is not None and run_state.project_id is not None
+            else []
+        )
+        run_assets = await self.store.list_research_assets(run_id=run_id)
+        available_documents = [
+            asset
+            for asset in [*project_assets, *run_assets]
+            if asset.processing_status.value == "ready"
+        ]
+        source_selection = list((run_state.metadata.get("source_selection") or []) if run_state else [])
+        approved_plan = None
+        planning_stage = PlanningStage.EXECUTION
+        if preview_raw is not None and approval_status == "approved":
+            preview = PlanPreview.model_validate(preview_raw)
+            approved_plan = preview.plan
+            await self.events.publish(
+                run_id,
+                "planning.execution.started",
+                {
+                    "preview_version": preview.version,
+                    "source_selection": source_selection,
+                },
+            )
+        elif replan_count > 0:
+            planning_stage = PlanningStage.REPLAN
+
+        min_total_sources_retrieved, min_total_cited_sources = _derive_source_floor_targets(
+            budget=budget,
+            stream_count=len(approved_plan.streams) if approved_plan is not None else max(run_state.latest_plan_version, 1),
+            minimum_retrieved=self.settings.planner_min_total_sources_retrieved,
+            minimum_cited=self.settings.planner_min_total_cited_sources,
+        )
+        attempts = max(1, self.settings.planner_max_validation_retries + 1)
+        plan_result = None
+        plan = None
+        validation_issues: list[str] = []
+        for attempt in range(1, attempts + 1):
+            plan_result = await self.planner.create_plan(
+                state["question"],
+                budget,
+                planning_stage=planning_stage,
+                agent_config=agent_config,
+                model_config=model_config,
+                prior_notes=prior_notes,
+                context_pack=context_pack,
+                replan_count=replan_count,
+                approved_plan=approved_plan,
+                available_documents=available_documents,
+                source_selection=source_selection,
+                min_total_sources_retrieved=min_total_sources_retrieved,
+                min_total_cited_sources=min_total_cited_sources,
+            )
+            plan = plan_result.value
+            validation_issues = (
+                _validate_research_plan(
+                    plan=plan,
+                    budget=budget,
+                    stage=planning_stage,
+                    min_total_sources_retrieved=min_total_sources_retrieved,
+                    min_total_cited_sources=min_total_cited_sources,
+                )
+                if self.settings.planner_validation_enabled
+                else []
+            )
+            if not validation_issues:
+                break
+            await self.events.publish(
+                run_id,
+                "planning.validation.failed",
+                {
+                    "attempt": attempt,
+                    "issues": validation_issues,
+                    "planning_stage": planning_stage.value,
+                },
+            )
+        if plan is None or plan_result is None:
+            raise RuntimeError("Planner did not return a plan.")
+        if validation_issues:
+            raise RuntimeError(
+                "Execution planning failed validation: " + "; ".join(validation_issues)
+            )
+        if preview_raw is not None and approval_status == "approved" and plan.planning_artifact is not None:
+            preview = PlanPreview.model_validate(preview_raw)
+            plan = plan.model_copy(
+                update={
+                    "planning_artifact": plan.planning_artifact.model_copy(
+                        update={"approved_preview_version": preview.version}
+                    )
+                }
+            )
+        version = await self.store.get_next_plan_version(run_id)
+        _, stream_ids = await self.store.save_plan(run_id, plan, version)
+        await self._record_llm_usage(
+            run_id=run_id,
+            phase="plan_create",
+            model=model_config.planner_model,
+            usage=plan_result.usage,
+            metadata={
+                "version": version,
+                "planning_stage": planning_stage.value,
+                "approved_preview_version": (
+                    PlanPreview.model_validate(preview_raw).version if preview_raw is not None else None
+                ),
+                **(plan_result.metadata or {}),
+            },
+        )
+        if run_state is not None:
+            await self.store.update_run_metadata(
+                run_id,
+                {
+                    "execution_plan_version": version,
+                    "planning_stage": planning_stage.value,
+                },
+            )
+        await self.events.publish(
+            run_id,
+            "planning.validation.passed",
+            {
+                "planning_stage": planning_stage.value,
+                "validation_checks": (
+                    plan.planning_artifact.validation_checks
+                    if plan.planning_artifact is not None
+                    else []
+                ),
+            },
+        )
+        await self.events.publish(
+            run_id,
+            "plan.created",
+            {
+                "version": version,
+                "summary": plan.summary,
+                "stream_count": len(plan.streams),
+                "planning_stage": planning_stage.value,
+                "prompt_template_version": (plan_result.metadata or {}).get(
+                    "prompt_template_version"
+                ),
+            },
+        )
+        if plan.planning_artifact is not None:
+            for record in plan.planning_artifact.discovery_records:
+                await self.events.publish(
+                    run_id,
+                    "planning.discovery.recorded",
+                    {
+                        "planning_stage": planning_stage.value,
+                        "query": record.query,
+                        "provider": record.provider,
+                        "result_count": record.result_count,
+                        "titles": record.titles,
+                    },
+                )
+        for stream, stream_id in zip(plan.streams, stream_ids, strict=True):
+            await self.events.publish(
+                run_id,
+                "stream.created",
+                {
+                    "stream_id": stream_id,
+                    "name": stream.name,
+                    "objective": stream.objective,
+                    "model": stream.model,
+                },
+            )
+        if preview_raw is not None and approval_status == "approved":
+            await self.events.publish(
+                run_id,
+                "planning.execution.completed",
+                {
+                    "preview_version": PlanPreview.model_validate(preview_raw).version,
+                    "plan_version": version,
+                },
+            )
+        return {}
+
+    async def _research_node(self, state: ResearchGraphState) -> dict[str, Any]:
+        run_id = state["run_id"]
+        budget = BudgetPolicy.model_validate(state["budget"])
+        profile_id, memory_policy = await self._get_run_profile(run_id)
+        await self._ensure_run_active(run_id)
+        await self.store.update_run_status(run_id, RunStatus.RESEARCHING)
+        plan = await self.store.get_latest_plan(run_id)
+        if plan is None:
+            raise RuntimeError("Cannot research without a plan")
+        stream_views = await self.store.list_queued_streams(run_id)
+        if not stream_views:
+            return {}
+        context_pack = (
+            await self.context_assembler.assemble(
+                run_id=run_id,
+                question=state["question"],
+                profile_id=profile_id,
+                phase=ContextPhase.RESEARCH,
+                memory_policy=memory_policy,
+            )
+            if self.context_assembler is not None and memory_policy.enabled
+            else None
+        )
+
+        plan_by_name = {stream.name: stream for stream in plan.streams}
+        tasks = [
+            asyncio.create_task(
+                self.worker.execute_stream(
+                    run_id=run_id,
+                    question=state["question"],
+                    stream_view=stream_view,
+                    stream_plan=plan_by_name.get(stream_view.name, plan.streams[0]),
+                    budget=budget,
+                    context_pack=context_pack,
+                ),
+                name=f"stream-{stream_view.id}",
+            )
+            for stream_view in stream_views
+        ]
+        try:
+            await asyncio.gather(*tasks)
+        except RunCancelledError:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        return {}
+
+    async def _assess_node(self, state: ResearchGraphState) -> dict[str, Any]:
+        run_id = state["run_id"]
+        await self._ensure_run_active(run_id)
+        plan = await self.store.get_latest_plan(run_id)
+        if plan is None:
+            raise RuntimeError("Cannot assess without a plan")
+        notes = await self.store.list_notes(run_id)
+        budget = BudgetPolicy.model_validate(state["budget"])
+        model_config = await self._get_model_config(run_id)
+        analysis_result = await self.gap_analyzer.analyze(
+            question=state["question"],
+            plan=plan,
+            notes=notes,
+            budget=budget,
+            replan_count=state["replan_count"],
+            model_config=model_config,
+        )
+        analysis = analysis_result.value
+        await self._record_llm_usage(
+            run_id=run_id,
+            phase="gap_assess",
+            model=model_config.worker_model,
+            usage=analysis_result.usage,
+        )
+        if analysis.should_replan:
+            await self.events.publish(
+                run_id=run_id,
+                event_type="gap.detected",
+                payload={
+                    "rationale": analysis.rationale,
+                    "additional_streams": len(analysis.additional_streams),
+                },
+            )
+        return {"should_replan": analysis.should_replan}
+
+    def _route_after_assess(self, state: ResearchGraphState) -> str:
+        return "replan" if state["should_replan"] else "synthesize"
+
+    async def _replan_node(self, state: ResearchGraphState) -> dict[str, Any]:
+        run_id = state["run_id"]
+        agent_config = await self._get_agent_config(run_id)
+        model_config = await self._get_model_config(run_id)
+        profile_id, memory_policy = await self._get_run_profile(run_id)
+        await self._ensure_run_active(run_id)
+        notes = await self.store.list_notes(run_id)
+        budget = BudgetPolicy.model_validate(state["budget"])
+        replan_count = state["replan_count"] + 1
+        await self.events.publish(run_id, "replan.started", {"replan_count": replan_count})
+        context_pack = (
+            await self.context_assembler.assemble(
+                run_id=run_id,
+                question=state["question"],
+                profile_id=profile_id,
+                phase=ContextPhase.REPLAN,
+                memory_policy=memory_policy,
+            )
+            if self.context_assembler is not None and memory_policy.enabled
+            else None
+        )
+        run_state = await self.store.get_run_execution_state(run_id)
+        project_assets = (
+            await self.store.list_research_assets(project_id=run_state.project_id)
+            if run_state is not None and run_state.project_id is not None
+            else []
+        )
+        run_assets = await self.store.list_research_assets(run_id=run_id)
+        available_documents = [
+            asset
+            for asset in [*project_assets, *run_assets]
+            if asset.processing_status.value == "ready"
+        ]
+        source_selection = list((run_state.metadata.get("source_selection") or []) if run_state else [])
+        prior_plan = await self.store.get_latest_plan(run_id)
+        min_total_sources_retrieved, min_total_cited_sources = _derive_source_floor_targets(
+            budget=budget,
+            stream_count=len(prior_plan.streams) if prior_plan is not None else 1,
+            minimum_retrieved=self.settings.planner_min_total_sources_retrieved,
+            minimum_cited=self.settings.planner_min_total_cited_sources,
+        )
+        plan_result = await self.planner.create_plan(
+            state["question"],
+            budget,
+            planning_stage=PlanningStage.REPLAN,
+            agent_config=agent_config,
+            model_config=model_config,
+            prior_notes=notes,
+            context_pack=context_pack,
+            replan_count=replan_count,
+            approved_plan=prior_plan,
+            available_documents=available_documents,
+            source_selection=source_selection,
+            min_total_sources_retrieved=min_total_sources_retrieved,
+            min_total_cited_sources=min_total_cited_sources,
+        )
+        plan = plan_result.value
+        validation_issues = (
+            _validate_research_plan(
+                plan=plan,
+                budget=budget,
+                stage=PlanningStage.REPLAN,
+                min_total_sources_retrieved=min_total_sources_retrieved,
+                min_total_cited_sources=min_total_cited_sources,
+            )
+            if self.settings.planner_validation_enabled
+            else []
+        )
+        if validation_issues:
+            await self.events.publish(
+                run_id,
+                "planning.validation.failed",
+                {
+                    "planning_stage": PlanningStage.REPLAN.value,
+                    "issues": validation_issues,
+                    "attempt": 1,
+                },
+            )
+            raise RuntimeError("Replan failed validation: " + "; ".join(validation_issues))
+        existing_stream_names = {stream.name for stream in await self.store.list_streams(run_id)}
+        new_streams = [
+            stream for stream in plan.streams if stream.name not in existing_stream_names
+        ]
+        version = await self.store.get_next_plan_version(run_id)
+        await self._record_llm_usage(
+            run_id=run_id,
+            phase="plan_recreate",
+            model=model_config.planner_model,
+            usage=plan_result.usage,
+            metadata={
+                "version": version,
+                "replan_count": replan_count,
+                **(plan_result.metadata or {}),
+            },
+        )
+        if not new_streams:
+            return {"replan_count": replan_count, "should_replan": False}
+        await self.events.publish(
+            run_id,
+            "planning.validation.passed",
+            {
+                "planning_stage": PlanningStage.REPLAN.value,
+                "validation_checks": (
+                    plan.planning_artifact.validation_checks
+                    if plan.planning_artifact is not None
+                    else []
+                ),
+            },
+        )
+        _, stream_ids = await self.store.save_plan(
+            run_id,
+            plan,
+            version,
+            streams_to_queue=new_streams,
+        )
+        await self.events.publish(
+            run_id,
+            "plan.created",
+            {
+                "version": version,
+                "summary": plan.summary,
+                "stream_count": len(new_streams),
+                "planning_stage": PlanningStage.REPLAN.value,
+                "prompt_template_version": (plan_result.metadata or {}).get(
+                    "prompt_template_version"
+                ),
+            },
+        )
+        if plan.planning_artifact is not None:
+            for record in plan.planning_artifact.discovery_records:
+                await self.events.publish(
+                    run_id,
+                    "planning.discovery.recorded",
+                    {
+                        "planning_stage": PlanningStage.REPLAN.value,
+                        "query": record.query,
+                        "provider": record.provider,
+                        "result_count": record.result_count,
+                        "titles": record.titles,
+                    },
+                )
+        for stream, stream_id in zip(new_streams, stream_ids, strict=True):
+            await self.events.publish(
+                run_id,
+                "stream.created",
+                {
+                    "stream_id": stream_id,
+                    "name": stream.name,
+                    "objective": stream.objective,
+                    "model": stream.model,
+                },
+            )
+        return {"replan_count": replan_count, "should_replan": False}
+
+    async def _synthesize_node(self, state: ResearchGraphState) -> dict[str, Any]:
+        run_id = state["run_id"]
+        agent_config = await self._get_agent_config(run_id)
+        model_config = await self._get_model_config(run_id)
+        profile_id, memory_policy = await self._get_run_profile(run_id)
+        await self._ensure_run_active(run_id)
+        plan = await self.store.get_latest_plan(run_id)
+        if plan is None:
+            raise RuntimeError("Cannot synthesize without a plan")
+        notes = await self.store.list_notes(run_id)
+        context_pack = (
+            await self.context_assembler.assemble(
+                run_id=run_id,
+                question=state["question"],
+                profile_id=profile_id,
+                phase=ContextPhase.SYNTHESIZE,
+                memory_policy=memory_policy,
+            )
+            if self.context_assembler is not None and memory_policy.enabled
+            else None
+        )
+        report_result = await self.report_writer.write_report(
+            question=state["question"],
+            plan=plan,
+            notes=notes,
+            agent_config=agent_config,
+            model_config=model_config,
+            context_pack=context_pack,
+        )
+        draft_report = report_result.value
+        await self.store.save_draft_report(run_id, draft_report.model_dump(mode="json"))
+        await self._record_llm_usage(
+            run_id=run_id,
+            phase="report_synthesize",
+            model=model_config.lead_model,
+            usage=report_result.usage,
+            metadata=report_result.metadata,
+        )
+        await self.events.publish(
+            run_id,
+            "report.drafted",
+            {
+                "section_count": len(draft_report.sections),
+                "open_questions": len(draft_report.open_questions),
+                "prompt_template_version": (report_result.metadata or {}).get(
+                    "prompt_template_version"
+                ),
+            },
+        )
+        return {}
+
+    async def _ground_node(self, state: ResearchGraphState) -> dict[str, Any]:
+        run_id = state["run_id"]
+        telemetry_context = (
+            self.telemetry.span("report.ground", run_id=run_id)
+            if self.telemetry is not None
+            else None
+        )
+        if telemetry_context is None:
+            return await self._ground_node_impl(state)
+        with telemetry_context:
+            return await self._ground_node_impl(state)
+
+    async def _ground_node_impl(self, state: ResearchGraphState) -> dict[str, Any]:
+        run_id = state["run_id"]
+        agent_config = await self._get_agent_config(run_id)
+        model_config = await self._get_model_config(run_id)
+        await self._ensure_run_active(run_id)
+        await self.store.update_run_status(run_id, RunStatus.GROUNDING)
+        raw_draft = await self.store.get_draft_report(run_id)
+        if raw_draft is None:
+            raise RuntimeError("Cannot ground a report that does not exist")
+        draft = DraftReport.model_validate(raw_draft)
+
+        claim_rows_by_key: dict[tuple[str, int], dict[str, Any]] = {}
+        citation_candidates: list[CitationCandidate] = []
+
+        for section in draft.sections:
+            for ordinal, claim in enumerate(section.claims, start=1):
+                await self._ensure_run_active(run_id)
+                candidates = await self._retrieve_supporting_passages(run_id=run_id, claim=claim)
+                verification_result = await self.verifier.verify(
+                    claim=claim,
+                    candidates=candidates,
+                    agent_config=agent_config,
+                    model_config=model_config,
+                )
+                verification = verification_result.value
+                await self._record_llm_usage(
+                    run_id=run_id,
+                    phase="claim_verify",
+                    model=model_config.verifier_model,
+                    usage=verification_result.usage,
+                    metadata={
+                        "section_title": section.title,
+                        **(verification_result.metadata or {}),
+                    },
+                )
+
+                repair_attempts = 0
+                while (
+                    verification.support_label == CitationSupportLabel.UNSUPPORTED
+                    and repair_attempts < self.worker.settings.max_claim_repairs
+                ):
+                    repair_attempts += 1
+                    new_passages = await self.worker.collect_supporting_passages(
+                        run_id=run_id,
+                        claim=claim,
+                        section_title=section.title,
+                    )
+                    if not new_passages:
+                        break
+                    candidates = await self._retrieve_supporting_passages(
+                        run_id=run_id,
+                        claim=claim,
+                    )
+                    verification_result = await self.verifier.verify(
+                        claim=claim,
+                        candidates=candidates,
+                        agent_config=agent_config,
+                        model_config=model_config,
+                    )
+                    verification = verification_result.value
+                    await self._record_llm_usage(
+                        run_id=run_id,
+                        phase="claim_reverify",
+                        model=model_config.verifier_model,
+                        usage=verification_result.usage,
+                        metadata={
+                            "section_title": section.title,
+                            "repair_attempt": repair_attempts,
+                            **(verification_result.metadata or {}),
+                        },
+                    )
+
+                await self.events.publish(
+                    run_id,
+                    "citation.verified",
+                    {
+                        "section_title": section.title,
+                        "claim": claim,
+                        "support_label": verification.support_label.value,
+                        "repair_attempts": repair_attempts,
+                        "prompt_template_version": (verification_result.metadata or {}).get(
+                            "prompt_template_version"
+                        ),
+                    },
+                )
+                claim_key = (section.title, ordinal)
+                claim_rows_by_key[claim_key] = {
+                    "section_title": section.title,
+                    "ordinal": ordinal,
+                    "claim_text": claim,
+                    "support_label": verification.support_label.value,
+                    "confidence": verification.confidence,
+                }
+
+                chosen = next(
+                    (
+                        candidate
+                        for candidate in candidates
+                        if candidate.source_id == verification.selected_source_id
+                        and candidate.passage_index == verification.selected_passage_index
+                    ),
+                    candidates[0] if candidates else None,
+                )
+                if verification.support_label == CitationSupportLabel.UNSUPPORTED or chosen is None:
+                    citation_candidates.append(
+                        CitationCandidate(
+                            section_title=section.title,
+                            ordinal=ordinal,
+                            claim=claim,
+                            citation=None,
+                        )
+                    )
+                    continue
+
+                citation_candidates.append(
+                    CitationCandidate(
+                        section_title=section.title,
+                        ordinal=ordinal,
+                        claim=claim,
+                        citation=CitationRecord(
+                            claim=claim,
+                            support_label=verification.support_label,
+                            source_id=chosen.source_id,
+                            source_title=chosen.source_title,
+                            source_url=chosen.source_url,
+                            citation_key=build_citation_key(
+                                chosen.source_title,
+                                str(chosen.source_url),
+                            ),
+                            passage_index=chosen.passage_index,
+                            quote=verification.quote or chosen.text[:240],
+                            confidence=verification.confidence,
+                        ),
+                    )
+                )
+
+        registry_entries = await self.store.list_source_registry_entries(run_id)
+        audit_result = audit_citation_candidates(
+            run_id=run_id,
+            candidates=citation_candidates,
+            registry_entries=registry_entries,
+        )
+        kept_keys = {
+            (candidate.section_title, candidate.ordinal)
+            for candidate in audit_result.kept
+            if candidate.citation is not None
+        }
+        unsupported_claims: list[str] = []
+        citations: list[CitationRecord] = []
+        citation_rows: list[dict[str, Any]] = []
+        confidence_values: list[float] = []
+        source_registry_annotations: list[dict[str, Any]] = []
+
+        for audit in audit_result.audits:
+            if audit.decision != CitationAuditDecision.REMOVED:
+                continue
+            for reason in audit.reasons:
+                if self.telemetry is not None:
+                    self.telemetry.record_citation_removed(reason=reason.value)
+            await self.events.publish(
+                run_id,
+                "citation.removed",
+                {
+                    "section_title": audit.section_title,
+                    "ordinal": audit.ordinal,
+                    "claim": audit.claim,
+                    "reasons": [reason.value for reason in audit.reasons],
+                },
+            )
+            claim_key = (audit.section_title, audit.ordinal)
+            claim_row = claim_rows_by_key[claim_key]
+            claim_row["support_label"] = CitationSupportLabel.UNSUPPORTED.value
+            unsupported_claims.append(audit.claim)
+            source_registry_annotations.append(
+                {
+                    "source_id": audit.source_id,
+                    "normalized_url": audit.normalized_url,
+                    "citation_key": audit.citation_key,
+                    "metadata": {
+                        "survived_final_citation": False,
+                        "removed_in_audit": True,
+                        "audit_reasons": [reason.value for reason in audit.reasons],
+                        "audit_removed_claim": audit.claim,
+                    },
+                }
+            )
+
+        for candidate in audit_result.kept:
+            if candidate.citation is None:
+                unsupported_claims.append(candidate.claim)
+                continue
+            citation = candidate.citation
+            citations.append(citation)
+            citation_rows.append(
+                {
+                    "section_title": candidate.section_title,
+                    "ordinal": candidate.ordinal,
+                    "source_id": citation.source_id,
+                    "passage_index": citation.passage_index,
+                    "quote": citation.quote,
+                    "support_label": citation.support_label.value,
+                    "confidence": citation.confidence,
+                }
+            )
+            confidence_values.append(citation.confidence)
+            source_registry_annotations.append(
+                {
+                    "source_id": citation.source_id,
+                    "normalized_url": normalize_url(str(citation.source_url)),
+                    "citation_key": citation.citation_key,
+                    "metadata": {
+                        "survived_final_citation": True,
+                        "removed_in_audit": False,
+                        "final_citation_section": candidate.section_title,
+                        "final_citation_ordinal": candidate.ordinal,
+                        "final_citation_support_label": citation.support_label.value,
+                    },
+                }
+            )
+
+        unsupported_claims = dedupe_preserve_order(unsupported_claims)
+        if self.telemetry is not None and unsupported_claims:
+            self.telemetry.record_unsupported_claim(len(unsupported_claims))
+
+        final_report = FinalReport(
+            markdown=self._render_final_markdown(
+                draft=draft,
+                kept_keys=kept_keys,
+                citations=citations,
+                unsupported_claims=unsupported_claims,
+            ),
+            citations=citations,
+            unsupported_claims=unsupported_claims,
+            confidence=round(sum(confidence_values) / max(len(confidence_values), 1), 3),
+        )
+        await self.store.replace_claims_and_citations(
+            run_id,
+            list(claim_rows_by_key.values()),
+            citation_rows,
+        )
+        await self.store.annotate_source_registry_entries(run_id, source_registry_annotations)
+        await self.store.replace_citation_audits(run_id, audit_result.audits)
+        await self.events.publish(
+            run_id,
+            "citation.audit.completed",
+            {
+                "kept": len(audit_result.kept),
+                "removed": len(audit_result.removed),
+            },
+        )
+        await self.events.publish(
+            run_id,
+            "report.sanitized",
+            {
+                "citation_count": len(citations),
+                "removed_citations": len(audit_result.removed),
+            },
+        )
+        await self.store.update_run_status(run_id, RunStatus.COMPLETED, final_report=final_report)
+        await self.events.publish(
+            run_id,
+            "report.completed",
+            {
+                "citation_count": len(citations),
+                "unsupported_claims": len(unsupported_claims),
+                "confidence": final_report.confidence,
+            },
+        )
+        return {}
+
+    def _render_final_markdown(
+        self,
+        *,
+        draft: DraftReport,
+        kept_keys: set[tuple[str, int]],
+        citations: Sequence[CitationRecord],
+        unsupported_claims: Sequence[str],
+    ) -> str:
+        markdown_lines = ["# Research Report", "", draft.executive_summary, ""]
+        citation_index = 1
+        for section in draft.sections:
+            markdown_lines.extend([f"## {section.title}", "", section.overview, ""])
+            for ordinal, claim in enumerate(section.claims, start=1):
+                if (section.title, ordinal) not in kept_keys:
+                    continue
+                citation = citations[citation_index - 1]
+                support_suffix = (
+                    " (partial support)"
+                    if citation.support_label == CitationSupportLabel.PARTIAL
+                    else ""
+                )
+                markdown_lines.append(f"- {claim}{support_suffix} [{citation_index}]")
+                citation_index += 1
+            markdown_lines.append("")
+
+        if unsupported_claims:
+            markdown_lines.extend(["## Remaining Uncertainty", ""])
+            for claim in unsupported_claims:
+                markdown_lines.append(f"- {claim}")
+            markdown_lines.append("")
+
+        if citations:
+            markdown_lines.extend(["## Citations", ""])
+            for index, citation in enumerate(citations, start=1):
+                markdown_lines.append(f"[{index}] {citation.source_title} ({citation.source_url})")
+                markdown_lines.append(f"> {citation.quote}")
+                markdown_lines.append("")
+
+        return "\n".join(markdown_lines).strip()
+
+
+def _render_notes(notes: Sequence[dict[str, Any]]) -> str:
+    if not notes:
+        return "No prior notes."
+    rendered = []
+    for note in notes:
+        rendered.append(
+            {
+                "stream_name": note.get("stream_name"),
+                "source_title": note.get("source_title"),
+                "source_url": note.get("source_url"),
+                "source_kind": (
+                    note.get("source_kind").value if note.get("source_kind") is not None else None
+                ),
+                "retrieval_method": (
+                    note.get("retrieval_method").value
+                    if note.get("retrieval_method") is not None
+                    else None
+                ),
+                "trust_tier": (
+                    note.get("trust_tier").value if note.get("trust_tier") is not None else None
+                ),
+                "trust_rationale": note.get("trust_rationale"),
+                "summary": note.get("summary"),
+                "key_facts": note.get("key_facts", []),
+                "open_questions": note.get("open_questions", []),
+                "confidence": note.get("confidence"),
+            }
+        )
+    return str(rendered)

@@ -1,0 +1,159 @@
+"use client";
+
+import { useEffect } from "react";
+import { useQueryClient } from "@tanstack/react-query";
+
+import { getStreamUrl } from "@/lib/api";
+import type { RunEvent, StreamEnvelope } from "@/lib/types";
+import { useResearchStore } from "@/store/use-research-store";
+
+const KNOWN_EVENT_TYPES = [
+  "stream.mode",
+  "run.started",
+  "prompt.profile.applied",
+  "run.heartbeat",
+  "run.cancel_requested",
+  "run.cancellation_requested",
+  "run.cancelled",
+  "run.failed",
+  "run.resumed",
+  "run.recovered",
+  "run.retried",
+  "run.shutdown",
+  "plan.created",
+  "stream.created",
+  "stream.cancelled",
+  "stream.failed",
+  "task.started",
+  "search.performed",
+  "source.fetched",
+  "note.saved",
+  "gap.detected",
+  "replan.started",
+  "passages.reranked",
+  "claim.repair.started",
+  "claim.repair.search_performed",
+  "claim.repair.source_fetched",
+  "claim.repair.completed",
+  "citation.verified",
+  "citation.removed",
+  "citation.audit.completed",
+  "report.drafted",
+  "report.sanitized",
+  "report.completed",
+  "provider.retry",
+  "memory.retrieved",
+  "memory.compiled",
+  "context.fragment.dropped",
+  "context.pack.created",
+  "profile.feedback.recorded",
+];
+
+interface UseRunStreamOptions {
+  runId: string | null;
+  apiBaseUrl: string;
+}
+
+function toRunEvent(envelope: StreamEnvelope): RunEvent | null {
+  if (typeof envelope.id !== "number" || !envelope.run_id) {
+    return null;
+  }
+  return {
+    id: envelope.id,
+    run_id: envelope.run_id,
+    event_type: envelope.event_type,
+    payload: envelope.payload,
+    created_at: envelope.created_at,
+  };
+}
+
+export function useRunStream({ runId, apiBaseUrl }: UseRunStreamOptions): void {
+  const queryClient = useQueryClient();
+  const appendEvent = useResearchStore((state) => state.appendEvent);
+  const setConnectionState = useResearchStore((state) => state.setConnectionState);
+  const clearRunEvents = useResearchStore((state) => state.clearRunEvents);
+
+  useEffect(() => {
+    if (!runId) {
+      return;
+    }
+
+    clearRunEvents(runId);
+    setConnectionState(runId, "connecting");
+
+    const stream = new EventSource(getStreamUrl(apiBaseUrl, runId, 0));
+
+    const invalidateRunQueries = (): void => {
+      void queryClient.invalidateQueries({ queryKey: ["run-detail", apiBaseUrl, runId] });
+      void queryClient.invalidateQueries({ queryKey: ["run-workspace", apiBaseUrl, runId] });
+      void queryClient.invalidateQueries({ queryKey: ["run-report", apiBaseUrl, runId] });
+      void queryClient.invalidateQueries({ queryKey: ["run-audit", apiBaseUrl, runId] });
+      void queryClient.invalidateQueries({ queryKey: ["run-artifacts", apiBaseUrl, runId] });
+      void queryClient.invalidateQueries({ queryKey: ["run-notes", apiBaseUrl, runId] });
+      void queryClient.invalidateQueries({ queryKey: ["run-passages", apiBaseUrl, runId] });
+      void queryClient.invalidateQueries({ queryKey: ["run-context-packs", apiBaseUrl, runId] });
+      void queryClient.invalidateQueries({ queryKey: ["run-assessments", apiBaseUrl, runId] });
+      void queryClient.invalidateQueries({ queryKey: ["runs", apiBaseUrl] });
+    };
+
+    const handleEnvelope = (event: MessageEvent<string>): void => {
+      const envelope = JSON.parse(event.data) as StreamEnvelope;
+      if (envelope.event_type === "stream.mode") {
+        const mode = String(envelope.payload.mode ?? "live");
+        if (mode === "replay") {
+          setConnectionState(runId, "replay", mode);
+        } else if (mode === "live") {
+          setConnectionState(runId, "live", mode);
+        } else {
+          setConnectionState(runId, "terminal", mode);
+          invalidateRunQueries();
+        }
+        return;
+      }
+
+      const runEvent = toRunEvent(envelope);
+      if (!runEvent) {
+        return;
+      }
+      appendEvent(runId, runEvent);
+
+      if (
+        runEvent.event_type === "report.completed" ||
+        runEvent.event_type === "run.failed" ||
+        runEvent.event_type === "run.cancelled"
+      ) {
+        setConnectionState(runId, "terminal");
+        invalidateRunQueries();
+      } else if (
+        runEvent.event_type === "plan.created" ||
+        runEvent.event_type === "source.fetched" ||
+        runEvent.event_type === "note.saved" ||
+        runEvent.event_type === "citation.audit.completed" ||
+        runEvent.event_type === "context.pack.created" ||
+        runEvent.event_type === "memory.compiled" ||
+        runEvent.event_type === "profile.feedback.recorded"
+      ) {
+        invalidateRunQueries();
+      }
+    };
+
+    for (const eventType of KNOWN_EVENT_TYPES) {
+      stream.addEventListener(eventType, handleEnvelope as EventListener);
+    }
+
+    stream.onerror = () => {
+      setConnectionState(runId, "error");
+    };
+
+    return () => {
+      stream.close();
+    };
+  }, [
+    apiBaseUrl,
+    appendEvent,
+    clearRunEvents,
+    queryClient,
+    runId,
+    setConnectionState,
+  ]);
+}
