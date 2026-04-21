@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from .domain import (
@@ -98,6 +98,55 @@ EVENT_PHASES: dict[str, WorkspacePhaseKey] = {
 class _SectionParseResult:
     sections: list[WorkspaceReportSectionView]
     section_text: dict[str, str]
+
+
+def _normalize_workspace_lookup(value: str | None) -> str | None:
+    if not value:
+        return None
+    normalized = re.sub(r"\s+", " ", value).strip().casefold()
+    return normalized or None
+
+
+def _resolve_workspace_citation_source(
+    *,
+    claim: str,
+    source_id: str | None,
+    source_title: str | None,
+    source_url: str | None,
+    source_entries: list[SourceRegistryEntry],
+) -> tuple[str | None, str | None, str | None]:
+    if source_id and (source_title or source_url):
+        return source_id, source_title, source_url
+
+    by_source_id = {entry.source_id: entry for entry in source_entries if entry.source_id}
+    by_url: dict[str, SourceRegistryEntry] = {}
+    by_title: dict[str, SourceRegistryEntry] = {}
+    for entry in source_entries:
+        for candidate in (entry.canonical_url, entry.url):
+            normalized = _normalize_workspace_lookup(candidate)
+            if normalized and normalized not in by_url:
+                by_url[normalized] = entry
+        normalized_title = _normalize_workspace_lookup(entry.title)
+        if normalized_title and normalized_title not in by_title:
+            by_title[normalized_title] = entry
+
+    resolved: SourceRegistryEntry | None = None
+    if source_id:
+        resolved = by_source_id.get(source_id)
+    if resolved is None:
+        resolved = by_url.get(_normalize_workspace_lookup(source_url))
+    if resolved is None:
+        resolved = by_title.get(_normalize_workspace_lookup(source_title))
+    if resolved is None:
+        resolved = by_title.get(_normalize_workspace_lookup(claim))
+
+    if resolved is None:
+        return source_id, source_title, source_url
+    return (
+        resolved.source_id or source_id,
+        resolved.title or source_title,
+        resolved.canonical_url or resolved.url or source_url,
+    )
 
 
 def _extract_source_origin(entry: SourceRegistryEntry) -> WorkspaceSourceOrigin:
@@ -246,9 +295,27 @@ def _build_approval_history(events: list[RunEvent], latest: ApprovalDecision | N
                 created_at=event.created_at,
             )
         )
-    if latest is not None and not any(item.created_at == latest.created_at and item.decision == latest.decision for item in history):
+    if latest is not None and not any(_approval_entries_match(item, latest) for item in history):
         history.append(latest)
-    return sorted(history, key=lambda item: item.created_at)
+    return sorted(history, key=lambda item: _normalize_datetime(item.created_at).timestamp())
+
+
+def _approval_entries_match(left: ApprovalDecision, right: ApprovalDecision) -> bool:
+    if left.decision != right.decision:
+        return False
+    if (left.note or None) != (right.note or None):
+        return False
+    left_created = _normalize_datetime(left.created_at)
+    right_created = _normalize_datetime(right.created_at)
+    return abs((left_created - right_created).total_seconds()) < 2
+
+
+def _normalize_datetime(value: datetime | None) -> datetime:
+    if value is None:
+        return datetime.min.replace(tzinfo=UTC)
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
 
 
 def _build_tasks(
@@ -329,6 +396,74 @@ def _build_tasks(
         )
         views.append(view)
         by_stream[stream_id].append(view)
+
+    # Some runs, especially local/heuristic or older persisted runs, complete without
+    # durable task rows even though the stream/event history is rich enough to show
+    # meaningful execution visibility. Synthesize a single execution card per stream
+    # so the Tasks tab never collapses into an empty board after a successful run.
+    for stream_id, stream in streams_by_id.items():
+        if by_stream.get(stream_id):
+            continue
+        stream_events = events_by_stream.get(stream_id, [])
+        search_events = [event for event in stream_events if event.event_type == "search.performed"]
+        source_events = [event for event in stream_events if event.event_type == "source.fetched"]
+        latest_source_titles = [
+            str(event.payload.get("title") or "Untitled source") for event in source_events[-3:]
+        ]
+        latest_tool_call = source_events[-1].event_type if source_events else (
+            search_events[-1].event_type if search_events else None
+        )
+        latest_note = (notes_by_stream.get(stream_id) or [None])[-1]
+        last_decision = None
+        for event in reversed(stream_events):
+            if event.event_type in {
+                "gap.detected",
+                "replan.started",
+                "citation.verified",
+                "claim.repair.completed",
+                "citation.removed",
+            }:
+                last_decision = event.event_type.replace(".", " ")
+                break
+
+        started_at = stream_events[0].created_at if stream_events else None
+        completed_at = None
+        blocker_reason = None
+        task_status = stream.status
+        if stream.status in {StreamStatus.COMPLETED.value, StreamStatus.FAILED.value}:
+            completed_at = stream_events[-1].created_at if stream_events else None
+        if stream.status == StreamStatus.FAILED.value:
+            blocker_reason = "Stream execution failed."
+
+        synthetic = WorkspaceTaskView(
+            id=f"synthetic-{stream_id}",
+            stream_id=stream_id,
+            stream_name=stream.name,
+            task_type="stream_execution",
+            objective=stream.objective,
+            status=task_status,
+            query_count=len(search_events),
+            selected_source_count=len(source_events),
+            notes_produced=len(notes_by_stream.get(stream_id) or []),
+            elapsed_ms=max(int(stream.elapsed_ms or 0), 0) or None,
+            started_at=started_at,
+            completed_at=completed_at,
+            next_action=(
+                None
+                if task_status == TaskStatus.COMPLETED.value
+                else "Awaiting more sources"
+                if not source_events
+                else "Ground claims"
+            ),
+            blocker_reason=blocker_reason,
+            latest_sources=latest_source_titles,
+            latest_note_summary=latest_note.summary if latest_note is not None else None,
+            last_tool_call=latest_tool_call,
+            last_decision=last_decision,
+            metadata={"synthetic": True},
+        )
+        views.append(synthetic)
+        by_stream[stream_id].append(synthetic)
     return views, by_stream
 
 
@@ -503,6 +638,13 @@ def _build_report_sections(
         support_label = _extract_support_label(
             str(event.payload.get("support_label")) if event.payload.get("support_label") else None
         )
+        resolved_source_id, resolved_source_title, resolved_source_url = _resolve_workspace_citation_source(
+            claim=claim,
+            source_id=str(event.payload.get("source_id")) if event.payload.get("source_id") else None,
+            source_title=str(event.payload.get("source_title")) if event.payload.get("source_title") else None,
+            source_url=str(event.payload.get("source_url")) if event.payload.get("source_url") else None,
+            source_entries=detail.source_registry_entries,
+        )
         claim_views_by_section[section_title][(claim, ordinal)] = WorkspaceReportClaimView(
             section_title=section_title,
             ordinal=ordinal,
@@ -521,9 +663,9 @@ def _build_report_sections(
             section_title=section_title,
             claim=claim,
             status="surviving",
-            source_id=str(event.payload.get("source_id")) if event.payload.get("source_id") else None,
-            source_title=str(event.payload.get("source_title")) if event.payload.get("source_title") else None,
-            source_url=str(event.payload.get("source_url")) if event.payload.get("source_url") else None,
+            source_id=resolved_source_id,
+            source_title=resolved_source_title,
+            source_url=resolved_source_url,
             citation_key=str(event.payload.get("citation_key")) if event.payload.get("citation_key") else None,
             support_label=support_label,
             quote=str(event.payload.get("quote")) if event.payload.get("quote") else None,

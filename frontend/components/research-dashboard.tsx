@@ -10,6 +10,7 @@ import {
   createJob,
   createRun,
   fetchProfilePreferences,
+  fetchProjects,
   fetchPublicConfig,
   fetchRunDetail,
   fetchRunMessages,
@@ -30,8 +31,8 @@ import {
   type FocusedDrawerKey,
   BudgetDrawerPanel,
   ModelsDrawerPanel,
+  ProjectPanel,
   ProfileDrawerPanel,
-  RunComposer,
   SettingsDrawerPanel,
   SourcesDrawerPanel,
   WorkflowDrawerPanel,
@@ -39,16 +40,62 @@ import {
 import { RunHistory } from "./run-history";
 import { RunWorkspace } from "./run-workspace";
 
-type DrawerKey = "settings" | FocusedDrawerKey;
+type DrawerKey = "project" | "settings" | FocusedDrawerKey;
 
-const DRAWER_META: Record<DrawerKey, { eyebrow: string; title: string }> = {
-  settings: { eyebrow: "Settings", title: "Agent behavior" },
-  workflow: { eyebrow: "Workflow", title: "Execution and policy" },
-  sources: { eyebrow: "Sources", title: "Source registry" },
-  budget: { eyebrow: "Budget", title: "Budget controls" },
-  models: { eyebrow: "Models", title: "Model selection" },
-  profile: { eyebrow: "Profile", title: "Profile and memory" },
+const DRAWER_META: Record<
+  DrawerKey,
+  { eyebrow: string; title: string; description: string }
+> = {
+  project: {
+    eyebrow: "Context",
+    title: "Project context",
+    description:
+      "Attach a project corpus, manage its planning and reference assets, and stage inputs for this run.",
+  },
+  settings: {
+    eyebrow: "Settings",
+    title: "Agent behavior",
+    description:
+      "Tune behavior, policy, and connection plumbing in one place. Deep panels are one click away.",
+  },
+  workflow: {
+    eyebrow: "Workflow",
+    title: "Execution and policy",
+    description:
+      "Pick the execution mode, toggle human-in-the-loop approval, and shape the output policy.",
+  },
+  sources: {
+    eyebrow: "Sources",
+    title: "Source registry",
+    description:
+      "Choose which source presets the agent may use. Unselected presets fall back to the deployment default.",
+  },
+  budget: {
+    eyebrow: "Budget",
+    title: "Budget controls",
+    description:
+      "Cap streams, queries, and provider spend. The planner respects these as hard ceilings.",
+  },
+  models: {
+    eyebrow: "Models",
+    title: "Model selection",
+    description:
+      "Override the lead, planner, and reviewer models for this run. Leave blank to use the deployment defaults.",
+  },
+  profile: {
+    eyebrow: "Profile",
+    title: "Profile and memory",
+    description:
+      "Shape how prior runs and preferences condition the agent's planning and grounding behavior.",
+  },
 };
+
+function formatLabel(value: string | null | undefined): string {
+  if (!value) return "Not configured";
+  return value
+    .replaceAll("_", " ")
+    .replace(/\b\w/g, (match) => match.toUpperCase());
+}
 
 function isActive(status: RunDetail["status"] | undefined): boolean {
   return (
@@ -62,14 +109,14 @@ function isActive(status: RunDetail["status"] | undefined): boolean {
 }
 
 function useTheme() {
-  const [theme, setTheme] = useState<"dark" | "light">("dark");
+  const [theme, setTheme] = useState<"dark" | "light">("light");
 
   useEffect(() => {
     const stored = localStorage.getItem("or-theme");
-    if (stored === "light" || stored === "dark") {
-      setTheme(stored);
-      document.documentElement.setAttribute("data-theme", stored);
-    }
+    const resolved = stored === "dark" || stored === "light" ? stored : "light";
+    setTheme(resolved);
+    document.documentElement.setAttribute("data-theme", resolved);
+    localStorage.setItem("or-theme", resolved);
   }, []);
 
   const toggle = useCallback(() => {
@@ -91,6 +138,7 @@ export function ResearchDashboard() {
   const [activeDrawer, setActiveDrawer] = useState<DrawerKey | null>(null);
   const centerScrollRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const pendingQuestionRef = useRef<string>("");
 
   const autoResizeTextarea = useCallback(() => {
     const el = textareaRef.current;
@@ -109,6 +157,7 @@ export function ResearchDashboard() {
   const clarifierConfig = useResearchStore((state) => state.clarifierConfig);
   const sourceSelection = useResearchStore((state) => state.sourceSelection);
   const selectedProjectId = useResearchStore((state) => state.selectedProjectId);
+  const setSelectedProjectId = useResearchStore((state) => state.setSelectedProjectId);
   const runInputAssets = useResearchStore((state) => state.runInputAssets);
   const stagedRunAssets = useResearchStore((state) => state.stagedRunAssets);
   const clearRunInputAssets = useResearchStore((state) => state.clearRunInputAssets);
@@ -145,6 +194,11 @@ export function ResearchDashboard() {
     queryKey: ["runs", apiBaseUrl],
     queryFn: () => fetchRuns(apiBaseUrl),
     refetchInterval: 5_000,
+  });
+
+  const projectsQuery = useQuery({
+    queryKey: ["projects", apiBaseUrl],
+    queryFn: () => fetchProjects(apiBaseUrl),
   });
 
   const detailQuery = useQuery({
@@ -206,10 +260,10 @@ export function ResearchDashboard() {
   });
 
   const createRunMutation = useMutation({
-    mutationFn: async () => {
+    mutationFn: async (question: string) => {
       await updateProfilePreferences(apiBaseUrl, profileId, profilePreferences);
       const payload = {
-        question: questionDraft.trim(),
+        question,
         budget,
         agent_config: agentConfig,
         model_config_override:
@@ -237,18 +291,26 @@ export function ResearchDashboard() {
       }
       return createRun(apiBaseUrl, payload);
     },
-    onSuccess: (run) => {
+    onMutate: async (question) => {
+      pendingQuestionRef.current = question;
       setSubmitError(null);
+      setQuestionDraft("");
+      if (textareaRef.current) textareaRef.current.style.height = "";
+    },
+    onSuccess: (run) => {
       setSelectedRunId(run.id);
       clearRunInputAssets();
       clearStagedRunAssets();
-      if (textareaRef.current) textareaRef.current.style.height = "";
+      pendingQuestionRef.current = "";
       void queryClient.invalidateQueries({ queryKey: ["runs", apiBaseUrl] });
       void queryClient.invalidateQueries({ queryKey: ["run-detail", apiBaseUrl, run.id] });
       void queryClient.invalidateQueries({ queryKey: ["run-workspace", apiBaseUrl, run.id] });
     },
     onError: (error) => {
       setSubmitError(error instanceof Error ? error.message : "Failed to start run.");
+      setQuestionDraft(pendingQuestionRef.current);
+      pendingQuestionRef.current = "";
+      requestAnimationFrame(() => autoResizeTextarea());
     },
   });
 
@@ -356,12 +418,83 @@ export function ResearchDashboard() {
     [activeDetail?.events, streamState?.events],
   );
   const conversationMessages = messagesQuery.data ?? activeDetail?.conversation_messages ?? [];
+  const displayConnectionState =
+    activeWorkspace &&
+    (activeWorkspace.status === "completed" ||
+      activeWorkspace.status === "failed" ||
+      activeWorkspace.status === "cancelled") &&
+    (streamState?.connectionState ?? "idle") === "error"
+      ? "terminal"
+      : streamState?.connectionState ?? "idle";
+  const leadModel =
+    modelConfigOverride.lead_model || publicConfigQuery.data?.models.lead_model || "Default";
+  const plannerModel =
+    modelConfigOverride.planner_model ||
+    publicConfigQuery.data?.models.planner_model ||
+    "Default";
+  const setupSummary = [
+    {
+      label: "Project",
+      value: selectedProjectId ? "Attached" : "Standalone run",
+    },
+    {
+      label: "Assets",
+      value: `${runInputAssets.length + stagedRunAssets.length} attached`,
+    },
+    {
+      label: "Workflow",
+      value: "Approval-first research",
+    },
+    {
+      label: "Sources",
+      value:
+        sourceSelection.length > 0
+          ? `${sourceSelection.length} selected`
+          : "Deployment default",
+    },
+    {
+      label: "Budget",
+      value: `${budget.max_streams} streams`,
+    },
+    {
+      label: "Models",
+      value: `${leadModel} / ${plannerModel}`,
+    },
+  ];
+  const runStatusLabel = selectedRunId
+    ? formatLabel(activeDetail?.status ?? displayConnectionState)
+    : "Ready";
 
   const handleSubmit = () => {
-    if (questionDraft.trim().length >= 12 && !createRunMutation.isPending) {
-      createRunMutation.mutate();
+    const trimmedQuestion = questionDraft.trim();
+    if (trimmedQuestion.length >= 12 && !createRunMutation.isPending) {
+      createRunMutation.mutate(trimmedQuestion);
     }
   };
+
+  const handleNewChat = () => {
+    setSelectedRunId(null);
+    setSubmitError(null);
+    requestAnimationFrame(() => {
+      textareaRef.current?.focus();
+      centerScrollRef.current?.scrollTo({ top: 0, behavior: "smooth" });
+    });
+  };
+
+  const handleSelectProject = (projectId: string | null) => {
+    setSelectedProjectId(projectId);
+    setSelectedRunId(null);
+  };
+
+  const projects = projectsQuery.data ?? [];
+  const activeProject = projects.find((project) => project.id === selectedProjectId) ?? null;
+  const isLanding = !selectedRunId;
+  const suggestionChips = [
+    "Compare the economic impact of universal basic income pilots since 2020.",
+    "Survey recent advances in liquid neural networks and their applications.",
+    "Draft a grounded literature review on microplastics in freshwater systems.",
+    "Summarize the state of direct air capture economics in 2025–2026.",
+  ];
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -372,10 +505,45 @@ export function ResearchDashboard() {
 
   return (
     <main className="dashboard-page">
-      {/* ── Header bar ── */}
       <header className="hero">
-        <p className="eyebrow">Open Research Console</p>
+        <div className="hero-brand">
+          <div>
+            <p className="eyebrow">Open Research</p>
+            <h1 className="hero-title">Console</h1>
+          </div>
+        </div>
+        <div className="hero-badges">
+          <span
+            className={`pill ${
+              activeDetail?.status
+                ? `status-${activeDetail.status}`
+                : "muted"
+            }`}
+          >
+            <span
+              className={`status-dot status-${
+                activeDetail?.status ?? (selectedRunId ? "queued" : "completed")
+              }`}
+            />
+            {runStatusLabel}
+          </span>
+          <span className="pill muted">
+            {publicConfigQuery.data?.backends.workflow ?? "local"}
+          </span>
+          <span className="pill muted">
+            {visibleRuns.length} run{visibleRuns.length === 1 ? "" : "s"}
+          </span>
+        </div>
         <div className="hero-actions">
+          <button
+            className={`config-action ${activeDrawer === "project" ? "active" : ""}`}
+            onClick={() =>
+              setActiveDrawer((prev) => (prev === "project" ? null : "project"))
+            }
+            type="button"
+          >
+            Project
+          </button>
           <button
             className={`config-action ${activeDrawer === "settings" ? "active" : ""}`}
             onClick={() =>
@@ -383,142 +551,253 @@ export function ResearchDashboard() {
             }
             type="button"
           >
-            Settings
+            Customize
           </button>
-          <button
-            className={`config-action ${activeDrawer === "workflow" ? "active" : ""}`}
-            onClick={() =>
-              setActiveDrawer((prev) => (prev === "workflow" ? null : "workflow"))
-            }
-            type="button"
-          >
-            Workflow
-          </button>
-          <button
-            className={`config-action ${activeDrawer === "sources" ? "active" : ""}`}
-            onClick={() =>
-              setActiveDrawer((prev) => (prev === "sources" ? null : "sources"))
-            }
-            type="button"
-          >
-            Sources
-          </button>
-          <button
-            className={`config-action ${activeDrawer === "budget" ? "active" : ""}`}
-            onClick={() =>
-              setActiveDrawer((prev) => (prev === "budget" ? null : "budget"))
-            }
-            type="button"
-          >
-            Budget
-          </button>
-          <button
-            className={`config-action ${activeDrawer === "models" ? "active" : ""}`}
-            onClick={() =>
-              setActiveDrawer((prev) => (prev === "models" ? null : "models"))
-            }
-            type="button"
-          >
-            Models
-          </button>
-          <button
-            className={`config-action ${activeDrawer === "profile" ? "active" : ""}`}
-            onClick={() =>
-              setActiveDrawer((prev) => (prev === "profile" ? null : "profile"))
-            }
-            type="button"
-          >
-            Profile
-          </button>
-        </div>
-        <div className="hero-badges">
-          <span className="pill">
-            {publicConfigQuery.data?.backends.workflow ?? "\u2014"}
-          </span>
-          <span className="pill muted">
-            {streamState?.connectionState ?? "idle"}
-          </span>
           <button
             className="theme-toggle"
             onClick={toggleTheme}
             type="button"
             title={`Switch to ${theme === "dark" ? "light" : "dark"} mode`}
+            aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} mode`}
           >
             {theme === "dark" ? "Light" : "Dark"}
           </button>
         </div>
       </header>
 
-      {/* ── 3-column grid ── */}
       <div className="dashboard-grid">
-        {/* Left sidebar: settings */}
         <aside className="left-column">
-          <RunComposer
-            publicConfig={publicConfigQuery.data}
-          />
-          <RunHistory
-            runs={visibleRuns}
-            selectedRunId={selectedRunId}
-            onSelect={setSelectedRunId}
-          />
+          <div className="left-column-shell">
+            <div className="rail-new-chat">
+              <button
+                className="new-chat-button"
+                onClick={handleNewChat}
+                type="button"
+                disabled={isLanding}
+              >
+                <span className="new-chat-plus" aria-hidden>+</span>
+                New chat
+              </button>
+            </div>
+
+            <section className="rail-projects">
+              <div className="rail-section-head">
+                <p className="eyebrow">Projects</p>
+                <button
+                  className="rail-section-action"
+                  onClick={() => setActiveDrawer("project")}
+                  type="button"
+                >
+                  Manage
+                </button>
+              </div>
+              <div className="rail-project-list">
+                <button
+                  className={`rail-project-chip ${activeProject === null ? "active" : ""}`}
+                  onClick={() => handleSelectProject(null)}
+                  type="button"
+                >
+                  <span className="rail-project-name">All runs</span>
+                  <span className="rail-project-count">
+                    {(runsQuery.data ?? []).length}
+                  </span>
+                </button>
+                {projects.slice(0, 6).map((project) => {
+                  const count = (runsQuery.data ?? []).filter(
+                    (run) => run.project_id === project.id,
+                  ).length;
+                  return (
+                    <button
+                      className={`rail-project-chip ${
+                        activeProject?.id === project.id ? "active" : ""
+                      }`}
+                      key={project.id}
+                      onClick={() => handleSelectProject(project.id)}
+                      type="button"
+                      title={project.description ?? undefined}
+                    >
+                      <span className="rail-project-name">{project.name}</span>
+                      <span className="rail-project-count">{count}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            </section>
+
+            <RunHistory
+              runs={visibleRuns}
+              selectedRunId={selectedRunId}
+              onSelect={setSelectedRunId}
+            />
+
+            <div className="rail-setup-actions">
+              <p className="eyebrow">Setup</p>
+              <div className="rail-setup-buttons">
+                <button
+                  className="rail-setup-button"
+                  onClick={() => setActiveDrawer("workflow")}
+                  type="button"
+                >
+                  Workflow
+                </button>
+                <button
+                  className="rail-setup-button"
+                  onClick={() => setActiveDrawer("sources")}
+                  type="button"
+                >
+                  Sources
+                </button>
+                <button
+                  className="rail-setup-button"
+                  onClick={() => setActiveDrawer("budget")}
+                  type="button"
+                >
+                  Budget
+                </button>
+                <button
+                  className="rail-setup-button"
+                  onClick={() => setActiveDrawer("models")}
+                  type="button"
+                >
+                  Models
+                </button>
+                <button
+                  className="rail-setup-button"
+                  onClick={() => setActiveDrawer("profile")}
+                  type="button"
+                >
+                  Profile
+                </button>
+              </div>
+            </div>
+          </div>
         </aside>
 
-        {/* Workspace */}
-        <section className="center-column workspace-column">
-          <div className="center-scroll" ref={centerScrollRef}>
-            <RunWorkspace
-              workspace={activeWorkspace}
-              rawEvents={eventFeed}
-              conversationMessages={conversationMessages}
-              connectionState={streamState?.connectionState ?? "idle"}
-              connectionMode={streamState?.lastMode}
-              onCancel={(runId) => cancelMutation.mutate(runId)}
-              onResume={(runId) => resumeMutation.mutate(runId)}
-              onRetry={(runId) => retryMutation.mutate(runId)}
-              onAnswerClarification={(runId, response) =>
-                clarificationMutation.mutate({ runId, response })
-              }
-              onApprove={(runId, note) => approveMutation.mutate({ runId, note })}
-              onReject={(runId, note) => rejectMutation.mutate({ runId, note })}
-              onRequestChanges={(runId, note) =>
-                requestChangesMutation.mutate({ runId, note })
-              }
-              onSendMessage={(runId, message) => chatMutation.mutate({ runId, message })}
-              pending={{
-                cancel: cancelMutation.isPending,
-                resume: resumeMutation.isPending,
-                retry: retryMutation.isPending,
-                clarification: clarificationMutation.isPending,
-                approve: approveMutation.isPending,
-                reject: rejectMutation.isPending,
-                requestChanges: requestChangesMutation.isPending,
-                chat: chatMutation.isPending,
-              }}
-            />
-          </div>
+        <section
+          className={`center-column workspace-column ${
+            isLanding ? "is-landing" : ""
+          }`}
+        >
+          {isLanding ? null : (
+            <div className="center-scroll" ref={centerScrollRef}>
+              <RunWorkspace
+                workspace={activeWorkspace}
+                rawEvents={eventFeed}
+                conversationMessages={conversationMessages}
+                connectionState={displayConnectionState}
+                connectionMode={streamState?.lastMode}
+                onCancel={(runId) => cancelMutation.mutate(runId)}
+                onResume={(runId) => resumeMutation.mutate(runId)}
+                onRetry={(runId) => retryMutation.mutate(runId)}
+                onAnswerClarification={(runId, response) =>
+                  clarificationMutation.mutate({ runId, response })
+                }
+                onApprove={(runId, note) => approveMutation.mutate({ runId, note })}
+                onReject={(runId, note) => rejectMutation.mutate({ runId, note })}
+                onRequestChanges={(runId, note) =>
+                  requestChangesMutation.mutate({ runId, note })
+                }
+                onSendMessage={(runId, message) => chatMutation.mutate({ runId, message })}
+                pending={{
+                  cancel: cancelMutation.isPending,
+                  resume: resumeMutation.isPending,
+                  retry: retryMutation.isPending,
+                  clarification: clarificationMutation.isPending,
+                  approve: approveMutation.isPending,
+                  reject: rejectMutation.isPending,
+                  requestChanges: requestChangesMutation.isPending,
+                  chat: chatMutation.isPending,
+                }}
+              />
+            </div>
+          )}
 
-          {/* ── Pinned input bar at bottom ── */}
+          {isLanding ? (
+            <div className="landing-hero">
+              <div className="landing-hero-inner">
+                <p className="eyebrow">Open Research</p>
+                <h2 className="landing-title">
+                  What should we dig into?
+                </h2>
+                <p className="landing-copy">
+                  Ask a research question. The agent plans, runs parallel search
+                  streams, grounds every claim, and delivers a cited report.
+                  {activeProject
+                    ? ` Attached to project ${activeProject.name}.`
+                    : ""}
+                </p>
+                <div className="landing-setup">
+                  {setupSummary.slice(0, 4).map((item) => (
+                    <article className="landing-setup-item" key={item.label}>
+                      <span>{item.label}</span>
+                      <strong>{item.value}</strong>
+                    </article>
+                  ))}
+                </div>
+                <div className="landing-suggestions">
+                  <p className="landing-suggestions-head">Try a starter</p>
+                  <div className="landing-suggestion-grid">
+                    {suggestionChips.map((chip) => (
+                      <button
+                        className="landing-suggestion"
+                        key={chip}
+                        onClick={() => {
+                          setQuestionDraft(chip);
+                          requestAnimationFrame(() => {
+                            autoResizeTextarea();
+                            textareaRef.current?.focus();
+                          });
+                        }}
+                        type="button"
+                      >
+                        {chip}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            </div>
+          ) : null}
+
           <div className="center-input">
-            <textarea
-              className="textarea-input"
-              ref={textareaRef}
-              value={questionDraft}
-              onChange={(e) => {
-                setQuestionDraft(e.target.value);
-                autoResizeTextarea();
-              }}
-              onKeyDown={handleKeyDown}
-              placeholder="Ask a research question... (Enter to submit, Shift+Enter for newline)"
-              rows={1}
-            />
-            <button
-              className="primary-button"
-              disabled={questionDraft.trim().length < 12 || createRunMutation.isPending}
-              onClick={handleSubmit}
-              type="button"
-            >
-              {createRunMutation.isPending ? "..." : "Run"}
-            </button>
+            <div className="center-input-shell">
+              <div className="center-input-meta">
+                <span>{selectedProjectId ? "Project attached" : "Fresh run"}</span>
+                <span>
+                  {runInputAssets.length + stagedRunAssets.length} input asset
+                  {runInputAssets.length + stagedRunAssets.length === 1 ? "" : "s"}
+                </span>
+                <span>
+                  {sourceSelection.length > 0
+                    ? `${sourceSelection.length} source presets`
+                    : "Default source registry"}
+                </span>
+              </div>
+              <div className="center-input-row">
+                <textarea
+                  className="textarea-input"
+                  ref={textareaRef}
+                  value={questionDraft}
+                  onChange={(e) => {
+                    setQuestionDraft(e.target.value);
+                    autoResizeTextarea();
+                  }}
+                  onKeyDown={handleKeyDown}
+                  placeholder="Ask a research question... (Enter to submit, Shift+Enter for newline)"
+                  rows={1}
+                />
+                <button
+                  className="primary-button"
+                  disabled={
+                    questionDraft.trim().length < 12 || createRunMutation.isPending
+                  }
+                  onClick={handleSubmit}
+                  type="button"
+                >
+                  {createRunMutation.isPending ? "..." : "Run"}
+                </button>
+              </div>
+            </div>
           </div>
           {submitError ? (
             <div style={{ padding: "0 16px 6px" }}>
@@ -540,16 +819,21 @@ export function ResearchDashboard() {
               <div>
                 <p className="eyebrow">{DRAWER_META[activeDrawer].eyebrow}</p>
                 <h2 className="panel-title">{DRAWER_META[activeDrawer].title}</h2>
+                <p className="drawer-lead">{DRAWER_META[activeDrawer].description}</p>
               </div>
               <button
                 className="drawer-close"
                 onClick={() => setActiveDrawer(null)}
                 type="button"
+                aria-label="Close drawer"
               >
                 Close
               </button>
             </div>
             <div className="drawer-body">
+              {activeDrawer === "project" ? (
+                <ProjectPanel publicConfig={publicConfigQuery.data} />
+              ) : null}
               {activeDrawer === "settings" ? (
                 <SettingsDrawerPanel
                   publicConfig={publicConfigQuery.data}

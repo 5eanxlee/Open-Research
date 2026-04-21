@@ -239,7 +239,7 @@ def _add_request_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--execution-mode",
         choices=[mode.value for mode in ExecutionMode],
-        default=ExecutionMode.STANDARD.value,
+        default=ExecutionMode.DEEP.value,
     )
     parser.add_argument(
         "--require-plan-approval",

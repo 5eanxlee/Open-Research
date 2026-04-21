@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+from difflib import SequenceMatcher
 import importlib.util
+import re
 import socket
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
@@ -115,6 +117,7 @@ from .providers import (
     TavilySearchProvider,
     provider_hooks_scope,
 )
+from .utils import clean_text
 from .workspace import build_run_workspace_snapshot
 
 
@@ -154,6 +157,60 @@ def _retry_kwargs(settings: Settings) -> dict[str, float | int]:
         "cooldown_failures": settings.provider_cooldown_failures,
         "cooldown_seconds": settings.provider_cooldown_seconds,
     }
+
+
+def _is_local_ollama_endpoint(settings: Settings) -> bool:
+    if settings.resolved_llm_backend != "openai_compatible":
+        return False
+    base_url = (settings.llm_base_url or "").lower()
+    return "127.0.0.1:11434" in base_url or "localhost:11434" in base_url
+
+
+def _use_local_ollama_conversation_mode(settings: Settings) -> bool:
+    return _is_local_ollama_endpoint(settings)
+
+
+def _llm_request_timeout_seconds(settings: Settings) -> float:
+    if _is_local_ollama_endpoint(settings):
+        return max(settings.http_timeout_seconds * 6, 240.0)
+    if (
+        settings.resolved_llm_backend == "openai"
+        and settings.resolved_llm_supports_reasoning_effort
+        and settings.llm_reasoning_effort in {"medium", "high"}
+    ):
+        return max(settings.http_timeout_seconds * 6, 180.0)
+    return settings.http_timeout_seconds * 2
+
+
+def _maximal_source_selection(settings: Settings) -> list[str]:
+    selection: list[str] = [settings.resolved_search_backend, settings.resolved_fetch_backend]
+    return list(dict.fromkeys(selection))
+
+
+def _validate_maximal_research_path(settings: Settings) -> None:
+    if not settings.enforce_maximal_research_path:
+        return
+
+    errors: list[str] = []
+    if settings.resolved_llm_backend not in {"openai", "openai_compatible"}:
+        errors.append("LLM backend must be a real OpenAI or OpenAI-compatible model endpoint.")
+    if settings.search_backend in {"auto", "mock"} or settings.resolved_search_backend == "mock":
+        errors.append("Search backend must be explicitly configured with a real provider.")
+    if settings.fetch_backend in {"auto", "mock"} or settings.resolved_fetch_backend == "mock":
+        errors.append("Fetch backend must be explicitly configured with a real provider.")
+    if (
+        settings.embedding_backend in {"auto", "disabled", "mock"}
+        or settings.resolved_embedding_backend not in {"openai", "openai_compatible"}
+    ):
+        errors.append("Embedding backend must be explicitly configured with a real provider.")
+    if settings.resolved_reranker_backend != "sentence_transformers":
+        errors.append("Reranker backend must be sentence_transformers.")
+
+    if errors:
+        raise ValueError(
+            "Maximal research path enforcement rejected the current configuration: "
+            + " ".join(errors)
+        )
 
 
 def _budget_limits() -> dict[str, dict[str, int]]:
@@ -255,6 +312,36 @@ def _compose_clarified_question(question: str, session: ClarificationSession | N
     return f"{question}\n\nClarifications:\n" + "\n".join(clarification_lines)
 
 
+def _normalize_user_question(question: str) -> str:
+    cleaned = clean_text(question)
+    if len(cleaned) < 40:
+        return cleaned
+    words = cleaned.split()
+    if len(words) >= 12:
+        for window in range(min(10, len(words) // 2), 5, -1):
+            prefix = " ".join(words[:window]).lower()
+            for start in range(window, len(words) - window + 1):
+                candidate = " ".join(words[start : start + window]).lower()
+                if SequenceMatcher(None, prefix, candidate).ratio() >= 0.88:
+                    collapsed = clean_text(" ".join(words[:start]))
+                    if collapsed.endswith((".", "?", "!")):
+                        return collapsed
+    start = max(20, len(cleaned) // 3)
+    end = max(start + 1, len(cleaned) - 20)
+    for split in range(start, end):
+        if cleaned[split - 1] not in ".?! ":
+            continue
+        left = clean_text(cleaned[:split])
+        right = clean_text(cleaned[split:])
+        if min(len(left), len(right)) < 20:
+            continue
+        if abs(len(left) - len(right)) > max(12, len(cleaned) // 8):
+            continue
+        if SequenceMatcher(None, left.lower(), right.lower()).ratio() >= 0.92:
+            return left if len(left) >= len(right) else right
+    return cleaned
+
+
 def _render_asset_block(title: str, assets: list[ResearchAssetRecord], *, include_content: bool) -> str:
     if not assets:
         return ""
@@ -345,6 +432,91 @@ def _conversation_references(detail: RunDetail, passages: list[dict[str, object]
     return refs[:8]
 
 
+def _extract_markdown_summary(markdown: str | None) -> str:
+    if not markdown:
+        return ""
+    for block in re.split(r"\n\s*\n", markdown):
+        cleaned = block.strip()
+        if not cleaned or cleaned.startswith("#"):
+            continue
+        return cleaned
+    return ""
+
+
+def _extract_markdown_bullets(markdown: str | None, *, limit: int = 3) -> list[str]:
+    if not markdown:
+        return []
+    bullets: list[str] = []
+    for line in markdown.splitlines():
+        candidate = line.strip()
+        if not candidate.startswith("- "):
+            continue
+        bullets.append(candidate[2:].strip())
+        if len(bullets) >= limit:
+            break
+    return bullets
+
+
+def _heuristic_follow_up_reply(
+    *,
+    detail: RunDetail,
+    question: str,
+    passages: list[dict[str, object]],
+    references: list[str],
+) -> str:
+    summary = _extract_markdown_summary(detail.final_report.markdown if detail.final_report else "")
+    highlights = _extract_markdown_bullets(
+        detail.final_report.markdown if detail.final_report else "",
+        limit=3,
+    )
+    passage_highlights = [
+        _clip_text(str(passage.get("text") or ""), limit=260)
+        for passage in passages[:3]
+        if str(passage.get("text") or "").strip()
+    ]
+
+    sections = ["## Follow-up answer"]
+    if summary:
+        sections.append(summary)
+    else:
+        sections.append(
+            "I do not have a clean summary paragraph for this completed run, so I am answering from the grounded passages that were retrieved."
+        )
+
+    if highlights:
+        sections.extend(
+            [
+                "## Key takeaways",
+                *[f"- {item}" for item in highlights],
+            ]
+        )
+
+    if passage_highlights:
+        sections.extend(
+            [
+                "## Relevant evidence",
+                *[f"- {item}" for item in passage_highlights],
+            ]
+        )
+
+    sections.extend(
+        [
+            "## Your question",
+            question.strip(),
+        ]
+    )
+
+    if references:
+        sections.extend(
+            [
+                "## References",
+                *[f"- {reference}" for reference in references[:5]],
+            ]
+        )
+
+    return "\n\n".join(section for section in sections if section.strip())
+
+
 def _build_uploaded_asset(
     *,
     usage: ResearchAssetUsage,
@@ -401,13 +573,13 @@ def _build_source_catalog(settings: Settings) -> list[SourceCatalogEntry]:
             status_reason=None if configured else "Not configured in this deployment.",
         )
 
-    return [
+    entries = [
         entry(
             id="brave",
             name="Brave Search",
             description="Web search provider focused on public-web coverage.",
             backend_kind="search",
-            configured=settings.brave_api_key is not None or settings.search_backend in {"mock", "auto"},
+            configured=settings.brave_api_key is not None,
             auth_required=True,
             supports_search=True,
             supports_advanced_search=False,
@@ -417,7 +589,7 @@ def _build_source_catalog(settings: Settings) -> list[SourceCatalogEntry]:
             name="Exa Search",
             description="Semantic search provider useful for docs and technical content.",
             backend_kind="search",
-            configured=settings.exa_api_key is not None or settings.search_backend in {"mock", "auto"},
+            configured=settings.exa_api_key is not None,
             auth_required=True,
             supports_search=True,
             supports_primary_sources=True,
@@ -428,26 +600,16 @@ def _build_source_catalog(settings: Settings) -> list[SourceCatalogEntry]:
             name="Tavily Search",
             description="General search API with quick public-web retrieval.",
             backend_kind="search",
-            configured=settings.tavily_api_key is not None or settings.search_backend in {"mock", "auto"},
+            configured=settings.tavily_api_key is not None,
             auth_required=True,
             supports_search=True,
-        ),
-        entry(
-            id="mock",
-            name="Mock Search/Fetch",
-            description="Synthetic fallback path used in local demo mode.",
-            backend_kind="search_fetch",
-            configured=True,
-            auth_required=False,
-            supports_search=True,
-            supports_fetch=True,
         ),
         entry(
             id="firecrawl",
             name="Firecrawl Fetch",
             description="Fetches and normalizes public pages into main-content markdown.",
             backend_kind="fetch",
-            configured=settings.firecrawl_api_key is not None or settings.fetch_backend in {"mock", "auto"},
+            configured=settings.firecrawl_api_key is not None,
             auth_required=True,
             supports_fetch=True,
             supports_primary_sources=True,
@@ -457,7 +619,7 @@ def _build_source_catalog(settings: Settings) -> list[SourceCatalogEntry]:
             name="Browserbase Fetch",
             description="Browser-backed fetch path for difficult pages.",
             backend_kind="fetch",
-            configured=settings.browserbase_api_key is not None or settings.fetch_backend in {"mock", "auto"},
+            configured=settings.browserbase_api_key is not None,
             auth_required=True,
             supports_fetch=True,
         ),
@@ -466,20 +628,35 @@ def _build_source_catalog(settings: Settings) -> list[SourceCatalogEntry]:
             name="Browserbase Session",
             description="Longer-lived browser sessions for harder interactive pages.",
             backend_kind="fetch",
-            configured=settings.browserbase_api_key is not None or settings.fetch_backend in {"mock", "auto"},
+            configured=settings.browserbase_api_key is not None,
             auth_required=True,
             supports_fetch=True,
         ),
         entry(
             id="playwright",
             name="Playwright Fetch",
-            description="Local browser fallback for public pages.",
+            description="Local browser-backed fetch path for public pages.",
             backend_kind="fetch",
-            configured=True,
+            configured=settings.fetch_backend == "playwright",
             auth_required=False,
             supports_fetch=True,
         ),
     ]
+    if not settings.enforce_maximal_research_path:
+        entries.insert(
+            3,
+            entry(
+                id="mock",
+                name="Mock Search/Fetch",
+                description="Synthetic fallback path used in local demo mode.",
+                backend_kind="search_fetch",
+                configured=True,
+                auth_required=False,
+                supports_search=True,
+                supports_fetch=True,
+            ),
+        )
+    return entries
 
 
 def _resolve_oss_api_key(secret) -> str:
@@ -552,78 +729,37 @@ def _build_search_provider(settings: Settings):
     )
 
 
-def _build_fetch_provider(settings: Settings):
-    if settings.fetch_backend == "auto":
-        providers = []
-        if settings.firecrawl_api_key is not None:
-            providers.append(
-                RetriedFetchProvider(
-                    FirecrawlFetchProvider(
-                        _require_secret(
-                            settings.firecrawl_api_key,
-                            setting_name="FIRECRAWL_API_KEY",
-                        ),
-                        timeout=settings.http_timeout_seconds,
-                    ),
-                    **_retry_kwargs(settings),
-                )
-            )
-        if settings.browserbase_api_key is not None:
-            providers.append(
-                RetriedFetchProvider(
-                    BrowserbaseFetchProvider(
-                        _require_secret(
-                            settings.browserbase_api_key,
-                            setting_name="BROWSERBASE_API_KEY",
-                        ),
-                        timeout=settings.http_timeout_seconds,
-                        use_proxies=settings.browserbase_use_proxies,
-                    ),
-                    **_retry_kwargs(settings),
-                )
-            )
-            providers.append(
-                RetriedFetchProvider(
-                    BrowserbaseSessionFetchProvider(
-                        _require_secret(
-                            settings.browserbase_api_key,
-                            setting_name="BROWSERBASE_API_KEY",
-                        ),
-                        project_id=settings.browserbase_project_id,
-                        timeout=settings.http_timeout_seconds,
-                        use_proxies=settings.browserbase_use_proxies,
-                        keep_alive=settings.browserbase_session_keep_alive,
-                    ),
-                    **_retry_kwargs(settings),
-                )
-            )
-        if not providers:
-            providers.append(MockFetchProvider())
-        return FetchPipeline(providers)
-
-    if settings.fetch_backend == "mock":
-        return MockFetchProvider()
-    if settings.fetch_backend == "firecrawl":
-        return RetriedFetchProvider(
+def _configured_fetch_providers(settings: Settings) -> dict[str, Any]:
+    providers: dict[str, Any] = {}
+    if settings.firecrawl_api_key is not None:
+        providers["firecrawl"] = RetriedFetchProvider(
             FirecrawlFetchProvider(
-                _require_secret(settings.firecrawl_api_key, setting_name="FIRECRAWL_API_KEY"),
+                _require_secret(
+                    settings.firecrawl_api_key,
+                    setting_name="FIRECRAWL_API_KEY",
+                ),
                 timeout=settings.http_timeout_seconds,
             ),
             **_retry_kwargs(settings),
         )
-    if settings.fetch_backend == "browserbase":
-        return RetriedFetchProvider(
+    if settings.browserbase_api_key is not None:
+        providers["browserbase"] = RetriedFetchProvider(
             BrowserbaseFetchProvider(
-                _require_secret(settings.browserbase_api_key, setting_name="BROWSERBASE_API_KEY"),
+                _require_secret(
+                    settings.browserbase_api_key,
+                    setting_name="BROWSERBASE_API_KEY",
+                ),
                 timeout=settings.http_timeout_seconds,
                 use_proxies=settings.browserbase_use_proxies,
             ),
             **_retry_kwargs(settings),
         )
-    if settings.fetch_backend == "browserbase_session":
-        return RetriedFetchProvider(
+        providers["browserbase-session"] = RetriedFetchProvider(
             BrowserbaseSessionFetchProvider(
-                _require_secret(settings.browserbase_api_key, setting_name="BROWSERBASE_API_KEY"),
+                _require_secret(
+                    settings.browserbase_api_key,
+                    setting_name="BROWSERBASE_API_KEY",
+                ),
                 project_id=settings.browserbase_project_id,
                 timeout=settings.http_timeout_seconds,
                 use_proxies=settings.browserbase_use_proxies,
@@ -631,10 +767,43 @@ def _build_fetch_provider(settings: Settings):
             ),
             **_retry_kwargs(settings),
         )
-    return RetriedFetchProvider(
+    providers["playwright"] = RetriedFetchProvider(
         PlaywrightFetchProvider(timeout=settings.playwright_timeout_seconds),
         **_retry_kwargs(settings),
     )
+    return providers
+
+
+def _build_fetch_provider(settings: Settings):
+    if settings.fetch_backend == "mock":
+        return MockFetchProvider()
+
+    configured = _configured_fetch_providers(settings)
+    if settings.fetch_backend == "auto":
+        ordered_names = [
+            name
+            for name in ("firecrawl", "browserbase", "browserbase-session", "playwright")
+            if name in configured
+        ]
+        if not ordered_names:
+            return MockFetchProvider()
+        return FetchPipeline([configured[name] for name in ordered_names])
+
+    primary_name = settings.fetch_backend.replace("_", "-")
+    primary = configured.get(primary_name)
+    if primary is None:
+        if settings.fetch_backend == "playwright":
+            return configured["playwright"]
+        raise ValueError(f"Unsupported fetch backend: {settings.fetch_backend}")
+
+    ordered_names = [primary_name]
+    for fallback_name in ("firecrawl", "browserbase", "browserbase-session", "playwright"):
+        if fallback_name in configured and fallback_name not in ordered_names:
+            ordered_names.append(fallback_name)
+
+    if len(ordered_names) == 1:
+        return configured[ordered_names[0]]
+    return FetchPipeline([configured[name] for name in ordered_names])
 
 
 def _build_embedding_provider(settings: Settings) -> EmbeddingProvider | None:
@@ -700,6 +869,7 @@ class RunCoordinator:
         self.runtime = runtime
 
     async def start_run(self, request: CreateRunRequest) -> RunSummary:
+        normalized_question = _normalize_user_question(request.question)
         requested_budget = request.budget or self.runtime.default_budget()
         agent_config = resolve_agent_config(
             request.agent_config or request.metadata.get("agent_config")
@@ -725,18 +895,31 @@ class RunCoordinator:
                     "Some staged assets could not be found: " + ", ".join(sorted(missing))
                 )
         source_selection = self.runtime.resolve_source_selection(request.source_selection)
-        execution_mode = request.execution_mode
-        requires_approval = self.runtime.should_require_plan_approval(
-            execution_mode=execution_mode,
-            requested_budget=requested_budget,
-            explicit=request.require_plan_approval,
-            source_selection=source_selection,
-            model_config=model_config,
-            user_supplied_budget=request.budget is not None,
-            user_supplied_sources=request.source_selection is not None,
-            user_supplied_model_override=request.model_config_override is not None,
-        )
         metadata = dict(request.metadata)
+        if (
+            self.runtime.settings.enforce_maximal_research_path
+            and request.execution_mode != ExecutionMode.DEEP
+        ):
+            metadata["requested_execution_mode"] = request.execution_mode.value
+        execution_mode = (
+            ExecutionMode.DEEP
+            if self.runtime.settings.enforce_maximal_research_path
+            else request.execution_mode
+        )
+        requires_approval = (
+            True
+            if self.runtime.settings.enforce_maximal_research_path
+            else self.runtime.should_require_plan_approval(
+                execution_mode=execution_mode,
+                requested_budget=requested_budget,
+                explicit=request.require_plan_approval,
+                source_selection=source_selection,
+                model_config=model_config,
+                user_supplied_budget=request.budget is not None,
+                user_supplied_sources=request.source_selection is not None,
+                user_supplied_model_override=request.model_config_override is not None,
+            )
+        )
         metadata["profile_id"] = profile_id
         metadata["requested_budget"] = requested_budget.model_dump(mode="json")
         metadata["effective_budget"] = requested_budget.model_dump(mode="json")
@@ -751,6 +934,8 @@ class RunCoordinator:
             (request.clarifier_config or ClarifierConfig()).model_dump(mode="json")
         )
         metadata["model_config"] = model_config.model_dump(mode="json")
+        if normalized_question != clean_text(request.question):
+            metadata["submitted_question"] = request.question
         if request.model_config_override is not None:
             metadata["model_config_override"] = request.model_config_override.model_dump(
                 mode="json",
@@ -767,7 +952,7 @@ class RunCoordinator:
             )
         )
         run = await self.runtime.store.create_run(
-            request.question,
+            normalized_question,
             requested_budget,
             profile_id=profile_id,
             project_id=request.project_id,
@@ -793,7 +978,7 @@ class RunCoordinator:
             asset for asset in effective_assets if asset.processing_status == AssetProcessingStatus.READY
         ]
         effective_question = _augment_question_with_assets(
-            request.question,
+            normalized_question,
             ready_assets,
             include_reference_context=True,
         )
@@ -1015,6 +1200,16 @@ class WorkerExecutor:
                     raise
                 await asyncio.sleep(0.05 * (attempt + 1))
 
+    async def _repair_terminal_run_state(self, state) -> bool:
+        if state is None or not state.has_final_report or state.status == RunStatus.COMPLETED:
+            return False
+        await self.runtime.store.update_run_status(
+            state.id,
+            RunStatus.COMPLETED,
+            estimated_cost_usd=state.estimated_cost_usd,
+        )
+        return True
+
     async def launch_run(
         self,
         run_id: str,
@@ -1026,9 +1221,7 @@ class WorkerExecutor:
         try:
             if self.runtime.workflow_engine is None:
                 scheduled = self.schedule_run(run_id, question, budget)
-                if not scheduled:
-                    raise ValueError("Run is already active.")
-                return True
+                return scheduled
             await self.runtime.workflow_engine.start_run(
                 run_id=run_id,
                 question=question,
@@ -1081,6 +1274,8 @@ class WorkerExecutor:
                         status=state.status.value,
                         started_at=datetime.now(UTC),
                     )
+                if await self._repair_terminal_run_state(state):
+                    return
             heartbeat_task = asyncio.create_task(
                 self._heartbeat_loop(run_id, stop_heartbeat),
                 name=f"heartbeat-{run_id}",
@@ -1441,6 +1636,7 @@ class ResearchRuntime:
     @classmethod
     def build(cls, settings: Settings | None = None) -> ResearchRuntime:
         settings = settings or get_settings()
+        _validate_maximal_research_path(settings)
         engine, session_factory = create_engine_and_sessionmaker(settings.database_url)
         store = ResearchStore(engine, session_factory)
         broker = EventBroker()
@@ -1478,7 +1674,7 @@ class ResearchRuntime:
             openai_client = OpenAIJsonClient(
                 api_key=llm_api_key,
                 base_url=llm_base_url,
-                timeout=settings.http_timeout_seconds * 2,
+                timeout=_llm_request_timeout_seconds(settings),
                 api_style=settings.resolved_llm_api_style,
                 structured_output_mode=settings.resolved_llm_structured_output_mode,
                 supports_reasoning_effort=settings.resolved_llm_supports_reasoning_effort,
@@ -1706,7 +1902,11 @@ class ResearchRuntime:
         return await self.store.list_notes(run_id)
 
     async def list_passages(self, run_id: str):
-        return await self.store.list_passages(run_id)
+        passages = await self.store.list_passages(run_id)
+        return [
+            {key: value for key, value in passage.items() if key != "embedding_vector"}
+            for passage in passages
+        ]
 
     async def list_context_packs(self, run_id: str):
         return await self.store.list_context_packs(run_id)
@@ -1735,26 +1935,31 @@ class ResearchRuntime:
     ) -> tuple[str, list[str]]:
         passages = await self.store.search_passages(detail.id, user_message.content, limit=6)
         notes = await self.store.list_notes(detail.id)
-        recent_messages = detail.conversation_messages[-8:]
+        local_ollama_mode = _use_local_ollama_conversation_mode(self.settings)
+        recent_messages = detail.conversation_messages[-4:] if local_ollama_mode else detail.conversation_messages[-8:]
         plan_summary = detail.latest_plan.summary if detail.latest_plan is not None else "No saved plan."
         source_lines = [
             f"- {passage['source_title']}: {str(passage['text'])[:500]}"
-            for passage in passages[:6]
+            for passage in passages[: (3 if local_ollama_mode else 6)]
         ]
         note_lines = [
             f"- {note['stream_name']}: {note['summary']}"
-            for note in notes[:6]
+            for note in notes[: (4 if local_ollama_mode else 6)]
         ]
         references = _conversation_references(detail, passages)
 
         if self.conversation_client is None:
-            answer_parts = [
-                "Here’s the best answer from the completed research run.",
-                _clip_text(detail.final_report.markdown, limit=1400) if detail.final_report else "",
-            ]
-            if source_lines:
-                answer_parts.append("Relevant retrieved passages:\n" + "\n".join(source_lines[:3]))
-            return "\n\n".join(part for part in answer_parts if part), references
+            if self.settings.enforce_maximal_research_path:
+                raise RuntimeError("Run follow-up replies require a configured conversation model.")
+            return (
+                _heuristic_follow_up_reply(
+                    detail=detail,
+                    question=user_message.content,
+                    passages=passages,
+                    references=references,
+                ),
+                references,
+            )
 
         agent_config = resolve_agent_config(detail.metadata.get("agent_config"))
         model_config = resolve_model_config(
@@ -1768,23 +1973,47 @@ class ResearchRuntime:
         conversation_history = "\n".join(
             f"{message.role.value}: {message.content}" for message in recent_messages
         ) or "No prior follow-up conversation."
+        report_limit = 2500 if local_ollama_mode else 8000
+        note_block = chr(10).join(note_lines) or "- none"
+        source_block = chr(10).join(source_lines) or "- none"
         user_prompt = (
             f"Original research question:\n{detail.question}\n\n"
             f"Approved / latest plan summary:\n{plan_summary}\n\n"
-            f"Final report:\n{_clip_text(detail.final_report.markdown, limit=8000) if detail.final_report else ''}\n\n"
+            f"Final report:\n{_clip_text(detail.final_report.markdown, limit=report_limit) if detail.final_report else ''}\n\n"
             f"Recent follow-up conversation:\n{conversation_history}\n\n"
-            f"Relevant note summaries:\n{chr(10).join(note_lines) or '- none'}\n\n"
-            f"Retrieved passages for this follow-up:\n{chr(10).join(source_lines) or '- none'}\n\n"
+            f"Relevant note summaries:\n{note_block}\n\n"
+            f"Retrieved passages for this follow-up:\n{source_block}\n\n"
             f"User follow-up:\n{user_message.content}"
         )
-        response = await self.conversation_client.generate_text(
-            model=model_config.lead_model,
-            system_prompt=prompt.system_prompt,
-            user_prompt=user_prompt,
-            reasoning_effort="minimal",
-            temperature=0.3,
+        try:
+            response = await asyncio.wait_for(
+                self.conversation_client.generate_text(
+                    model=model_config.lead_model,
+                    system_prompt=prompt.system_prompt,
+                    user_prompt=user_prompt,
+                    reasoning_effort=self.settings.llm_reasoning_effort,
+                    temperature=0.3,
+                ),
+                timeout=90.0 if local_ollama_mode else 45.0,
+            )
+            response_text = response.strip()
+            if response_text:
+                return response_text, references
+            if self.settings.enforce_maximal_research_path:
+                raise RuntimeError("Run follow-up reply generation returned an empty response.")
+        except Exception as exc:
+            if self.settings.enforce_maximal_research_path:
+                raise RuntimeError("Run follow-up reply generation failed.") from exc
+
+        return (
+            _heuristic_follow_up_reply(
+                detail=detail,
+                question=user_message.content,
+                passages=passages,
+                references=references,
+            ),
+            references,
         )
-        return response.strip(), references
 
     async def get_profile_preferences(self, profile_id: str) -> ProfileRecord | None:
         return await self.store.get_profile(profile_id)
@@ -2011,9 +2240,19 @@ class ResearchRuntime:
         return _build_source_catalog(self.settings)
 
     def default_source_selection(self) -> list[str]:
+        if self.settings.enforce_maximal_research_path:
+            return _maximal_source_selection(self.settings)
         return [entry.id for entry in self.available_sources() if entry.default_enabled]
 
     def resolve_source_selection(self, source_selection: list[str] | None) -> list[str]:
+        if self.settings.enforce_maximal_research_path:
+            selected = source_selection or self.default_source_selection()
+            if list(dict.fromkeys(selected)) != self.default_source_selection():
+                raise ValueError(
+                    "Custom source selection is disabled while maximal research path enforcement "
+                    "is enabled."
+                )
+            return self.default_source_selection()
         available = {entry.id: entry for entry in self.available_sources()}
         selected = source_selection or self.default_source_selection()
         unknown = [entry_id for entry_id in selected if entry_id not in available]
@@ -2022,7 +2261,7 @@ class ResearchRuntime:
         unavailable = [
             entry_id
             for entry_id in selected
-            if not available[entry_id].configured and entry_id != "mock"
+            if not available[entry_id].configured
         ]
         if unavailable:
             raise ValueError(
@@ -2043,6 +2282,8 @@ class ResearchRuntime:
         user_supplied_sources: bool,
         user_supplied_model_override: bool,
     ) -> bool:
+        if self.settings.enforce_maximal_research_path:
+            return True
         if explicit is not None:
             return explicit
         if not self.settings.deep_plan_approval_enabled:

@@ -623,7 +623,7 @@ def create_engine_and_sessionmaker(
         "json_deserializer": orjson.loads,
     }
     if database_url.startswith("sqlite+aiosqlite://"):
-        engine_kwargs["connect_args"] = {"timeout": 30}
+        engine_kwargs["connect_args"] = {"timeout": 60}
     if database_url.startswith("sqlite+aiosqlite:///:memory:"):
         engine_kwargs["poolclass"] = StaticPool
     engine = create_async_engine(database_url, **engine_kwargs)
@@ -667,6 +667,10 @@ class ResearchStore:
 
     @staticmethod
     def _apply_schema_patches(connection) -> None:
+        if connection.dialect.name == "sqlite":
+            connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+            connection.exec_driver_sql("PRAGMA synchronous=NORMAL")
+            connection.exec_driver_sql("PRAGMA busy_timeout=60000")
         inspector = inspect(connection)
         existing_tables = set(inspector.get_table_names())
         for table_name in (
@@ -1883,7 +1887,7 @@ class ResearchStore:
                 SourceORM.run_id == run_id,
                 SourceORM.canonical_url == canonical_url,
             )
-            return (await session.execute(stmt)).scalar_one_or_none() is not None
+            return (await session.execute(stmt)).scalars().first() is not None
 
     async def save_source(
         self,
@@ -1898,7 +1902,7 @@ class ResearchStore:
                 SourceORM.canonical_url == str(document.canonical_url),
                 SourceORM.content_hash == content_hash,
             )
-            existing = (await session.execute(stmt)).scalar_one_or_none()
+            existing = (await session.execute(stmt)).scalars().first()
             if existing is not None:
                 return existing.id, False
             source_id = str(uuid4())
@@ -1940,7 +1944,7 @@ class ResearchStore:
                     stmt = stmt.where(SourceRegistryEntryORM.citation_key.is_(None))
                 else:
                     stmt = stmt.where(SourceRegistryEntryORM.citation_key == citation_key)
-                existing = (await session.execute(stmt)).scalar_one_or_none()
+                existing = (await session.execute(stmt)).scalars().first()
                 if existing is not None:
                     if raw_entry.get("source_id") and existing.source_id is None:
                         existing.source_id = raw_entry["source_id"]
@@ -2015,6 +2019,37 @@ class ResearchStore:
                 "url": source.url,
                 "canonical_url": source.canonical_url,
                 "content": source.content,
+                "source_kind": source.source_kind,
+                "retrieval_method": source.retrieval_method,
+                "metadata": dict(source.metadata_json or {}),
+            }
+
+    async def get_run_source_snapshot(
+        self,
+        run_id: str,
+        canonical_url: str,
+    ) -> dict[str, Any] | None:
+        async with self.session_factory() as session:
+            stmt = (
+                select(SourceORM)
+                .where(
+                    SourceORM.run_id == run_id,
+                    SourceORM.canonical_url == canonical_url,
+                )
+                .order_by(SourceORM.created_at.asc())
+                .limit(1)
+            )
+            source = (await session.execute(stmt)).scalars().first()
+            if source is None:
+                return None
+            return {
+                "id": source.id,
+                "title": source.title,
+                "url": source.url,
+                "canonical_url": source.canonical_url,
+                "content": source.content,
+                "source_kind": source.source_kind,
+                "retrieval_method": source.retrieval_method,
                 "metadata": dict(source.metadata_json or {}),
             }
 
@@ -2178,6 +2213,7 @@ class ResearchStore:
                     "passage_index": passage.passage_index,
                     "text": passage.text,
                     "search_document": passage.search_document,
+                    "embedding_vector": passage.embedding_vector,
                     "start_offset": passage.start_offset,
                     "end_offset": passage.end_offset,
                     "token_count": passage.token_count,

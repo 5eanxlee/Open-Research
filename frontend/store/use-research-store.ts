@@ -41,7 +41,7 @@ interface ResearchStoreState {
   profilePreferences: ProfilePreferences;
   memoryPolicyOverride: MemoryInfluencePolicy;
   executionMode: ExecutionMode;
-  requirePlanApproval: boolean | null;
+  requirePlanApproval: boolean;
   clarifierConfig: ClarifierConfig;
   sourceSelection: string[];
   runInputAssets: ResearchInputAsset[];
@@ -61,7 +61,7 @@ interface ResearchStoreState {
   updateProfilePreferences: (patch: Partial<ProfilePreferences>) => void;
   updateMemoryPolicyOverride: (patch: Partial<MemoryInfluencePolicy>) => void;
   setExecutionMode: (value: ExecutionMode) => void;
-  setRequirePlanApproval: (value: boolean | null) => void;
+  setRequirePlanApproval: (value: boolean) => void;
   updateClarifierConfig: (patch: Partial<ClarifierConfig>) => void;
   setSourceSelection: (value: string[]) => void;
   toggleSourceSelection: (value: string) => void;
@@ -111,8 +111,8 @@ export const useResearchStore = create<ResearchStoreState>()(
       profileId: "default",
       profilePreferences: DEFAULT_PROFILE_PREFERENCES,
       memoryPolicyOverride: DEFAULT_MEMORY_POLICY,
-      executionMode: "standard",
-      requirePlanApproval: null,
+      executionMode: "deep",
+      requirePlanApproval: true,
       clarifierConfig: {
         enabled: true,
         max_questions: 2,
@@ -228,8 +228,8 @@ export const useResearchStore = create<ResearchStoreState>()(
           profileId: "default",
           profilePreferences: DEFAULT_PROFILE_PREFERENCES,
           memoryPolicyOverride: DEFAULT_MEMORY_POLICY,
-          executionMode: "standard",
-          requirePlanApproval: null,
+          executionMode: "deep",
+          requirePlanApproval: true,
           clarifierConfig: {
             enabled: true,
             max_questions: 2,
@@ -326,6 +326,37 @@ export const useResearchStore = create<ResearchStoreState>()(
     }),
     {
       name: "open-research-dashboard",
+      version: 3,
+      migrate: (persistedState) => {
+        if (!persistedState || typeof persistedState !== "object") {
+          return persistedState as never;
+        }
+        const state = persistedState as Partial<ResearchStoreState>;
+        return {
+          apiBaseUrl: state.apiBaseUrl ?? DEFAULT_API_BASE_URL,
+          selectedRunId: state.selectedRunId ?? null,
+          selectedProjectId: state.selectedProjectId ?? null,
+          profileId: state.profileId ?? "default",
+          profilePreferences: state.profilePreferences ?? DEFAULT_PROFILE_PREFERENCES,
+          memoryPolicyOverride: state.memoryPolicyOverride ?? DEFAULT_MEMORY_POLICY,
+          executionMode: "deep",
+          requirePlanApproval: true,
+          clarifierConfig: state.clarifierConfig ?? {
+            enabled: true,
+            max_questions: 2,
+            ambiguity_threshold: 0.45,
+            require_response_for_deep: false,
+          },
+          sourceSelection: state.sourceSelection ?? [],
+          runInputAssets: state.runInputAssets ?? [],
+          stagedRunAssets: state.stagedRunAssets ?? [],
+          asyncSubmit: state.asyncSubmit ?? false,
+          budget: state.budget ?? DEFAULT_BUDGET,
+          agentConfig: state.agentConfig ?? DEFAULT_AGENT_CONFIG,
+          modelConfigOverride: state.modelConfigOverride ?? {},
+          serverDefaultsApplied: state.serverDefaultsApplied ?? false,
+        };
+      },
       partialize: (state) => ({
         apiBaseUrl: state.apiBaseUrl,
         selectedRunId: state.selectedRunId,
@@ -333,14 +364,13 @@ export const useResearchStore = create<ResearchStoreState>()(
         profileId: state.profileId,
         profilePreferences: state.profilePreferences,
         memoryPolicyOverride: state.memoryPolicyOverride,
-        executionMode: state.executionMode,
-        requirePlanApproval: state.requirePlanApproval,
+          executionMode: "deep",
+          requirePlanApproval: true,
         clarifierConfig: state.clarifierConfig,
         sourceSelection: state.sourceSelection,
         runInputAssets: state.runInputAssets,
         stagedRunAssets: state.stagedRunAssets,
         asyncSubmit: state.asyncSubmit,
-        questionDraft: state.questionDraft,
         budget: state.budget,
         agentConfig: state.agentConfig,
         modelConfigOverride: state.modelConfigOverride,

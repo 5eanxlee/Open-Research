@@ -16,10 +16,8 @@ import {
   stageAssets,
   uploadProjectFiles,
 } from "@/lib/api";
-import { DEFAULT_AGENT_CONFIG } from "@/lib/defaults";
 import type {
   ClarifierConfig,
-  ExecutionMode,
   MemoryPolicyNumericField,
   ModelConfig,
   ModelConfigOverride,
@@ -181,24 +179,6 @@ const recencyPolicyOptions: ReadonlyArray<CustomSelectOption> = [
   },
 ];
 
-const executionModeOptions: ReadonlyArray<CustomSelectOption> = [
-  {
-    value: "standard",
-    label: "Standard",
-    description: "Default. Run immediately unless complexity triggers a gate.",
-  },
-  {
-    value: "deep",
-    label: "Deep",
-    description: "Allow clarifier and approval gating for deeper work.",
-  },
-  {
-    value: "hitl",
-    label: "HITL",
-    description: "Always require a human approval path before execution.",
-  },
-];
-
 const answerStyleOptions: ReadonlyArray<CustomSelectOption> = [
   {
     value: "analyst",
@@ -263,24 +243,6 @@ const claimGranularityOptions: ReadonlyArray<CustomSelectOption> = [
     value: "balanced",
     label: "Balanced",
     description: "Slightly broader claim grouping.",
-  },
-];
-
-const approvalGateOptions: ReadonlyArray<CustomSelectOption> = [
-  {
-    value: "auto",
-    label: "Auto",
-    description: "Default. Runtime decides from plan depth and mode.",
-  },
-  {
-    value: "force",
-    label: "Always require approval",
-    description: "Pause every eligible deep run for review.",
-  },
-  {
-    value: "skip",
-    label: "Skip when allowed",
-    description: "Let approved-safe runs continue without a stop.",
   },
 ];
 
@@ -711,7 +673,6 @@ export function ProjectPanel({ publicConfig }: Pick<RunComposerProps, "publicCon
   );
 
   const renderUrlComposer = (
-    title: string,
     usage: ResearchAssetUsage,
     scope: "project" | "run",
     label: string,
@@ -720,7 +681,6 @@ export function ProjectPanel({ publicConfig }: Pick<RunComposerProps, "publicCon
     setValue: (value: string) => void,
   ) => (
     <div className="project-inline-form">
-      <span className="project-inline-title">{title}</span>
       <input
         className="text-input"
         value={label}
@@ -763,9 +723,6 @@ export function ProjectPanel({ publicConfig }: Pick<RunComposerProps, "publicCon
       <div className="project-panel-header">
         <div>
           <span className="eyebrow">Project</span>
-          <p className="project-panel-copy">
-            Fresh runs stay isolated. Project runs inherit the project corpus only.
-          </p>
         </div>
         <button
           className="project-new-btn"
@@ -812,7 +769,6 @@ export function ProjectPanel({ publicConfig }: Pick<RunComposerProps, "publicCon
           type="button"
         >
           <span className="project-item-name">No project</span>
-          <span className="project-item-hint">Fresh run, no persistent corpus</span>
         </button>
         {projects.map((project: ProjectSummary) => (
           <button
@@ -822,31 +778,27 @@ export function ProjectPanel({ publicConfig }: Pick<RunComposerProps, "publicCon
             type="button"
           >
             <span className="project-item-name">{project.name}</span>
-            {project.description ? (
-              <span className="project-item-hint">{project.description}</span>
-            ) : null}
           </button>
         ))}
       </div>
 
-      <div className="project-summary-card">
-        <div className="project-summary-row">
-          <span>Project</span>
-          <strong>{currentProject?.name ?? "No project"}</strong>
-        </div>
-        <div className="project-summary-row">
-          <span>Persistent corpus</span>
-          <strong>{currentProject?.assets.length ?? 0} assets</strong>
-        </div>
-        <div className="project-summary-row">
-          <span>Run-only attachments</span>
-          <strong>{runInputAssets.length + stagedRunAssets.length}</strong>
-        </div>
+      <div className="project-summary-pills">
+        <span className="pill muted">
+          {currentProject?.name ?? "No project"}
+        </span>
+        {selectedProjectId ? (
+          <span className="pill muted">
+            {currentProject?.assets.length ?? 0} corpus assets
+          </span>
+        ) : null}
+        <span className="pill muted">
+          {runInputAssets.length + stagedRunAssets.length} run assets
+        </span>
         {limits ? (
-          <p className="project-summary-hint">
-            Upload limit: {limits.max_files_per_batch} files /{" "}
-            {(limits.max_file_size_bytes / (1024 * 1024)).toFixed(0)} MB each.
-          </p>
+          <span className="pill muted">
+            {limits.max_files_per_batch} files /{" "}
+            {(limits.max_file_size_bytes / (1024 * 1024)).toFixed(0)} MB
+          </span>
         ) : null}
       </div>
 
@@ -881,10 +833,7 @@ export function ProjectPanel({ publicConfig }: Pick<RunComposerProps, "publicCon
 
       <div className="project-corpus-section">
         <div className="project-section-header">
-          <span className="eyebrow">Planning Context</span>
-          <span className="project-section-copy">
-            Read before planning and approval. Shapes the proposed deep research plan.
-          </span>
+          <span className="eyebrow">Planning</span>
         </div>
 
         {selectedProjectId ? (
@@ -903,7 +852,6 @@ export function ProjectPanel({ publicConfig }: Pick<RunComposerProps, "publicCon
               </div>
             </div>
             {renderUrlComposer(
-              "Add persistent planning URL",
               "planning_context",
               "project",
               projectPlanningLabel,
@@ -921,9 +869,7 @@ export function ProjectPanel({ publicConfig }: Pick<RunComposerProps, "publicCon
                   }),
                 )}
               </ul>
-            ) : (
-              <p className="project-empty-hint">No persistent planning context in this project.</p>
-            )}
+            ) : null}
           </div>
         ) : null}
 
@@ -942,7 +888,6 @@ export function ProjectPanel({ publicConfig }: Pick<RunComposerProps, "publicCon
             </div>
           </div>
           {renderUrlComposer(
-            "Add run-only planning URL",
             "planning_context",
             "run",
             runPlanningLabel,
@@ -957,19 +902,13 @@ export function ProjectPanel({ publicConfig }: Pick<RunComposerProps, "publicCon
                 renderRunUrlAsset(asset, runInputAssets.indexOf(asset, index)),
               )}
             </ul>
-          ) : (
-            <p className="project-empty-hint">No run-only planning context attached.</p>
-          )}
+          ) : null}
         </div>
       </div>
 
       <div className="project-run-section">
         <div className="project-section-header">
-          <span className="eyebrow">Reference Sources</span>
-          <span className="project-section-copy">
-            Ingest as evidence. They inform retrieval and grounding, but are only cited if they
-            truly support final claims.
-          </span>
+          <span className="eyebrow">References</span>
         </div>
 
         {selectedProjectId ? (
@@ -988,7 +927,6 @@ export function ProjectPanel({ publicConfig }: Pick<RunComposerProps, "publicCon
               </div>
             </div>
             {renderUrlComposer(
-              "Add persistent reference URL",
               "reference_source",
               "project",
               projectReferenceLabel,
@@ -1006,9 +944,7 @@ export function ProjectPanel({ publicConfig }: Pick<RunComposerProps, "publicCon
                   }),
                 )}
               </ul>
-            ) : (
-              <p className="project-empty-hint">No persistent reference sources in this project.</p>
-            )}
+            ) : null}
           </div>
         ) : null}
 
@@ -1027,7 +963,6 @@ export function ProjectPanel({ publicConfig }: Pick<RunComposerProps, "publicCon
             </div>
           </div>
           {renderUrlComposer(
-            "Add run-only reference URL",
             "reference_source",
             "run",
             runReferenceLabel,
@@ -1042,9 +977,7 @@ export function ProjectPanel({ publicConfig }: Pick<RunComposerProps, "publicCon
                 renderRunUrlAsset(asset, runInputAssets.indexOf(asset, index)),
               )}
             </ul>
-          ) : (
-            <p className="project-empty-hint">No run-only reference sources attached.</p>
-          )}
+          ) : null}
         </div>
       </div>
 
@@ -1059,9 +992,6 @@ function CommonSettingsFields({ publicConfig, onOpenPanel }: RunComposerProps) {
   const profileId = useResearchStore((state) => state.profileId);
   const setProfileId = useResearchStore((state) => state.setProfileId);
   const budget = useResearchStore((state) => state.budget);
-  const memoryPolicyOverride = useResearchStore((state) => state.memoryPolicyOverride);
-  const executionMode = useResearchStore((state) => state.executionMode);
-  const setExecutionMode = useResearchStore((state) => state.setExecutionMode);
   const sourceSelection = useResearchStore((state) => state.sourceSelection);
   const selectedProjectId = useResearchStore((state) => state.selectedProjectId);
   const runInputAssets = useResearchStore((state) => state.runInputAssets);
@@ -1091,73 +1021,43 @@ function CommonSettingsFields({ publicConfig, onOpenPanel }: RunComposerProps) {
         />
       </label>
 
-      <label className="field">
-        <span className="field-label">Execution mode</span>
-        <CustomSelect
-          ariaLabel="Execution mode"
-          value={executionMode}
-          onChange={(value) => setExecutionMode(value as ExecutionMode)}
-          options={executionModeOptions}
-        />
-      </label>
-
-      <details className="settings-summary-details">
-        <summary className="settings-summary-trigger">Config summary</summary>
-        <div className="config-callout settings-summary-card">
-          <dl className="settings-summary-grid">
-            <div className="settings-summary-row">
-              <dt>Budget</dt>
-              <dd>
-                {budget.max_streams} streams / {budget.max_queries_per_stream} queries /{" "}
-                {budget.max_sources_per_stream} sources
-              </dd>
-            </div>
-            <div className="settings-summary-row">
-              <dt>Memory</dt>
-              <dd>
-                {memoryPolicyOverride.enabled ? "Enabled" : "Disabled"},{" "}
-                {memoryPolicyOverride.retrieval_limit} retrieval slots
-              </dd>
-            </div>
-            <div className="settings-summary-row">
-              <dt>Workflow</dt>
-              <dd>{executionMode}</dd>
-            </div>
-            <div className="settings-summary-row">
-              <dt>Project</dt>
-              <dd>{selectedProjectId ? "Attached" : "Fresh run"}</dd>
-            </div>
-            <div className="settings-summary-row">
-              <dt>Sources</dt>
-              <dd>
-                {sourceSelection.length > 0
-                  ? `${sourceSelection.length} selected`
-                  : "Deployment default"}
-              </dd>
-            </div>
-            <div className="settings-summary-row">
-              <dt>Inputs</dt>
-              <dd>{runInputAssets.length + stagedRunAssets.length} run-only items</dd>
-            </div>
-            <div className="settings-summary-row">
-              <dt>Models</dt>
-              <dd>
-                {effectiveModels.lead_model} / {effectiveModels.planner_model} /{" "}
-                {effectiveModels.worker_model} / {effectiveModels.verifier_model}
-              </dd>
-            </div>
-            {publicConfig ? (
-              <div className="settings-summary-row settings-summary-row-wide">
-                <dt>Runtime</dt>
-                <dd>
-                  {publicConfig.backends.llm} LLM, {publicConfig.backends.search} search,{" "}
-                  {publicConfig.backends.fetch} fetch, lead {publicConfig.models.lead_model}
-                </dd>
-              </div>
-            ) : null}
-          </dl>
-        </div>
-      </details>
+      <div className="config-callout settings-summary-card">
+        <dl className="settings-summary-grid">
+          <div className="settings-summary-row">
+            <dt>Budget</dt>
+            <dd>
+              {budget.max_streams} streams / {budget.max_queries_per_stream} queries
+            </dd>
+          </div>
+          <div className="settings-summary-row">
+            <dt>Workflow</dt>
+            <dd>Approval-first research</dd>
+          </div>
+          <div className="settings-summary-row">
+            <dt>Project</dt>
+            <dd>{selectedProjectId ? "Attached" : "Fresh run"}</dd>
+          </div>
+          <div className="settings-summary-row">
+            <dt>Sources</dt>
+            <dd>
+              {sourceSelection.length > 0
+                ? `${sourceSelection.length} selected`
+                : "Deployment default"}
+            </dd>
+          </div>
+          <div className="settings-summary-row">
+            <dt>Inputs</dt>
+            <dd>{runInputAssets.length + stagedRunAssets.length} attached</dd>
+          </div>
+          <div className="settings-summary-row settings-summary-row-wide">
+            <dt>Models</dt>
+            <dd>
+              {effectiveModels.lead_model} / {effectiveModels.planner_model} /{" "}
+              {effectiveModels.worker_model} / {effectiveModels.verifier_model}
+            </dd>
+          </div>
+        </dl>
+      </div>
 
       {onOpenPanel ? (
         <div className="button-row composer-actions">
@@ -1167,6 +1067,20 @@ function CommonSettingsFields({ publicConfig, onOpenPanel }: RunComposerProps) {
             type="button"
           >
             Workflow
+          </button>
+          <button
+            className="secondary-button"
+            onClick={() => onOpenPanel("sources")}
+            type="button"
+          >
+            Sources
+          </button>
+          <button
+            className="secondary-button"
+            onClick={() => onOpenPanel("budget")}
+            type="button"
+          >
+            Budget
           </button>
           <button
             className="secondary-button"
@@ -1192,12 +1106,6 @@ export function RunComposer({ publicConfig, onOpenPanel }: RunComposerProps) {
   return (
     <>
       <ProjectPanel publicConfig={publicConfig} />
-      <section className="panel composer-panel">
-        <div className="panel-header">
-          <p className="eyebrow">Quick settings</p>
-        </div>
-        <CommonSettingsFields publicConfig={publicConfig} onOpenPanel={onOpenPanel} />
-      </section>
     </>
   );
 }
@@ -1216,7 +1124,6 @@ function BehaviorSettingsFields() {
           onChange={(value) => updateAgentConfig({ research_profile: value as never })}
           options={researchProfileOptions}
         />
-        <span className="field-hint">Coverage and sourcing strategy.</span>
       </label>
 
       <label className="field">
@@ -1227,7 +1134,6 @@ function BehaviorSettingsFields() {
           onChange={(value) => updateAgentConfig({ recency_policy: value as never })}
           options={recencyPolicyOptions}
         />
-        <span className="field-hint">How much freshness matters.</span>
       </label>
 
       <label className="field">
@@ -1238,7 +1144,6 @@ function BehaviorSettingsFields() {
           onChange={(value) => updateAgentConfig({ answer_style: value as never })}
           options={answerStyleOptions}
         />
-        <span className="field-hint">Report framing and depth.</span>
       </label>
 
       <label className="field">
@@ -1249,7 +1154,6 @@ function BehaviorSettingsFields() {
           onChange={(value) => updateAgentConfig({ source_trust_floor: value as never })}
           options={trustFloorOptions}
         />
-        <span className="field-hint">Minimum acceptable source quality.</span>
       </label>
     </div>
   );
@@ -1281,10 +1185,6 @@ function AgentPolicyFields() {
             onChange={(value) => updateAgentConfig({ citation_discipline: value as never })}
             options={citationDisciplineOptions}
           />
-          <span className="field-hint">
-            Default: {DEFAULT_AGENT_CONFIG.citation_discipline}. Keeps unsupported claims out of the
-            final body.
-          </span>
         </label>
 
         <label className="field">
@@ -1295,9 +1195,6 @@ function AgentPolicyFields() {
             onChange={(value) => updateAgentConfig({ claim_granularity: value as never })}
             options={claimGranularityOptions}
           />
-          <span className="field-hint">
-            Default: {DEFAULT_AGENT_CONFIG.claim_granularity}. Smaller claims are easier to verify.
-          </span>
         </label>
       </div>
 
@@ -1309,17 +1206,13 @@ function AgentPolicyFields() {
             updateAgentConfig({ include_counterevidence: event.target.checked })
           }
         />
-        <span>
-          Surface counterevidence and disagreements instead of optimizing for a single story.
-        </span>
+        <span>Surface counterevidence and disagreements.</span>
       </label>
     </>
   );
 }
 
 function ProfilePreferenceFields() {
-  const profileId = useResearchStore((state) => state.profileId);
-  const agentConfig = useResearchStore((state) => state.agentConfig);
   const profilePreferences = useResearchStore((state) => state.profilePreferences);
   const updateProfilePreferences = useResearchStore(
     (state) => state.updateProfilePreferences,
@@ -1327,18 +1220,6 @@ function ProfilePreferenceFields() {
 
   return (
     <>
-      <div className="config-callout">
-        <p>
-          These preferences are saved under profile <code>{profileId}</code> before each run
-          starts.
-        </p>
-        <p>
-          “Follow run policy” means: answer style {agentConfig.answer_style}, recency{" "}
-          {agentConfig.recency_policy}, trust floor {agentConfig.source_trust_floor}, and
-          counterevidence {agentConfig.include_counterevidence ? "enabled" : "disabled"}.
-        </p>
-      </div>
-
       <div className="settings-grid">
         <label className="field settings-grid-wide">
           <span className="field-label">Preferred sources</span>
@@ -1462,11 +1343,6 @@ function ModelSelectionFields({ publicConfig }: RunComposerProps) {
 
   return (
     <>
-      <div className="config-callout">
-        <p>Model changes apply to the next run immediately. No backend restart is required.</p>
-        <p>Leaving a model override blank falls back to the server default shown in the hint.</p>
-      </div>
-
       <div className="settings-grid">
         <label className="field settings-grid-wide">
           <span className="field-label">Lead model</span>
@@ -1476,10 +1352,6 @@ function ModelSelectionFields({ publicConfig }: RunComposerProps) {
             onChange={handleModelChange("lead_model")}
             placeholder={publicConfig?.models.lead_model ?? "gpt-5.4"}
           />
-          <span className="field-hint">
-            Report synthesis and final high-level drafting. Default:{" "}
-            {publicConfig?.models.lead_model ?? "unknown"}.
-          </span>
         </label>
 
         <label className="field">
@@ -1490,9 +1362,6 @@ function ModelSelectionFields({ publicConfig }: RunComposerProps) {
             onChange={handleModelChange("planner_model")}
             placeholder={publicConfig?.models.planner_model ?? "gpt-5.4"}
           />
-          <span className="field-hint">
-            Preview planning, post-approval execution planning, and replans.
-          </span>
         </label>
 
         <label className="field">
@@ -1503,7 +1372,6 @@ function ModelSelectionFields({ publicConfig }: RunComposerProps) {
             onChange={handleModelChange("worker_model")}
             placeholder={publicConfig?.models.worker_model ?? "gpt-5.4-mini"}
           />
-          <span className="field-hint">Streams and note writing.</span>
         </label>
 
         <label className="field">
@@ -1514,7 +1382,6 @@ function ModelSelectionFields({ publicConfig }: RunComposerProps) {
             onChange={handleModelChange("verifier_model")}
             placeholder={publicConfig?.models.verifier_model ?? "gpt-5.4-mini"}
           />
-          <span className="field-hint">Claim verification and repair.</span>
         </label>
 
         <label className="field">
@@ -1525,7 +1392,6 @@ function ModelSelectionFields({ publicConfig }: RunComposerProps) {
             onChange={handleModelChange("embedding_model")}
             placeholder={publicConfig?.models.embedding_model ?? "text-embedding-3-large"}
           />
-          <span className="field-hint">Only used when embeddings are enabled.</span>
         </label>
 
         <label className="field">
@@ -1536,7 +1402,6 @@ function ModelSelectionFields({ publicConfig }: RunComposerProps) {
             onChange={handleModelChange("reranker_model")}
             placeholder={publicConfig?.models.reranker_model ?? "BAAI/bge-reranker-v2-m3"}
           />
-          <span className="field-hint">Only used when reranking is enabled.</span>
         </label>
       </div>
 
@@ -1550,8 +1415,6 @@ function ModelSelectionFields({ publicConfig }: RunComposerProps) {
 }
 
 function ExecutionWorkflowFields({ publicConfig }: RunComposerProps) {
-  const requirePlanApproval = useResearchStore((state) => state.requirePlanApproval);
-  const setRequirePlanApproval = useResearchStore((state) => state.setRequirePlanApproval);
   const clarifierConfig = useResearchStore((state) => state.clarifierConfig);
   const updateClarifierConfig = useResearchStore((state) => state.updateClarifierConfig);
   const asyncSubmit = useResearchStore((state) => state.asyncSubmit);
@@ -1559,33 +1422,11 @@ function ExecutionWorkflowFields({ publicConfig }: RunComposerProps) {
 
   return (
     <>
-      <div className="config-callout">
-        <p>
-          This drawer controls approval, clarification, and async behavior. Execution mode stays on
-          the main rail so it is always visible before you start a run.
-        </p>
-        <p>Approval gate defaults to Auto, which lets the runtime decide from mode and plan depth.</p>
-      </div>
-
       <div className="settings-grid">
-        <label className="field">
-          <span className="field-label">Approval gate</span>
-          <CustomSelect
-            ariaLabel="Approval gate"
-            value={
-              requirePlanApproval === null ? "auto" : requirePlanApproval ? "force" : "skip"
-            }
-            onChange={(value) =>
-              setRequirePlanApproval(
-                value === "auto" ? null : value === "force",
-              )
-            }
-            options={approvalGateOptions}
-          />
-          <span className="field-hint">
-            Default: Auto. The harness evaluates execution mode and plan complexity.
-          </span>
-        </label>
+        <div className="field static-field">
+          <span className="field-label">Workflow</span>
+          <span className="field-static-value">Approval-first research</span>
+        </div>
 
         <label className="field">
           <span className="field-label">Clarifier max questions</span>
@@ -1637,7 +1478,7 @@ function ExecutionWorkflowFields({ publicConfig }: RunComposerProps) {
               })
             }
           />
-          <span>Always ask before deep runs</span>
+          <span>Always clarify before planning</span>
         </label>
 
         <label className="toggle-card">
@@ -1651,9 +1492,7 @@ function ExecutionWorkflowFields({ publicConfig }: RunComposerProps) {
       </div>
 
       {publicConfig?.capabilities.supports_deep_approval === false ? (
-        <div className="config-callout">
-          <p>The backend currently has deep approval disabled. These controls will be ignored.</p>
-        </div>
+        <p className="muted-text">Plan approval is disabled on this backend.</p>
       ) : null}
     </>
   );
@@ -1668,17 +1507,6 @@ function SourceSelectionFields({ publicConfig }: RunComposerProps) {
 
   return (
     <>
-      <div className="config-callout">
-        <p>
-          Source selection constrains which search and fetch backends the planner and worker may
-          use for the next run.
-        </p>
-        <p>
-          Deployment default means the backend’s default source set, not every provider in the
-          catalog.
-        </p>
-      </div>
-
       <div className="toggle-grid">
         {availableSources.map((source) => (
           <label className="toggle-card" key={source.id}>
@@ -1725,14 +1553,8 @@ function MemoryHarnessFields({ publicConfig }: RunComposerProps) {
   return (
     <>
       {!supportsMemoryHarness ? (
-        <div className="config-callout">
-          <p>The backend has profile memory disabled. These controls will not affect runs.</p>
-        </div>
+        <p className="muted-text">Profile memory is disabled on this backend.</p>
       ) : null}
-
-      <div className="config-callout">
-        <p>These settings apply as a per-run override. They do not rewrite the saved profile.</p>
-      </div>
 
       <label className="toggle-row">
         <input
@@ -1760,8 +1582,8 @@ function MemoryHarnessFields({ publicConfig }: RunComposerProps) {
               disabled={!supportsMemoryHarness}
             />
             <span className="field-hint">
-              {field.description} Range: {memoryLimits?.[field.key]?.min ?? field.min}-
-              {memoryLimits?.[field.key]?.max ?? field.max}.
+              {memoryLimits?.[field.key]?.min ?? field.min}-
+              {memoryLimits?.[field.key]?.max ?? field.max}
             </span>
           </label>
         ))}
@@ -1852,8 +1674,8 @@ function BudgetFields({ publicConfig }: RunComposerProps) {
             onChange={handleBudgetChange(field.key)}
           />
           <span className="field-hint">
-            {field.description} Range: {budgetLimits?.[field.key]?.min ?? field.min}-
-            {budgetLimits?.[field.key]?.max ?? field.max}.
+            {budgetLimits?.[field.key]?.min ?? field.min}-
+            {budgetLimits?.[field.key]?.max ?? field.max}
           </span>
         </label>
       ))}

@@ -985,6 +985,17 @@ class OpenAIJsonClient:
             return {}
         return {"reasoning": {"effort": reasoning_effort}}
 
+    def _temperature_kwargs(
+        self,
+        *,
+        model: str,
+        reasoning_effort: str,
+        temperature: float,
+    ) -> dict[str, Any]:
+        if model.startswith("gpt-5") and reasoning_effort != "none":
+            return {}
+        return {"temperature": temperature}
+
     async def generate_text(
         self,
         *,
@@ -1001,7 +1012,11 @@ class OpenAIJsonClient:
                     system_prompt=system_prompt,
                     user_prompt=user_prompt,
                 ),
-                temperature=temperature,
+                **self._temperature_kwargs(
+                    model=model,
+                    reasoning_effort=reasoning_effort,
+                    temperature=temperature,
+                ),
                 **self._reasoning_kwargs(reasoning_effort),
             )
             return _extract_chat_completion_text(response).strip()
@@ -1010,7 +1025,11 @@ class OpenAIJsonClient:
             instructions=system_prompt,
             input=user_prompt,
             **self._reasoning_kwargs(reasoning_effort),
-            temperature=temperature,
+            **self._temperature_kwargs(
+                model=model,
+                reasoning_effort=reasoning_effort,
+                temperature=temperature,
+            ),
             store=False,
         )
         output_text = getattr(response, "output_text", None)
@@ -1093,7 +1112,11 @@ class OpenAIJsonClient:
             instructions=system_prompt,
             input=user_prompt,
             **self._reasoning_kwargs(reasoning_effort),
-            temperature=temperature,
+            **self._temperature_kwargs(
+                model=model,
+                reasoning_effort=reasoning_effort,
+                temperature=temperature,
+            ),
             text_format=schema_model,
             store=False,
         )
@@ -1120,7 +1143,11 @@ class OpenAIJsonClient:
                 user_prompt=user_prompt,
             ),
             response_format=schema_model,
-            temperature=temperature,
+            **self._temperature_kwargs(
+                model=model,
+                reasoning_effort=reasoning_effort,
+                temperature=temperature,
+            ),
             **self._reasoning_kwargs(reasoning_effort),
         )
         value = _extract_chat_parsed_output(response, schema_model=schema_model)
@@ -1152,7 +1179,11 @@ class OpenAIJsonClient:
                     "schema": schema_model.model_json_schema(),
                 },
             },
-            temperature=temperature,
+            **self._temperature_kwargs(
+                model=model,
+                reasoning_effort=reasoning_effort,
+                temperature=temperature,
+            ),
             **self._reasoning_kwargs(reasoning_effort),
         )
         text = _extract_chat_completion_text(response)
@@ -1185,7 +1216,11 @@ class OpenAIJsonClient:
                     system_prompt=instructions,
                     user_prompt=user_prompt,
                 ),
-                temperature=temperature,
+                **self._temperature_kwargs(
+                    model=model,
+                    reasoning_effort=reasoning_effort,
+                    temperature=temperature,
+                ),
                 **self._reasoning_kwargs(reasoning_effort),
             )
             text = _extract_chat_completion_text(response)
@@ -1195,7 +1230,11 @@ class OpenAIJsonClient:
                 instructions=instructions,
                 input=user_prompt,
                 **self._reasoning_kwargs(reasoning_effort),
-                temperature=temperature,
+                **self._temperature_kwargs(
+                    model=model,
+                    reasoning_effort=reasoning_effort,
+                    temperature=temperature,
+                ),
                 store=False,
             )
             text = getattr(response, "output_text", None) or _extract_output_text(response)

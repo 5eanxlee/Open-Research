@@ -1,7 +1,8 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 import type {
   RunConversationMessage,
@@ -17,27 +18,27 @@ import type {
   WorkspaceTaskView,
 } from "@/lib/types";
 
-type WorkspaceTab =
+type WorkspaceDetailsTab =
   | "overview"
   | "plan"
   | "tasks"
   | "thinking"
   | "sources"
   | "citations"
-  | "report"
-  | "chat"
   | "trace";
+
+type WorkspacePrimaryView = "chat" | "report";
 
 type ThinkingSubtab = "decisions" | "agents" | "tools" | "files";
 
-const PHASE_TO_TAB: Record<WorkspacePhaseKey, WorkspaceTab> = {
+const PHASE_TO_DETAILS_TAB: Record<WorkspacePhaseKey, WorkspaceDetailsTab> = {
   intake: "overview",
   clarify: "plan",
   plan: "plan",
   execute: "tasks",
-  ground: "report",
+  ground: "citations",
   audit: "citations",
-  deliver: "report",
+  deliver: "overview",
 };
 
 function formatTime(value: string | null | undefined): string {
@@ -67,11 +68,110 @@ function formatDuration(start: string, end?: string | null): string {
   return `${seconds}s`;
 }
 
+function formatElapsedMs(value: number | null | undefined): string | null {
+  if (value == null || value <= 0) return null;
+  const totalSeconds = Math.max(Math.round(value / 1000), 0);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes >= 60) {
+    const hours = Math.floor(minutes / 60);
+    const remainingMinutes = minutes % 60;
+    return `${hours}h ${remainingMinutes}m`;
+  }
+  if (minutes > 0) {
+    return `${minutes}m ${seconds}s`;
+  }
+  return `${seconds}s`;
+}
+
 function titleCase(value: string): string {
   return value
     .replaceAll("_", " ")
     .replaceAll(".", " ")
     .replace(/\b\w/g, (match) => match.toUpperCase());
+}
+
+function slugifyFilename(value: string): string {
+  const normalized = value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return normalized || "research-report";
+}
+
+function normalizeInlineText(value: string | null | undefined): string {
+  if (!value) return "";
+  return value
+    .replace(/\\[nrt]/g, " ")
+    .replace(/\\+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function normalizeLookupValue(value: string | null | undefined): string | null {
+  const normalized = normalizeInlineText(value);
+  return normalized ? normalized.toLowerCase() : null;
+}
+
+function resolveCitationSource(
+  citation: WorkspaceCitationView,
+  sources: WorkspaceSourceView[],
+): WorkspaceSourceView | null {
+  const sourceId = normalizeLookupValue(citation.source_id);
+  if (sourceId) {
+    const directMatch = sources.find(
+      (source) =>
+        normalizeLookupValue(source.source_id) === sourceId ||
+        normalizeLookupValue(source.id) === sourceId,
+    );
+    if (directMatch) {
+      return directMatch;
+    }
+  }
+
+  const sourceUrl = normalizeLookupValue(citation.source_url);
+  if (sourceUrl) {
+    const urlMatch = sources.find((source) => normalizeLookupValue(source.url) === sourceUrl);
+    if (urlMatch) {
+      return urlMatch;
+    }
+  }
+
+  const sourceTitle = normalizeLookupValue(citation.source_title);
+  if (sourceTitle) {
+    const titleMatch = sources.find(
+      (source) => normalizeLookupValue(source.title) === sourceTitle,
+    );
+    if (titleMatch) {
+      return titleMatch;
+    }
+  }
+
+  const claimTitle = normalizeLookupValue(citation.claim);
+  if (claimTitle) {
+    const claimMatch = sources.find(
+      (source) => normalizeLookupValue(source.title) === claimTitle,
+    );
+    if (claimMatch) {
+      return claimMatch;
+    }
+  }
+
+  return null;
+}
+
+function getCitationSourceLabel(
+  citation: WorkspaceCitationView,
+  sources: WorkspaceSourceView[],
+): string {
+  const resolvedSource = resolveCitationSource(citation, sources);
+  return normalizeInlineText(
+    citation.source_title ??
+      resolvedSource?.title ??
+      citation.source_url ??
+      resolvedSource?.url ??
+      "Unknown source",
+  );
 }
 
 function EventCard({ event }: { event: RunEvent }) {
@@ -83,6 +183,34 @@ function EventCard({ event }: { event: RunEvent }) {
       </summary>
       <pre>{JSON.stringify(event.payload, null, 2)}</pre>
     </details>
+  );
+}
+
+function MarkdownContent({
+  content,
+  className,
+}: {
+  content: string;
+  className?: string;
+}) {
+  return (
+    <div className={`markdown-body workspace-markdown${className ? ` ${className}` : ""}`}>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          a: ({ node: _node, ...props }) => (
+            <a {...props} rel="noreferrer" target="_blank" />
+          ),
+          table: ({ node: _node, children, ...props }) => (
+            <div className="markdown-table-wrap">
+              <table {...props}>{children as ReactNode}</table>
+            </div>
+          ),
+        }}
+      >
+        {content}
+      </ReactMarkdown>
+    </div>
   );
 }
 
@@ -138,15 +266,20 @@ export function RunWorkspace({
   onSendMessage,
   pending,
 }: RunWorkspaceProps) {
-  const [activeTab, setActiveTab] = useState<WorkspaceTab>("overview");
+  const [detailsTab, setDetailsTab] = useState<WorkspaceDetailsTab>("overview");
+  const [primaryView, setPrimaryView] = useState<WorkspacePrimaryView>("chat");
+  const [detailsOpen, setDetailsOpen] = useState(false);
   const [focusedPhase, setFocusedPhase] = useState<WorkspacePhaseKey | null>(null);
   const [selectedStreamId, setSelectedStreamId] = useState<string>("all");
   const [thinkingSubtab, setThinkingSubtab] = useState<ThinkingSubtab>("decisions");
   const [selectedSourceId, setSelectedSourceId] = useState<string | null>(null);
   const [selectedSectionId, setSelectedSectionId] = useState<string | null>(null);
+  const [selectedCitationId, setSelectedCitationId] = useState<string | null>(null);
   const [clarificationDraft, setClarificationDraft] = useState("");
   const [approvalNote, setApprovalNote] = useState("");
   const [chatDraft, setChatDraft] = useState("");
+  const [reportExpanded, setReportExpanded] = useState(false);
+  const [reportActionNotice, setReportActionNotice] = useState<string | null>(null);
 
   useEffect(() => {
     if (!workspace) return;
@@ -164,11 +297,28 @@ export function RunWorkspace({
 
   useEffect(() => {
     if (!workspace) return;
-    setActiveTab("overview");
+    if (!workspace.citations.some((citation) => citation.id === selectedCitationId)) {
+      setSelectedCitationId(workspace.citations[0]?.id ?? null);
+    }
+  }, [selectedCitationId, workspace]);
+
+  useEffect(() => {
+    if (!workspace) return;
+    setDetailsTab("overview");
+    setPrimaryView("chat");
+    setDetailsOpen(false);
     setFocusedPhase(null);
     setSelectedStreamId("all");
     setThinkingSubtab("decisions");
+    setReportExpanded(false);
+    setReportActionNotice(null);
   }, [workspace?.run_id]);
+
+  useEffect(() => {
+    if (!reportActionNotice) return;
+    const timeout = window.setTimeout(() => setReportActionNotice(null), 2200);
+    return () => window.clearTimeout(timeout);
+  }, [reportActionNotice]);
 
   const phaseFilteredEvents = useMemo(() => {
     if (!workspace) return rawEvents;
@@ -268,10 +418,43 @@ export function RunWorkspace({
 
   if (!workspace) {
     return (
-      <section className="panel workspace-panel">
-        <div className="empty-state">
-          <p>Select a run.</p>
-          <span>The live research workspace appears here with plan, tasks, sources, citations, and report visibility.</span>
+      <section className="panel workspace-panel workspace-empty-panel">
+        <div className="workspace-empty">
+          <div className="workspace-empty-mark" aria-hidden>
+            <span className="workspace-empty-dot status-queued" />
+            <span className="workspace-empty-dot status-researching" />
+            <span className="workspace-empty-dot status-completed" />
+          </div>
+          <p className="eyebrow">Workspace</p>
+          <h2 className="workspace-empty-title">Ready to run</h2>
+          <p className="workspace-empty-copy">
+            Ask a question below. As the run unfolds, the workspace will show the
+            plan preview, stream-by-stream execution, grounded citations, and the
+            final report — all in one place.
+          </p>
+          <div className="workspace-empty-hints">
+            <article>
+              <strong>Plan before you run</strong>
+              <span>
+                Enable plan approval in Customize → Workflow for human-in-the-loop
+                planning before any sources are touched.
+              </span>
+            </article>
+            <article>
+              <strong>Attach context</strong>
+              <span>
+                Link a Project to keep a session anchored to your corpus and prior
+                research.
+              </span>
+            </article>
+            <article>
+              <strong>Traceable grounding</strong>
+              <span>
+                Every claim in the final report links back to the passage, source,
+                and audit decision that supports it.
+              </span>
+            </article>
+          </div>
         </div>
       </section>
     );
@@ -286,35 +469,110 @@ export function RunWorkspace({
     workspace.sources.find((source) => source.id === selectedSourceId) ??
     workspace.sources[0] ??
     null;
-
+  const selectedCitation =
+    workspace.citations.find((citation) => citation.id === selectedCitationId) ??
+    workspace.citations[0] ??
+    null;
+  const citationSummary = {
+    surviving: workspace.citations.filter((citation) => citation.status === "surviving").length,
+    removed: workspace.citations.filter((citation) => citation.status === "removed").length,
+    uncitedSources: workspace.sources.filter(
+      (source) => source.state !== "cited" && source.state !== "removed",
+    ).length,
+  };
+  const displayConnectionState =
+    (workspace.status === "completed" ||
+      workspace.status === "failed" ||
+      workspace.status === "cancelled") &&
+    connectionState === "error"
+      ? "terminal"
+      : connectionState;
   const approvalBanner =
     workspace.status === "clarifying" || workspace.status === "awaiting_plan_approval";
+  const reportReady = Boolean(workspace.final_report_markdown);
+  const reportMarkdown = workspace.final_report_markdown ?? "";
+  const reportFilename = `${slugifyFilename(workspace.question)}-report.md`;
+  const plannedStreams =
+    workspace.plan.plan_preview?.plan.streams ?? workspace.plan.approved_plan?.streams ?? [];
+  const latestConversationModel = conversationMessages.at(-1)?.model ?? null;
+  const shellSummary = [
+    {
+      label: "Phase",
+      value: activePhase?.label ?? titleCase(workspace.current_phase),
+    },
+    { label: "Elapsed", value: formatDuration(workspace.created_at, workspace.updated_at) },
+    { label: "Cost", value: `$${workspace.estimated_cost_usd.toFixed(4)}` },
+    { label: "Transport", value: connectionMode ?? displayConnectionState },
+  ];
+
+  const handleCopyReport = async () => {
+    if (!reportMarkdown) return;
+    try {
+      await navigator.clipboard.writeText(reportMarkdown);
+      setReportActionNotice("Report copied.");
+    } catch {
+      setReportActionNotice("Copy failed.");
+    }
+  };
+
+  const handleDownloadReport = () => {
+    if (!reportMarkdown) return;
+    const blob = new Blob([reportMarkdown], { type: "text/markdown;charset=utf-8" });
+    const href = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = href;
+    link.download = reportFilename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(href);
+    setReportActionNotice("Report downloaded.");
+  };
 
   return (
-    <section className="panel workspace-panel">
-      <div className="workspace-header">
-        <div className="workspace-header-main">
-          <p className="eyebrow">Run workspace</p>
+    <section className="panel workspace-panel workspace-shell-panel">
+      <div className="workspace-shell-header">
+        <div className="workspace-shell-title">
+          <p className="eyebrow">Research chat</p>
           <h2 className="panel-title">{workspace.question}</h2>
-          <div className="workspace-meta-row">
-            <span className={`pill status-${workspace.status}`}>{workspace.status}</span>
-            <span className="pill muted">{activePhase?.label ?? titleCase(workspace.current_phase)}</span>
-            <span className="pill muted">{formatDuration(workspace.created_at, workspace.updated_at)}</span>
-            <span className="pill muted">${workspace.estimated_cost_usd.toFixed(4)}</span>
-            <span className="pill muted">{workspace.execution_mode}</span>
-            <span className="pill muted">{workspace.approval_status ?? "not_required"}</span>
-            <span className="pill muted">{workspace.job ? `job:${workspace.job.status}` : "direct run"}</span>
-            <span className="pill muted">{connectionState}</span>
-            {connectionMode ? <span className="pill muted">{connectionMode}</span> : null}
-            {workspace.project_id ? <span className="pill muted">project attached</span> : null}
-          </div>
-          <div className="workspace-submeta">
-            <span>Sources: {workspace.source_selection.length ? workspace.source_selection.join(", ") : "deployment default"}</span>
-            <span>Last event: {formatTime(workspace.connection.last_event_at)}</span>
-            <span>Events: {workspace.connection.event_count}</span>
+          <div className="workspace-shell-meta">
+            <span className={`pill status-${workspace.status}`}>{titleCase(workspace.status)}</span>
+            {workspace.approval_status ? (
+              <span className="pill muted">
+                Approval: {workspace.approval_status.replaceAll("_", " ")}
+              </span>
+            ) : null}
+            {workspace.project_id ? <span className="pill muted">Project attached</span> : null}
+            <span className="workspace-shell-timestamp">
+              Updated {formatTime(workspace.updated_at)}
+            </span>
           </div>
         </div>
-        <div className="workspace-header-actions">
+        <div className="workspace-shell-actions">
+          <div className="workspace-primary-tabs">
+            <button
+              className={`workspace-primary-tab ${primaryView === "chat" ? "active" : ""}`}
+              onClick={() => setPrimaryView("chat")}
+              type="button"
+            >
+              Chat
+            </button>
+            <button
+              className={`workspace-primary-tab ${primaryView === "report" ? "active" : ""}`}
+              onClick={() => setPrimaryView("report")}
+              type="button"
+              disabled={!reportReady}
+            >
+              Final report
+            </button>
+          </div>
+          <button
+            className="secondary-button"
+            onClick={() => setDetailsOpen((current) => !current)}
+            type="button"
+          >
+            {detailsOpen ? "Hide details" : "Run details"}
+          </button>
           {workspace.status !== "completed" &&
           workspace.status !== "failed" &&
           workspace.status !== "cancelled" ? (
@@ -353,62 +611,477 @@ export function RunWorkspace({
         </div>
       </div>
 
-      {approvalBanner ? (
-        <div className="workspace-banner">
-          <div>
-            <strong>
-              {workspace.status === "clarifying"
-                ? "Clarification is blocking the plan."
-                : "Plan approval is blocking execution."}
-            </strong>
-            <span>
-              {workspace.status === "clarifying"
-                ? "Answer the outstanding question so the preview can be regenerated."
-                : "Approve, reject, or request changes to move the run forward."}
-            </span>
-          </div>
-          <button
-            className="secondary-button"
-            onClick={() => setActiveTab("plan")}
-            type="button"
-          >
-            Open plan tab
-          </button>
-        </div>
-      ) : null}
+      <div className={`workspace-shell-layout ${detailsOpen ? "with-details" : ""}`}>
+        <section className="workspace-primary-surface">
+          {approvalBanner ? (
+            <div className="workspace-banner workspace-banner-inline">
+              <div>
+                <strong>
+                  {workspace.status === "clarifying"
+                    ? "Clarification is blocking the plan."
+                    : "Plan approval is blocking execution."}
+                </strong>
+                <span>
+                  {workspace.status === "clarifying"
+                    ? "Answer the outstanding question so the preview can be regenerated."
+                    : "Approve, reject, or request changes to move this run forward."}
+                </span>
+              </div>
+              <button
+                className="secondary-button"
+                onClick={() => {
+                  setDetailsOpen(true);
+                  setDetailsTab("plan");
+                }}
+                type="button"
+              >
+                Review plan
+              </button>
+            </div>
+          ) : null}
 
-      <div className="phase-rail">
-        {workspace.phases.map((phase) => (
-          <button
-            className={`phase-node ${phase.status} ${focusedPhase === phase.key ? "active" : ""}`}
-            key={phase.key}
-            onClick={() => {
-              setFocusedPhase((current) => (current === phase.key ? null : phase.key));
-              setActiveTab(PHASE_TO_TAB[phase.key]);
-            }}
-            type="button"
-          >
-            <span className="phase-node-title">{phase.label}</span>
-            <small>{phase.status}</small>
-            <strong>{phase.event_count}</strong>
-          </button>
-        ))}
-      </div>
+          {primaryView === "chat" ? (
+            <div className="workspace-chat-shell">
+              <div className="workspace-thread conversation-thread">
+                <article className="thread-item conversation-turn user prompt-turn">
+                  <strong>You</strong>
+                  <p>{workspace.question}</p>
+                </article>
 
-      <div className="workspace-tabs">
-        {(["overview", "plan", "tasks", "thinking", "sources", "citations", "report", "chat", "trace"] as WorkspaceTab[]).map((tab) => (
-          <button
-            className={`workspace-tab ${activeTab === tab ? "active" : ""}`}
-            key={tab}
-            onClick={() => setActiveTab(tab)}
-            type="button"
-          >
-            {titleCase(tab)}
-          </button>
-        ))}
-      </div>
+                {workspace.plan.plan_preview ? (
+                  <article className="thread-item conversation-turn system">
+                    <strong>
+                      {workspace.status === "awaiting_plan_approval"
+                        ? "Plan preview"
+                        : "Planning summary"}
+                    </strong>
+                    <div className="workspace-stack compact">
+                      <span>{workspace.plan.plan_preview.summary}</span>
+                      <small>{workspace.plan.plan_preview.hypothesis}</small>
+                      <div className="workspace-token-list">
+                        <span className="workspace-token">
+                          {workspace.plan.effective_budget
+                            ? `${workspace.plan.effective_budget.max_streams} streams`
+                            : "Budget pending"}
+                        </span>
+                        <span className="workspace-token">
+                          {plannedStreams.length} planned lanes
+                        </span>
+                      </div>
+                    </div>
+                    {workspace.status === "awaiting_plan_approval" ? (
+                      <div className="workspace-form">
+                        <textarea
+                          className="textarea-input"
+                          value={approvalNote}
+                          onChange={(event) => setApprovalNote(event.target.value)}
+                          rows={3}
+                          placeholder="Optional note or requested changes."
+                        />
+                        <div className="button-row">
+                          <button
+                            className="primary-button"
+                            onClick={() =>
+                              onApprove?.(workspace.run_id, approvalNote.trim() || undefined)
+                            }
+                            type="button"
+                            disabled={pending?.approve}
+                          >
+                            Approve
+                          </button>
+                          <button
+                            className="secondary-button"
+                            onClick={() =>
+                              onRequestChanges?.(
+                                workspace.run_id,
+                                approvalNote.trim() || undefined,
+                              )
+                            }
+                            type="button"
+                            disabled={pending?.requestChanges}
+                          >
+                            Request changes
+                          </button>
+                          <button
+                            className="secondary-button"
+                            onClick={() =>
+                              onReject?.(workspace.run_id, approvalNote.trim() || undefined)
+                            }
+                            type="button"
+                            disabled={pending?.reject}
+                          >
+                            Reject
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <button
+                        className="ghost-button"
+                        onClick={() => {
+                          setDetailsOpen(true);
+                          setDetailsTab("plan");
+                        }}
+                        type="button"
+                      >
+                        Open planning details
+                      </button>
+                    )}
+                  </article>
+                ) : null}
 
-      {activeTab === "overview" ? (
+                {workspace.status === "clarifying" &&
+                workspace.plan.clarification_session &&
+                onAnswerClarification ? (
+                  <article className="thread-item conversation-turn system">
+                    <strong>Clarification needed</strong>
+                    <div className="workspace-stack compact">
+                      {workspace.plan.clarification_session.questions.map((question) => (
+                        <article className="workspace-inline-card" key={question.id}>
+                          <strong>{question.prompt}</strong>
+                          <small>{question.rationale}</small>
+                        </article>
+                      ))}
+                    </div>
+                    <div className="workspace-form">
+                      <textarea
+                        className="textarea-input"
+                        value={clarificationDraft}
+                        onChange={(event) => setClarificationDraft(event.target.value)}
+                        rows={4}
+                        placeholder="Describe must-cover angles, blockers, and desired outcome."
+                      />
+                      <button
+                        className="primary-button"
+                        onClick={() =>
+                          onAnswerClarification(workspace.run_id, clarificationDraft.trim())
+                        }
+                        type="button"
+                        disabled={!clarificationDraft.trim() || pending?.clarification}
+                      >
+                        Submit clarification
+                      </button>
+                    </div>
+                  </article>
+                ) : null}
+
+                {reportReady ? (
+                  <article className="thread-item conversation-turn assistant report-turn">
+                    <div className="conversation-turn-header">
+                      <strong>Final report</strong>
+                      <div className="workspace-report-actions">
+                        <button
+                          className="ghost-button"
+                          onClick={() => setReportExpanded((current) => !current)}
+                          type="button"
+                        >
+                          {reportExpanded ? "Collapse report" : "Read full report"}
+                        </button>
+                        <button
+                          className="ghost-button"
+                          onClick={() => setPrimaryView("report")}
+                          type="button"
+                        >
+                          Open report view
+                        </button>
+                        <button
+                          className="ghost-button"
+                          onClick={handleCopyReport}
+                          type="button"
+                        >
+                          Copy
+                        </button>
+                        <button
+                          className="ghost-button"
+                          onClick={handleDownloadReport}
+                          type="button"
+                        >
+                          Download
+                        </button>
+                      </div>
+                    </div>
+                    {reportActionNotice ? (
+                      <span className="workspace-inline-feedback">{reportActionNotice}</span>
+                    ) : null}
+                    <MarkdownContent
+                      className={reportExpanded ? "workspace-report-preview expanded" : "workspace-report-preview collapsed"}
+                      content={reportMarkdown}
+                    />
+                  </article>
+                ) : workspace.status === "failed" ||
+                  workspace.status === "cancelled" ? (
+                  <article className="thread-item conversation-turn assistant status-turn terminal">
+                    <div className="status-turn-head">
+                      <span className={`status-dot status-${workspace.status}`} />
+                      <strong>
+                        {workspace.status === "failed"
+                          ? "Run failed"
+                          : "Run cancelled"}
+                      </strong>
+                    </div>
+                    <span>
+                      {activePhase?.blocked_reason ??
+                        (workspace.status === "failed"
+                          ? "The run stopped before a report could be grounded. Retry or resume to continue."
+                          : "The run was cancelled. You can retry from the header or start a fresh question below.")}
+                    </span>
+                    <div className="workspace-token-list">
+                      <span className="workspace-token">
+                        Stopped in{" "}
+                        {activePhase?.label ?? titleCase(workspace.current_phase)}
+                      </span>
+                      <span className="workspace-token">
+                        {workspace.connection.event_count} events captured
+                      </span>
+                      {workspace.citations.length ? (
+                        <span className="workspace-token">
+                          {workspace.citations.length} citations
+                        </span>
+                      ) : null}
+                    </div>
+                  </article>
+                ) : (
+                  <article className="thread-item conversation-turn assistant status-turn">
+                    <div className="status-turn-head">
+                      <span className={`status-dot status-${workspace.status}`} />
+                      <strong>Research in progress</strong>
+                      <span className="status-turn-phase">
+                        {activePhase?.label ?? titleCase(workspace.current_phase)}
+                      </span>
+                    </div>
+                    <span>
+                      {activePhase?.blocked_reason ??
+                        (workspace.streams.length
+                          ? `Running ${workspace.streams.length} stream${
+                              workspace.streams.length === 1 ? "" : "s"
+                            } across ${workspace.sources.length} source${
+                              workspace.sources.length === 1 ? "" : "s"
+                            }.`
+                          : `Current phase: ${
+                              activePhase?.label ?? titleCase(workspace.current_phase)
+                            }.`)}
+                    </span>
+                    <div className="status-turn-phase-strip" aria-hidden>
+                      {workspace.phases.map((phase) => (
+                        <span
+                          className={`phase-pip phase-${phase.status} ${
+                            phase.key === workspace.current_phase ? "current" : ""
+                          }`}
+                          key={phase.key}
+                          title={phase.label}
+                        />
+                      ))}
+                    </div>
+                    <div className="workspace-token-list">
+                      <span className="workspace-token">
+                        {workspace.connection.event_count} events
+                      </span>
+                      <span className="workspace-token">
+                        {workspace.source_selection.length
+                          ? `${workspace.source_selection.length} source presets`
+                          : "Default sources"}
+                      </span>
+                      {workspace.citations.length ? (
+                        <span className="workspace-token">
+                          {workspace.citations.length} cites so far
+                        </span>
+                      ) : null}
+                    </div>
+                  </article>
+                )}
+
+                {conversationMessages.map((message) => (
+                  <article
+                    className={`thread-item conversation-turn ${message.role}`}
+                    key={message.id}
+                  >
+                    <strong>{message.role === "user" ? "You" : "Assistant"}</strong>
+                    <MarkdownContent content={message.content} />
+                    <div className="thread-response">
+                      <span>{formatTime(message.created_at)}</span>
+                      {message.model ? <span>{message.model}</span> : null}
+                      {message.references.length ? (
+                        <span>Refs: {message.references.join(" · ")}</span>
+                      ) : null}
+                    </div>
+                  </article>
+                ))}
+              </div>
+
+              {workspace.status === "completed" && reportReady ? (
+                <div className="workspace-form conversation-composer">
+                  <div className="conversation-composer-meta">
+                    <span>
+                      Continue the conversation with{" "}
+                      {latestConversationModel ?? "the configured run model"}.
+                    </span>
+                  </div>
+                  <textarea
+                    className="textarea-input"
+                    value={chatDraft}
+                    onChange={(event) => setChatDraft(event.target.value)}
+                    rows={4}
+                    placeholder="Ask a follow-up about the completed research..."
+                  />
+                  <div className="button-row">
+                    <button
+                      className="primary-button"
+                      onClick={() => {
+                        const trimmed = chatDraft.trim();
+                        if (!trimmed) return;
+                        onSendMessage?.(workspace.run_id, trimmed);
+                        setChatDraft("");
+                      }}
+                      type="button"
+                      disabled={!chatDraft.trim() || pending?.chat}
+                    >
+                      {pending?.chat ? "Sending..." : "Send"}
+                    </button>
+                    <button
+                      className="ghost-button"
+                      onClick={() => setPrimaryView("report")}
+                      type="button"
+                    >
+                      Focus report
+                    </button>
+                  </div>
+                </div>
+              ) : null}
+            </div>
+          ) : (
+            <div className="workspace-report-shell">
+              <div className="workspace-report-header">
+                <div>
+                  <p className="eyebrow">Final report</p>
+                  <h3>{selectedSection?.title ?? "Grounded research report"}</h3>
+                </div>
+                <div className="workspace-report-actions">
+                  <button
+                    className="ghost-button"
+                    onClick={() => setPrimaryView("chat")}
+                    type="button"
+                  >
+                    Back to chat
+                  </button>
+                  <button
+                    className="ghost-button"
+                    onClick={() => {
+                      setDetailsOpen(true);
+                      setDetailsTab("citations");
+                    }}
+                    type="button"
+                  >
+                    View citations
+                  </button>
+                  <button className="ghost-button" onClick={handleCopyReport} type="button">
+                    Copy
+                  </button>
+                  <button className="ghost-button" onClick={handleDownloadReport} type="button">
+                    Download
+                  </button>
+                </div>
+              </div>
+              {reportActionNotice ? (
+                <span className="workspace-inline-feedback">{reportActionNotice}</span>
+              ) : null}
+              {workspace.report_sections.length ? (
+                <div className="workspace-report-sections">
+                  {workspace.report_sections.map((section) => (
+                    <button
+                      className={`workspace-report-section-tab ${
+                        selectedSection?.id === section.id ? "active" : ""
+                      }`}
+                      key={section.id}
+                      onClick={() => setSelectedSectionId(section.id)}
+                      type="button"
+                    >
+                      <span>{section.title}</span>
+                      <small>{section.citation_count} cites</small>
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+              <article className="workspace-report-body workspace-scroll-panel">
+                <MarkdownContent
+                  className="workspace-report-markdown"
+                  content={
+                    selectedSection?.body_markdown ||
+                    workspace.final_report_markdown ||
+                    "_No final report available yet._"
+                  }
+                />
+              </article>
+            </div>
+          )}
+        </section>
+
+        {detailsOpen ? (
+          <aside className="workspace-details-panel">
+            <div className="workspace-details-summary">
+              {shellSummary.map((item) => (
+                <article className="workspace-context-card" key={item.label}>
+                  <span className="workspace-context-label">{item.label}</span>
+                  <strong>{item.value}</strong>
+                </article>
+              ))}
+              <article className="workspace-context-card">
+                <span className="workspace-context-label">Sources</span>
+                <strong>
+                  {workspace.source_selection.length
+                    ? workspace.source_selection.join(", ")
+                    : "deployment default"}
+                </strong>
+              </article>
+              <article className="workspace-context-card">
+                <span className="workspace-context-label">Project</span>
+                <strong>{workspace.project_id ? "attached" : "none"}</strong>
+              </article>
+            </div>
+
+            <div className="phase-rail phase-rail-details">
+              {workspace.phases.map((phase) => (
+                <button
+                  className={`phase-node ${phase.status} ${
+                    focusedPhase === phase.key ? "active" : ""
+                  }`}
+                  key={phase.key}
+                  onClick={() => {
+                    setFocusedPhase((current) => (current === phase.key ? null : phase.key));
+                    setDetailsTab(PHASE_TO_DETAILS_TAB[phase.key]);
+                  }}
+                  type="button"
+                >
+                  <span className="phase-node-title">{phase.label}</span>
+                  <small>{phase.status}</small>
+                  <strong>{phase.event_count}</strong>
+                </button>
+              ))}
+            </div>
+
+            <div className="workspace-tabs">
+              {(
+                [
+                  "overview",
+                  "plan",
+                  "tasks",
+                  "thinking",
+                  "sources",
+                  "citations",
+                  "trace",
+                ] as WorkspaceDetailsTab[]
+              ).map((tab) => (
+                <button
+                  className={`workspace-tab ${detailsTab === tab ? "active" : ""}`}
+                  key={tab}
+                  onClick={() => setDetailsTab(tab)}
+                  type="button"
+                >
+                  {titleCase(tab)}
+                </button>
+              ))}
+            </div>
+
+            <div className="workspace-details-content">
+      {detailsTab === "overview" ? (
         <div className="workspace-grid overview-grid">
           <section className="workspace-card">
             <div className="workspace-card-header">
@@ -501,7 +1174,7 @@ export function RunWorkspace({
         </div>
       ) : null}
 
-      {activeTab === "plan" ? (
+      {detailsTab === "plan" ? (
         <div className="workspace-grid plan-grid">
           <section className="workspace-card">
             <div className="workspace-card-header">
@@ -651,7 +1324,17 @@ export function RunWorkspace({
                 <article className="workspace-inline-card" key={`${stream.name}-${stream.objective}`}>
                   <strong>{stream.name}</strong>
                   <span>{stream.objective}</span>
-                  <small>{stream.queries.join(" · ") || "Queries will be derived at execution time."}</small>
+                  {stream.queries.length ? (
+                    <div className="workspace-token-list">
+                      {stream.queries.map((query) => (
+                        <span className="workspace-token" key={`${stream.name}-${query}`}>
+                          {query}
+                        </span>
+                      ))}
+                    </div>
+                  ) : (
+                    <small>Queries will be derived at execution time.</small>
+                  )}
                 </article>
               ))}
             </div>
@@ -699,7 +1382,7 @@ export function RunWorkspace({
         </div>
       ) : null}
 
-      {activeTab === "tasks" ? (
+      {detailsTab === "tasks" ? (
         <div className="workspace-grid tasks-grid">
           <aside className="workspace-side-rail">
             <button
@@ -751,7 +1434,7 @@ export function RunWorkspace({
         </div>
       ) : null}
 
-      {activeTab === "thinking" ? (
+      {detailsTab === "thinking" ? (
         <div className="workspace-grid thinking-grid">
           <section className="workspace-card">
             <div className="workspace-card-header">
@@ -792,7 +1475,7 @@ export function RunWorkspace({
                   .map((event) => (
                     <article className="workspace-inline-card" key={event.id}>
                       <strong>{event.event_type}</strong>
-                      <span>{JSON.stringify(event.payload)}</span>
+                      <span>{normalizeInlineText(JSON.stringify(event.payload))}</span>
                     </article>
                   ))}
               </div>
@@ -821,7 +1504,7 @@ export function RunWorkspace({
         </div>
       ) : null}
 
-      {activeTab === "sources" ? (
+      {detailsTab === "sources" ? (
         <div className="workspace-grid sources-grid">
           <section className="workspace-card">
             <div className="workspace-card-header">
@@ -900,7 +1583,7 @@ export function RunWorkspace({
         </div>
       ) : null}
 
-      {activeTab === "citations" ? (
+      {detailsTab === "citations" ? (
         <div className="workspace-grid citations-grid">
           <section className="workspace-card">
             <div className="workspace-card-header">
@@ -909,31 +1592,35 @@ export function RunWorkspace({
             <div className="workspace-list">
               {groupBySection(workspace.citations).map(([sectionTitle, sectionCitations]) => (
                 <details className="workspace-detail-card" key={sectionTitle} open>
-                  <summary>
-                    <strong>{sectionTitle}</strong>
-                    <span>{sectionCitations.length} citations</span>
+                  <summary className="workspace-detail-summary">
+                    <div>
+                      <strong>{sectionTitle}</strong>
+                      <span>{sectionCitations.length} citations</span>
+                    </div>
                   </summary>
                   <div className="workspace-list">
                     {sectionCitations.map((citation) => (
                       <CitationCard
                         citation={citation}
                         key={citation.id}
+                        sources={workspace.sources}
+                        selected={selectedCitation?.id === citation.id}
+                        onSelect={() => setSelectedCitationId(citation.id)}
                         onOpenSection={() => {
                           const target = workspace.report_sections.find(
                             (section) => section.title === citation.section_title,
                           );
                           if (target) {
                             setSelectedSectionId(target.id);
-                            setActiveTab("report");
+                            setPrimaryView("report");
                           }
                         }}
                         onOpenSource={() => {
-                          const target = workspace.sources.find(
-                            (source) => source.source_id && source.source_id === citation.source_id,
-                          );
+                          const target = resolveCitationSource(citation, workspace.sources);
                           if (target) {
                             setSelectedSourceId(target.id);
-                            setActiveTab("sources");
+                            setDetailsOpen(true);
+                            setDetailsTab("sources");
                           }
                         }}
                       />
@@ -943,130 +1630,92 @@ export function RunWorkspace({
               ))}
             </div>
           </section>
-        </div>
-      ) : null}
-
-      {activeTab === "report" ? (
-        <div className="workspace-grid report-grid">
-          <aside className="workspace-side-rail">
-            {workspace.report_sections.map((section) => (
-              <button
-                className={`ops-rail-button ${selectedSection?.id === section.id ? "active" : ""}`}
-                key={section.id}
-                onClick={() => setSelectedSectionId(section.id)}
-                type="button"
-              >
-                <div>
-                  <span>{section.title}</span>
-                  <small>{section.grounded_claim_count} grounded / {section.unsupported_claim_count} open</small>
-                </div>
-                <strong>{section.citation_count}</strong>
-              </button>
-            ))}
-          </aside>
-          <section className="workspace-card report-body-card">
+          <aside className="workspace-card citations-detail-card">
             <div className="workspace-card-header">
-              <h3>{selectedSection?.title ?? "Report section"}</h3>
+              <h3>Citation detail</h3>
             </div>
-            {selectedSection ? (
-              <article className="markdown-body workspace-markdown">
-                <ReactMarkdown>{selectedSection.body_markdown || "_No section body available._"}</ReactMarkdown>
+            <div className="workspace-phase-summary">
+              <article className="phase-summary-card compact">
+                <strong>Surviving</strong>
+                <span>{citationSummary.surviving}</span>
               </article>
-            ) : (
-              <span className="muted-text">No report sections are available yet.</span>
-            )}
-          </section>
-          <section className="workspace-card report-sidecar-card">
-            <div className="workspace-card-header">
-              <h3>Grounding sidecar</h3>
+              <article className="phase-summary-card compact">
+                <strong>Removed</strong>
+                <span>{citationSummary.removed}</span>
+              </article>
+              <article className="phase-summary-card compact">
+                <strong>Uncited sources</strong>
+                <span>{citationSummary.uncitedSources}</span>
+              </article>
             </div>
-            {selectedSection ? (
-              <div className="workspace-list">
-                {selectedSection.claims.map((claim) => (
-                  <article className="workspace-inline-card" key={`${claim.section_title}-${claim.ordinal}`}>
-                    <strong>{claim.claim}</strong>
-                    <span>
-                      {claim.support_label ?? "unsupported"} · {claim.citation_count} citations · {claim.removed_citation_count} removed
-                    </span>
-                    <small>{claim.claim_repair_ran ? "Claim repair ran" : "No claim repair"}</small>
+            {selectedCitation ? (
+              <div className="workspace-stack workspace-scroll-panel">
+                <article className={`workspace-inline-card ${selectedCitation.status === "removed" ? "danger" : ""}`}>
+                  <strong>{normalizeInlineText(selectedCitation.claim)}</strong>
+                  <span>{selectedCitation.section_title}</span>
+                  <small>
+                    {selectedCitation.status}
+                    {selectedCitation.trust_tier ? ` · ${selectedCitation.trust_tier}` : ""}
+                  </small>
+                </article>
+                <article className="workspace-inline-card muted">
+                  <strong>Source</strong>
+                  <span>{getCitationSourceLabel(selectedCitation, workspace.sources)}</span>
+                </article>
+                {selectedCitation.quote ? (
+                  <blockquote className="citation-quote citation-quote-detail">
+                    {normalizeInlineText(selectedCitation.quote)}
+                  </blockquote>
+                ) : null}
+                {selectedCitation.audit_reasons.length ? (
+                  <article className="workspace-inline-card danger">
+                    <strong>Audit reason</strong>
+                    <span>{selectedCitation.audit_reasons.join(", ")}</span>
                   </article>
-                ))}
-              </div>
-            ) : null}
-          </section>
-        </div>
-      ) : null}
-
-      {activeTab === "chat" ? (
-        <div className="workspace-grid chat-grid">
-          <section className="workspace-card">
-            <div className="workspace-card-header">
-              <h3>Follow-up chat</h3>
-            </div>
-            {workspace.status !== "completed" || !workspace.final_report_markdown ? (
-              <span className="muted-text">
-                Follow-up chat becomes available once the research run has produced a final report.
-              </span>
-            ) : (
-              <div className="workspace-stack">
-                <div className="workspace-thread conversation-thread">
-                  {conversationMessages.length === 0 ? (
-                    <article className="thread-item">
-                      <strong>Start a follow-up conversation.</strong>
-                      <span className="muted-text">
-                        Ask for clarifications, compare claims, summarize sections, or drill into citations.
-                      </span>
-                    </article>
-                  ) : (
-                    conversationMessages.map((message) => (
-                      <article
-                        className={`thread-item conversation-turn ${message.role}`}
-                        key={message.id}
-                      >
-                        <strong>{message.role === "user" ? "You" : "Assistant"}</strong>
-                        <div className="workspace-markdown">
-                          <ReactMarkdown>{message.content}</ReactMarkdown>
-                        </div>
-                        <div className="thread-response">
-                          <span>{formatTime(message.created_at)}</span>
-                          {message.model ? <span>{message.model}</span> : null}
-                          {message.references.length ? (
-                            <span>Refs: {message.references.join(" · ")}</span>
-                          ) : null}
-                        </div>
-                      </article>
-                    ))
-                  )}
-                </div>
-                <div className="workspace-form">
-                  <textarea
-                    className="textarea-input"
-                    value={chatDraft}
-                    onChange={(event) => setChatDraft(event.target.value)}
-                    rows={4}
-                    placeholder="Ask a follow-up about the completed research..."
-                  />
+                ) : null}
+                <div className="button-row">
                   <button
-                    className="primary-button"
+                    className="ghost-button"
                     onClick={() => {
-                      const trimmed = chatDraft.trim();
-                      if (!trimmed) return;
-                      onSendMessage?.(workspace.run_id, trimmed);
-                      setChatDraft("");
+                      const target = workspace.report_sections.find(
+                        (section) => section.title === selectedCitation.section_title,
+                      );
+                      if (target) {
+                        setSelectedSectionId(target.id);
+                        setPrimaryView("report");
+                      }
                     }}
                     type="button"
-                    disabled={!chatDraft.trim() || pending?.chat}
                   >
-                    {pending?.chat ? "Sending..." : "Send"}
+                    Open section
+                  </button>
+                  <button
+                    className="ghost-button"
+                    onClick={() => {
+                      const target = resolveCitationSource(
+                        selectedCitation,
+                        workspace.sources,
+                      );
+                      if (target) {
+                        setSelectedSourceId(target.id);
+                        setDetailsOpen(true);
+                        setDetailsTab("sources");
+                      }
+                    }}
+                    type="button"
+                  >
+                    Open source
                   </button>
                 </div>
               </div>
+            ) : (
+              <span className="muted-text">Select a citation to inspect its claim, source, and audit state.</span>
             )}
-          </section>
+          </aside>
         </div>
       ) : null}
 
-      {activeTab === "trace" ? (
+      {detailsTab === "trace" ? (
         <div className="workspace-grid trace-grid">
           <section className="workspace-card">
             <div className="workspace-card-header">
@@ -1075,7 +1724,7 @@ export function RunWorkspace({
             <div className="workspace-phase-summary">
               <article className="phase-summary-card compact">
                 <strong>Transport</strong>
-                <span>{connectionState}</span>
+                <span>{displayConnectionState}</span>
               </article>
               <article className="phase-summary-card compact">
                 <strong>Mode</strong>
@@ -1105,26 +1754,44 @@ export function RunWorkspace({
           </section>
         </div>
       ) : null}
+            </div>
+          </aside>
+        ) : null}
+      </div>
     </section>
   );
 }
 
 function TaskCard({ task }: { task: WorkspaceTaskView }) {
+  const attemptCount =
+    typeof task.metadata.attempt_count === "number" ? task.metadata.attempt_count : null;
+  const elapsedLabel = formatElapsedMs(task.elapsed_ms);
+  const statusLabel =
+    task.status === "failed" && attemptCount && attemptCount > 1 ? "failed attempt" : task.status;
+
   return (
     <article className={`task-card task-${task.status}`}>
       <div className="task-card-header">
         <strong>{titleCase(task.task_type)}</strong>
-        <span>{task.status}</span>
+        <span>{statusLabel}</span>
       </div>
       <span>{task.objective}</span>
       <div className="task-card-meta">
         <small>{task.query_count} queries</small>
         <small>{task.selected_source_count} sources</small>
         <small>{task.notes_produced} notes</small>
+        {elapsedLabel ? <small>{elapsedLabel}</small> : null}
+        {attemptCount ? <small>attempt {attemptCount}</small> : null}
       </div>
+      {task.latest_sources.length ? (
+        <small>
+          Latest sources: {task.latest_sources.join(" · ")}
+        </small>
+      ) : null}
       {task.latest_note_summary ? <small>{task.latest_note_summary}</small> : null}
       {task.last_tool_call ? <small>Last tool: {task.last_tool_call}</small> : null}
       {task.last_decision ? <small>Last decision: {task.last_decision}</small> : null}
+      {task.next_action ? <small>Next: {task.next_action}</small> : null}
       {task.blocker_reason ? <small className="danger-text">{task.blocker_reason}</small> : null}
     </article>
   );
@@ -1135,9 +1802,9 @@ function DecisionCard({ decision }: { decision: WorkspaceDecisionView }) {
     <article className="decision-card">
       <div className="decision-card-header">
         <strong>{decision.title}</strong>
-        <span>{titleCase(decision.category)}</span>
+        <span className="pill muted">{titleCase(decision.category)}</span>
       </div>
-      <span>{decision.rationale}</span>
+      <span>{normalizeInlineText(decision.rationale)}</span>
       <div className="decision-card-meta">
         {decision.affected_stream_name ? <small>{decision.affected_stream_name}</small> : null}
         {decision.affected_section ? <small>{decision.affected_section}</small> : null}
@@ -1152,29 +1819,70 @@ function DecisionCard({ decision }: { decision: WorkspaceDecisionView }) {
 
 function CitationCard({
   citation,
+  sources,
+  selected,
+  onSelect,
   onOpenSection,
   onOpenSource,
 }: {
   citation: WorkspaceCitationView;
+  sources: WorkspaceSourceView[];
+  selected: boolean;
+  onSelect: () => void;
   onOpenSection: () => void;
   onOpenSource: () => void;
 }) {
+  const sourceLabel = getCitationSourceLabel(citation, sources);
+  const quote = normalizeInlineText(citation.quote);
+
   return (
-    <article className={`citation-card citation-${citation.status}`}>
+    <article
+      className={`citation-card citation-${citation.status} ${selected ? "active" : ""}`}
+      onClick={onSelect}
+      role="button"
+      tabIndex={0}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          onSelect();
+        }
+      }}
+    >
       <div className="citation-card-header">
-        <strong>{citation.claim}</strong>
-        <span>{citation.status}</span>
+        <div className="citation-card-heading">
+          <strong>{normalizeInlineText(citation.claim)}</strong>
+          <div className="citation-card-meta">
+            <span className={`pill ${citation.status === "removed" ? "status-failed" : "muted"}`}>
+              {citation.status}
+            </span>
+            {citation.trust_tier ? <span className="pill muted">{citation.trust_tier}</span> : null}
+          </div>
+        </div>
       </div>
-      <span>{citation.source_title ?? citation.source_url ?? "Unknown source"}</span>
-      {citation.quote ? <small>{citation.quote}</small> : null}
+      <span className="citation-card-source">{sourceLabel}</span>
+      {quote ? <blockquote className="citation-quote">{quote}</blockquote> : null}
       {citation.audit_reasons.length ? (
         <small className="danger-text">{citation.audit_reasons.join(", ")}</small>
       ) : null}
-      <div className="button-row">
-        <button className="ghost-button" onClick={onOpenSection} type="button">
+      <div className="button-row citation-card-actions">
+        <button
+          className="ghost-button"
+          onClick={(event) => {
+            event.stopPropagation();
+            onOpenSection();
+          }}
+          type="button"
+        >
           Open section
         </button>
-        <button className="ghost-button" onClick={onOpenSource} type="button">
+        <button
+          className="ghost-button"
+          onClick={(event) => {
+            event.stopPropagation();
+            onOpenSource();
+          }}
+          type="button"
+        >
           Open source
         </button>
       </div>

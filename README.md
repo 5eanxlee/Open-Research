@@ -114,8 +114,8 @@ The terminal client is prompt-first by default. Running `open-research` opens an
 shell-style Textual UI, and passing a plain question directly runs that prompt immediately without
 requiring the `ask` subcommand. The terminal surface is backed by the same API and SSE stream as
 the web dashboard, so run history, live progress, report rendering, and citation/audit inspection
-stay consistent across surfaces. Set `OPEN_RESEARCH_API_BASE_URL` if the API is not running at
-`http://127.0.0.1:8000`.
+stay consistent across surfaces. Set `OPEN_RESEARCH_API_BASE_URL` only if the CLI/TUI should talk
+to an API endpoint other than `http://127.0.0.1:8000`.
 
 For a Helix-style install-once workflow, install the CLI into your shell path and launch it with
 one command:
@@ -197,7 +197,53 @@ The code defaults to SQLite for local work and tests. For Postgres deployments, 
 
 ## Configuration
 
-See `.env.example` for the supported settings. The app accepts both provider-native env vars like `OPENAI_API_KEY` and repo-scoped env vars such as `OPEN_RESEARCH_DATABASE_URL`.
+The repo now ships two config templates:
+
+- `.env.example` for the minimal local setup
+- `.env.advanced.example` for the full backend control surface
+
+The app accepts both provider-native env vars like `OPENAI_API_KEY` and repo-scoped env vars such
+as `OPEN_RESEARCH_DATABASE_URL`.
+
+For most users, the minimal setup is enough:
+
+```bash
+cp .env.example .env
+```
+
+That file is intentionally small and covers:
+
+- local SQLite storage
+- backend auto-selection
+- real provider credentials for one LLM/search/fetch path
+- frontend API URL
+- optional CLI/TUI API URL override
+
+Use `.env.advanced.example` only if you need to change server-side defaults such as:
+
+- model defaults
+- stream/query budget defaults
+- planner discovery thresholds
+- upload / OCR limits
+- retry and timeout tuning
+- Temporal / workflow settings
+- S3 artifact storage
+- observability and tracing
+
+Two supported maximal-path setups:
+
+- Hosted OpenAI: use `.env.example` as the base profile.
+- Local OpenAI-compatible: use `.env.local-openai-compatible.example` as the base profile.
+
+The strict deep-research path now supports both backends as long as they provide:
+
+- a real LLM endpoint
+- a real embedding endpoint
+- Exa, Brave, or Tavily for search
+- Firecrawl, Browserbase, Browserbase Session, or Playwright for fetch
+- `sentence-transformers` reranking
+
+The local OpenAI-compatible profile does not fall back to heuristic planning or synthesis. It uses the same deep path as hosted OpenAI, but latency and output quality depend on the local model server you choose.
 
 Key runtime switches:
 
@@ -205,6 +251,7 @@ Key runtime switches:
 - `OPEN_RESEARCH_LLM_API_STYLE=auto|responses|chat_completions`
 - `OPEN_RESEARCH_LLM_STRUCTURED_OUTPUT_MODE=auto|parse|json_schema|prompted`
 - `OPEN_RESEARCH_LLM_MODEL_FAMILY=auto|generic|openai|glm|qwen|deepseek`
+- `OPEN_RESEARCH_LLM_REASONING_EFFORT=minimal|low|medium|high`
 - `OPEN_RESEARCH_SEARCH_BACKEND=auto|mock|brave|exa|tavily`
 - `OPEN_RESEARCH_FETCH_BACKEND=auto|mock|firecrawl|browserbase|browserbase_session|playwright`
 - `OPEN_RESEARCH_WORKFLOW_BACKEND=auto|local|temporal`
@@ -213,6 +260,7 @@ Key runtime switches:
 - `OPEN_RESEARCH_ARTIFACT_STORE_BACKEND=auto|disabled|local|s3`
 - `OPEN_RESEARCH_EMBEDDING_BACKEND=auto|disabled|mock|openai|openai_compatible`
 - `OPEN_RESEARCH_RERANKER_BACKEND=auto|disabled|heuristic|sentence_transformers`
+- `OPEN_RESEARCH_PLANNER_MODEL`
 - `OPEN_RESEARCH_RUN_HEARTBEAT_SECONDS`
 - `OPEN_RESEARCH_STALE_RUN_TIMEOUT_SECONDS`
 - `OPEN_RESEARCH_RECONCILER_INTERVAL_SECONDS`
@@ -220,7 +268,7 @@ Key runtime switches:
 - `OPEN_RESEARCH_PROVIDER_COOLDOWN_SECONDS`
 - `OPEN_RESEARCH_OTLP_ENDPOINT`
 - `OPEN_RESEARCH_METRICS_ENABLED`
-- `OPEN_RESEARCH_API_BASE_URL` for the terminal client default endpoint
+- `OPEN_RESEARCH_API_BASE_URL` only for the terminal client / TUI default endpoint
 
 When `OPEN_RESEARCH_WORKFLOW_BACKEND=temporal`, the API process can optionally run a co-located Temporal worker by leaving `OPEN_RESEARCH_TEMPORAL_START_WORKER=true`.
 
@@ -245,6 +293,8 @@ export OPEN_RESEARCH_EMBEDDING_BACKEND=openai_compatible
 export OPEN_RESEARCH_EMBEDDING_BASE_URL=http://127.0.0.1:8001/v1
 export OPEN_RESEARCH_EMBEDDING_API_KEY=EMPTY
 ```
+
+For a fully local strict-path example using Ollama plus Exa and Firecrawl, copy `.env.local-openai-compatible.example`.
 
 ## Deployment
 

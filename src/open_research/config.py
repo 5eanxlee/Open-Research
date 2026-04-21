@@ -7,6 +7,14 @@ from pydantic import AliasChoices, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+def _looks_like_openai_key(secret: SecretStr | None) -> bool:
+    if secret is None:
+        return False
+    value = secret.get_secret_value().strip()
+    # OpenAI project/user keys are currently issued with an sk- prefix.
+    return value.startswith("sk-")
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -146,6 +154,7 @@ class Settings(BaseSettings):
     verifier_model: str = "gpt-5.4-mini"
     embedding_model: str = "text-embedding-3-large"
     reranker_model: str = "BAAI/bge-reranker-v2-m3"
+    llm_reasoning_effort: Literal["minimal", "low", "medium", "high"] = "high"
     llm_api_style: Literal["auto", "responses", "chat_completions"] = "auto"
     llm_structured_output_mode: Literal["auto", "parse", "json_schema", "prompted"] = "auto"
     llm_supports_reasoning_effort: bool | None = None
@@ -160,6 +169,7 @@ class Settings(BaseSettings):
     source_registry_ui_enabled: bool = True
     async_jobs_enabled: bool = True
     debug_console_enabled: bool = True
+    enforce_maximal_research_path: bool = True
 
     max_streams: int = 30
     max_replans: int = 1
@@ -244,7 +254,7 @@ class Settings(BaseSettings):
     def resolved_llm_backend(self) -> Literal["heuristic", "openai", "openai_compatible"]:
         if self.llm_backend != "auto":
             return self.llm_backend
-        if self.openai_api_key:
+        if _looks_like_openai_key(self.openai_api_key):
             return "openai"
         if self.llm_base_url or self.llm_api_key:
             return "openai_compatible"
@@ -343,7 +353,7 @@ class Settings(BaseSettings):
     ) -> Literal["disabled", "mock", "openai", "openai_compatible"]:
         if self.embedding_backend != "auto":
             return self.embedding_backend
-        if self.openai_api_key:
+        if _looks_like_openai_key(self.openai_api_key):
             return "openai"
         if (
             self.embedding_base_url
