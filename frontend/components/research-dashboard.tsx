@@ -49,53 +49,39 @@ const DRAWER_META: Record<
   project: {
     eyebrow: "Context",
     title: "Project context",
-    description:
-      "Attach a project corpus, manage its planning and reference assets, and stage inputs for this run.",
+    description: "Projects and run inputs.",
   },
   settings: {
     eyebrow: "Settings",
     title: "Agent behavior",
-    description:
-      "Tune behavior, policy, and connection plumbing in one place. Deep panels are one click away.",
+    description: "Behavior and connection.",
   },
   workflow: {
     eyebrow: "Workflow",
     title: "Execution and policy",
-    description:
-      "Pick the execution mode, toggle human-in-the-loop approval, and shape the output policy.",
+    description: "Execution mode and approval.",
   },
   sources: {
     eyebrow: "Sources",
     title: "Source registry",
-    description:
-      "Choose which source presets the agent may use. Unselected presets fall back to the deployment default.",
+    description: "Search, fetch, and tools.",
   },
   budget: {
     eyebrow: "Budget",
     title: "Budget controls",
-    description:
-      "Cap streams, queries, and provider spend. The planner respects these as hard ceilings.",
+    description: "Caps and run limits.",
   },
   models: {
     eyebrow: "Models",
     title: "Model selection",
-    description:
-      "Override the lead, planner, and reviewer models for this run. Leave blank to use the deployment defaults.",
+    description: "Model overrides.",
   },
   profile: {
     eyebrow: "Profile",
     title: "Profile and memory",
-    description:
-      "Shape how prior runs and preferences condition the agent's planning and grounding behavior.",
+    description: "Memory and preferences.",
   },
 };
-
-function formatLabel(value: string | null | undefined): string {
-  if (!value) return "Not configured";
-  return value
-    .replaceAll("_", " ")
-    .replace(/\b\w/g, (match) => match.toUpperCase());
-}
 
 function isActive(status: RunDetail["status"] | undefined): boolean {
   return (
@@ -136,6 +122,7 @@ export function ResearchDashboard() {
   const { theme, toggle: toggleTheme } = useTheme();
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [activeDrawer, setActiveDrawer] = useState<DrawerKey | null>(null);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const centerScrollRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const pendingQuestionRef = useRef<string>("");
@@ -220,6 +207,19 @@ export function ResearchDashboard() {
     queryFn: () => fetchRunMessages(apiBaseUrl, selectedRunId as string),
     enabled: Boolean(selectedRunId),
   });
+
+  useEffect(() => {
+    const stored = localStorage.getItem("or-sidebar-collapsed");
+    if (stored === "true" || stored === "false") {
+      setSidebarCollapsed(stored === "true");
+      return;
+    }
+    setSidebarCollapsed(window.innerWidth < 900);
+  }, []);
+
+  useEffect(() => {
+    localStorage.setItem("or-sidebar-collapsed", String(sidebarCollapsed));
+  }, [sidebarCollapsed]);
 
   useEffect(() => {
     if (publicConfigQuery.data) {
@@ -426,45 +426,6 @@ export function ResearchDashboard() {
     (streamState?.connectionState ?? "idle") === "error"
       ? "terminal"
       : streamState?.connectionState ?? "idle";
-  const leadModel =
-    modelConfigOverride.lead_model || publicConfigQuery.data?.models.lead_model || "Default";
-  const plannerModel =
-    modelConfigOverride.planner_model ||
-    publicConfigQuery.data?.models.planner_model ||
-    "Default";
-  const setupSummary = [
-    {
-      label: "Project",
-      value: selectedProjectId ? "Attached" : "Standalone run",
-    },
-    {
-      label: "Assets",
-      value: `${runInputAssets.length + stagedRunAssets.length} attached`,
-    },
-    {
-      label: "Workflow",
-      value: "Approval-first research",
-    },
-    {
-      label: "Sources",
-      value:
-        sourceSelection.length > 0
-          ? `${sourceSelection.length} selected`
-          : "Deployment default",
-    },
-    {
-      label: "Budget",
-      value: `${budget.max_streams} streams`,
-    },
-    {
-      label: "Models",
-      value: `${leadModel} / ${plannerModel}`,
-    },
-  ];
-  const runStatusLabel = selectedRunId
-    ? formatLabel(activeDetail?.status ?? displayConnectionState)
-    : "Ready";
-
   const handleSubmit = () => {
     const trimmedQuestion = questionDraft.trim();
     if (trimmedQuestion.length >= 12 && !createRunMutation.isPending) {
@@ -475,6 +436,7 @@ export function ResearchDashboard() {
   const handleNewChat = () => {
     setSelectedRunId(null);
     setSubmitError(null);
+    setQuestionDraft("");
     requestAnimationFrame(() => {
       textareaRef.current?.focus();
       centerScrollRef.current?.scrollTo({ top: 0, behavior: "smooth" });
@@ -489,12 +451,6 @@ export function ResearchDashboard() {
   const projects = projectsQuery.data ?? [];
   const activeProject = projects.find((project) => project.id === selectedProjectId) ?? null;
   const isLanding = !selectedRunId;
-  const suggestionChips = [
-    "Compare the economic impact of universal basic income pilots since 2020.",
-    "Survey recent advances in liquid neural networks and their applications.",
-    "Draft a grounded literature review on microplastics in freshwater systems.",
-    "Summarize the state of direct air capture economics in 2025–2026.",
-  ];
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -506,34 +462,23 @@ export function ResearchDashboard() {
   return (
     <main className="dashboard-page">
       <header className="hero">
+        <button
+          className="sidebar-toggle"
+          type="button"
+          aria-label={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+          aria-expanded={!sidebarCollapsed}
+          onClick={() => setSidebarCollapsed((value) => !value)}
+        >
+          <span aria-hidden>☰</span>
+        </button>
         <div className="hero-brand">
-          <div>
-            <p className="eyebrow">Open Research</p>
-            <h1 className="hero-title">Console</h1>
-          </div>
+          <h1 className="hero-title">Open Research</h1>
         </div>
-        <div className="hero-badges">
-          <span
-            className={`pill ${
-              activeDetail?.status
-                ? `status-${activeDetail.status}`
-                : "muted"
-            }`}
-          >
-            <span
-              className={`status-dot status-${
-                activeDetail?.status ?? (selectedRunId ? "queued" : "completed")
-              }`}
-            />
-            {runStatusLabel}
-          </span>
-          <span className="pill muted">
-            {publicConfigQuery.data?.backends.workflow ?? "local"}
-          </span>
-          <span className="pill muted">
-            {visibleRuns.length} run{visibleRuns.length === 1 ? "" : "s"}
-          </span>
-        </div>
+        <button className="top-new-chat-button" onClick={handleNewChat} type="button">
+          <span aria-hidden>+</span>
+          New Chat
+        </button>
+        <div className="hero-spacer" />
         <div className="hero-actions">
           <button
             className={`config-action ${activeDrawer === "project" ? "active" : ""}`}
@@ -545,13 +490,31 @@ export function ResearchDashboard() {
             Project
           </button>
           <button
+            className={`config-action ${activeDrawer === "sources" ? "active" : ""}`}
+            onClick={() =>
+              setActiveDrawer((prev) => (prev === "sources" ? null : "sources"))
+            }
+            type="button"
+          >
+            Sources
+          </button>
+          <button
+            className={`config-action ${activeDrawer === "models" ? "active" : ""}`}
+            onClick={() =>
+              setActiveDrawer((prev) => (prev === "models" ? null : "models"))
+            }
+            type="button"
+          >
+            Models
+          </button>
+          <button
             className={`config-action ${activeDrawer === "settings" ? "active" : ""}`}
             onClick={() =>
               setActiveDrawer((prev) => (prev === "settings" ? null : "settings"))
             }
             type="button"
           >
-            Customize
+            Settings
           </button>
           <button
             className="theme-toggle"
@@ -560,117 +523,61 @@ export function ResearchDashboard() {
             title={`Switch to ${theme === "dark" ? "light" : "dark"} mode`}
             aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} mode`}
           >
-            {theme === "dark" ? "Light" : "Dark"}
+            Theme
           </button>
         </div>
       </header>
 
-      <div className="dashboard-grid">
-        <aside className="left-column">
-          <div className="left-column-shell">
-            <div className="rail-new-chat">
-              <button
-                className="new-chat-button"
-                onClick={handleNewChat}
-                type="button"
-                disabled={isLanding}
-              >
-                <span className="new-chat-plus" aria-hidden>+</span>
-                New chat
-              </button>
+      <div className={`dashboard-grid ${sidebarCollapsed ? "sidebar-collapsed" : ""}`}>
+        <aside className="left-column" aria-hidden={sidebarCollapsed}>
+          {!sidebarCollapsed ? (
+            <div className="left-column-shell">
+              <section className="rail-projects">
+                <div className="rail-section-head">
+                  <p className="eyebrow">Projects</p>
+                  <button
+                    className="rail-section-action"
+                    onClick={() => setActiveDrawer("project")}
+                    type="button"
+                  >
+                    Manage
+                  </button>
+                </div>
+                <div className="rail-project-list">
+                  <button
+                    className={`rail-project-chip ${
+                      activeProject === null ? "active" : ""
+                    }`}
+                    onClick={() => handleSelectProject(null)}
+                    type="button"
+                  >
+                    <span className="rail-project-name">All runs</span>
+                  </button>
+                  {projects.slice(0, 6).map((project) => {
+                    return (
+                      <button
+                        className={`rail-project-chip ${
+                          activeProject?.id === project.id ? "active" : ""
+                        }`}
+                        key={project.id}
+                        onClick={() => handleSelectProject(project.id)}
+                        type="button"
+                        title={project.description ?? undefined}
+                      >
+                        <span className="rail-project-name">{project.name}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </section>
+
+              <RunHistory
+                runs={visibleRuns}
+                selectedRunId={selectedRunId}
+                onSelect={setSelectedRunId}
+              />
             </div>
-
-            <section className="rail-projects">
-              <div className="rail-section-head">
-                <p className="eyebrow">Projects</p>
-                <button
-                  className="rail-section-action"
-                  onClick={() => setActiveDrawer("project")}
-                  type="button"
-                >
-                  Manage
-                </button>
-              </div>
-              <div className="rail-project-list">
-                <button
-                  className={`rail-project-chip ${activeProject === null ? "active" : ""}`}
-                  onClick={() => handleSelectProject(null)}
-                  type="button"
-                >
-                  <span className="rail-project-name">All runs</span>
-                  <span className="rail-project-count">
-                    {(runsQuery.data ?? []).length}
-                  </span>
-                </button>
-                {projects.slice(0, 6).map((project) => {
-                  const count = (runsQuery.data ?? []).filter(
-                    (run) => run.project_id === project.id,
-                  ).length;
-                  return (
-                    <button
-                      className={`rail-project-chip ${
-                        activeProject?.id === project.id ? "active" : ""
-                      }`}
-                      key={project.id}
-                      onClick={() => handleSelectProject(project.id)}
-                      type="button"
-                      title={project.description ?? undefined}
-                    >
-                      <span className="rail-project-name">{project.name}</span>
-                      <span className="rail-project-count">{count}</span>
-                    </button>
-                  );
-                })}
-              </div>
-            </section>
-
-            <RunHistory
-              runs={visibleRuns}
-              selectedRunId={selectedRunId}
-              onSelect={setSelectedRunId}
-            />
-
-            <div className="rail-setup-actions">
-              <p className="eyebrow">Setup</p>
-              <div className="rail-setup-buttons">
-                <button
-                  className="rail-setup-button"
-                  onClick={() => setActiveDrawer("workflow")}
-                  type="button"
-                >
-                  Workflow
-                </button>
-                <button
-                  className="rail-setup-button"
-                  onClick={() => setActiveDrawer("sources")}
-                  type="button"
-                >
-                  Sources
-                </button>
-                <button
-                  className="rail-setup-button"
-                  onClick={() => setActiveDrawer("budget")}
-                  type="button"
-                >
-                  Budget
-                </button>
-                <button
-                  className="rail-setup-button"
-                  onClick={() => setActiveDrawer("models")}
-                  type="button"
-                >
-                  Models
-                </button>
-                <button
-                  className="rail-setup-button"
-                  onClick={() => setActiveDrawer("profile")}
-                  type="button"
-                >
-                  Profile
-                </button>
-              </div>
-            </div>
-          </div>
+          ) : null}
         </aside>
 
         <section
@@ -715,64 +622,13 @@ export function ResearchDashboard() {
           {isLanding ? (
             <div className="landing-hero">
               <div className="landing-hero-inner">
-                <p className="eyebrow">Open Research</p>
-                <h2 className="landing-title">
-                  What should we dig into?
-                </h2>
-                <p className="landing-copy">
-                  Ask a research question. The agent plans, runs parallel search
-                  streams, grounds every claim, and delivers a cited report.
-                  {activeProject
-                    ? ` Attached to project ${activeProject.name}.`
-                    : ""}
-                </p>
-                <div className="landing-setup">
-                  {setupSummary.slice(0, 4).map((item) => (
-                    <article className="landing-setup-item" key={item.label}>
-                      <span>{item.label}</span>
-                      <strong>{item.value}</strong>
-                    </article>
-                  ))}
-                </div>
-                <div className="landing-suggestions">
-                  <p className="landing-suggestions-head">Try a starter</p>
-                  <div className="landing-suggestion-grid">
-                    {suggestionChips.map((chip) => (
-                      <button
-                        className="landing-suggestion"
-                        key={chip}
-                        onClick={() => {
-                          setQuestionDraft(chip);
-                          requestAnimationFrame(() => {
-                            autoResizeTextarea();
-                            textareaRef.current?.focus();
-                          });
-                        }}
-                        type="button"
-                      >
-                        {chip}
-                      </button>
-                    ))}
-                  </div>
-                </div>
+                <h2 className="landing-title">Open Research</h2>
               </div>
             </div>
           ) : null}
 
           <div className="center-input">
             <div className="center-input-shell">
-              <div className="center-input-meta">
-                <span>{selectedProjectId ? "Project attached" : "Fresh run"}</span>
-                <span>
-                  {runInputAssets.length + stagedRunAssets.length} input asset
-                  {runInputAssets.length + stagedRunAssets.length === 1 ? "" : "s"}
-                </span>
-                <span>
-                  {sourceSelection.length > 0
-                    ? `${sourceSelection.length} source presets`
-                    : "Default source registry"}
-                </span>
-              </div>
               <div className="center-input-row">
                 <textarea
                   className="textarea-input"
@@ -783,7 +639,7 @@ export function ResearchDashboard() {
                     autoResizeTextarea();
                   }}
                   onKeyDown={handleKeyDown}
-                  placeholder="Ask a research question... (Enter to submit, Shift+Enter for newline)"
+                  placeholder="Research topic"
                   rows={1}
                 />
                 <button

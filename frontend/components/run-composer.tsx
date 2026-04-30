@@ -1350,7 +1350,7 @@ function ModelSelectionFields({ publicConfig }: RunComposerProps) {
             className="text-input"
             value={effectiveModels.lead_model}
             onChange={handleModelChange("lead_model")}
-            placeholder={publicConfig?.models.lead_model ?? "gpt-5.4"}
+            placeholder={publicConfig?.models.lead_model ?? "gpt-5.5"}
           />
         </label>
 
@@ -1360,7 +1360,7 @@ function ModelSelectionFields({ publicConfig }: RunComposerProps) {
             className="text-input"
             value={effectiveModels.planner_model}
             onChange={handleModelChange("planner_model")}
-            placeholder={publicConfig?.models.planner_model ?? "gpt-5.4"}
+            placeholder={publicConfig?.models.planner_model ?? "gpt-5.5"}
           />
         </label>
 
@@ -1370,7 +1370,7 @@ function ModelSelectionFields({ publicConfig }: RunComposerProps) {
             className="text-input"
             value={effectiveModels.worker_model}
             onChange={handleModelChange("worker_model")}
-            placeholder={publicConfig?.models.worker_model ?? "gpt-5.4-mini"}
+            placeholder={publicConfig?.models.worker_model ?? "gpt-5.5"}
           />
         </label>
 
@@ -1380,7 +1380,7 @@ function ModelSelectionFields({ publicConfig }: RunComposerProps) {
             className="text-input"
             value={effectiveModels.verifier_model}
             onChange={handleModelChange("verifier_model")}
-            placeholder={publicConfig?.models.verifier_model ?? "gpt-5.4-mini"}
+            placeholder={publicConfig?.models.verifier_model ?? "gpt-5.5"}
           />
         </label>
 
@@ -1533,6 +1533,31 @@ function SourceSelectionFields({ publicConfig }: RunComposerProps) {
         </button>
       </div>
     </>
+  );
+}
+
+function ToolCatalogFields({ publicConfig }: RunComposerProps) {
+  const tools = publicConfig?.tool_catalog ?? [];
+  if (!tools.length) {
+    return null;
+  }
+
+  return (
+    <div className="tool-catalog-grid">
+      {tools.map((tool) => (
+        <article className={`tool-catalog-card ${tool.enabled ? "enabled" : "disabled"}`} key={tool.name}>
+          <div>
+            <strong>{tool.display_name}</strong>
+            <span>{tool.category} · {tool.owner}</span>
+          </div>
+          <div className="ops-badges">
+            <span className="pill muted">{tool.enabled ? "enabled" : "disabled"}</span>
+            {tool.provider ? <span className="pill muted">{tool.provider}</span> : null}
+            {tool.per_run_limit ? <span className="pill muted">{tool.per_run_limit}/run</span> : null}
+          </div>
+        </article>
+      ))}
+    </div>
   );
 }
 
@@ -1698,6 +1723,9 @@ export function SourcesDrawerPanel({ publicConfig }: RunComposerProps) {
   return (
     <div className="drawer-section-stack">
       <SourceSelectionFields publicConfig={publicConfig} />
+      <div className="drawer-divider" />
+      <p className="drawer-section-label">Tool registry</p>
+      <ToolCatalogFields publicConfig={publicConfig} />
     </div>
   );
 }

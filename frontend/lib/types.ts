@@ -830,6 +830,22 @@ export interface RunWorkspaceDelta {
   generated_at: string;
 }
 
+export interface ToolCatalogEntry {
+  name: string;
+  display_name: string;
+  category: string;
+  owner: string;
+  description: string;
+  enabled: boolean;
+  backend: string | null;
+  provider: string | null;
+  budget_categories: string[];
+  per_run_limit: number | null;
+  risk: string;
+  requires_auth: boolean;
+  failure_mode: string;
+}
+
 export interface PublicRuntimeConfig {
   app_name: string;
   environment: string;
@@ -842,6 +858,7 @@ export interface PublicRuntimeConfig {
   prompt_mode: PromptMode;
   available_sources: SourceCatalogEntry[];
   default_source_selection: string[];
+  tool_catalog: ToolCatalogEntry[];
   capabilities: RuntimeCapabilities;
 }
 
@@ -872,15 +889,14 @@ export interface RuntimeCapabilities {
   };
   budget_limits?: Partial<Record<keyof BudgetPolicy, NumericRange>>;
   memory_policy_limits?: Partial<Record<MemoryPolicyNumericField, NumericRange>>;
-  [key: string]:
-    | boolean
-    | string
-    | number
-    | null
-    | undefined
-    | { max_file_size_bytes: number; max_files_per_batch: number; max_ocr_pdf_pages: number }
-    | Partial<Record<keyof BudgetPolicy, NumericRange>>
-    | Partial<Record<MemoryPolicyNumericField, NumericRange>>;
+  custom_responses_contract?: {
+    endpoint: string;
+    tool_names: string[];
+    enabled_tool_names?: string[];
+    completion_gate?: Record<string, number>;
+    planner_discovery?: Record<string, number>;
+  };
+  [key: string]: unknown;
 }
 
 export interface CreateRunPayload {

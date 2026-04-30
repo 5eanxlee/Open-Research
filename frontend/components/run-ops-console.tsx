@@ -28,8 +28,12 @@ interface RunOpsConsoleProps {
 
 const TOOL_EVENT_TYPES = new Set([
   "search.performed",
+  "source.cache.hit",
+  "source.fetch_failed",
+  "source.fallback_document.created",
   "source.fetched",
   "provider.retry",
+  "tool.budget.low",
   "claim.repair.started",
   "claim.repair.search_performed",
   "claim.repair.source_fetched",

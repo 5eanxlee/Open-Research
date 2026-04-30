@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import orjson
 import re
 from abc import ABC, abstractmethod
 from collections import Counter, defaultdict
@@ -9,6 +8,7 @@ from collections.abc import Sequence
 from time import perf_counter
 from typing import Any
 
+import orjson
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel
 from typing_extensions import TypedDict
@@ -44,10 +44,10 @@ from .domain import (
     PlanningStage,
     PlanPreview,
     RecommendedBudget,
+    ReportSection,
     ResearchAssetRecord,
     ResearchAssetType,
     ResearchAssetUsage,
-    ReportSection,
     ResearchPlan,
     ResearchStreamPlan,
     ResearchStreamView,
@@ -87,6 +87,13 @@ from .providers import (
     PassageReranker,
     SearchProvider,
     UsageInfo,
+)
+from .tool_registry import (
+    FETCH_BUDGET_CATEGORIES,
+    FETCH_TOOL,
+    SEARCH_BUDGET_CATEGORIES,
+    SEARCH_TOOL,
+    assert_tool_budget_available,
 )
 from .utils import (
     chunk_text,
@@ -714,14 +721,25 @@ def _build_discovery_queries(
                 extra_terms=document_terms[:3],
             )
         )
+    discovery_angles = [
+        ("official", "documentation", "source"),
+        ("recent", "developments", "current"),
+        ("disagreement", "analysis", "critique"),
+        ("comparison", "alternatives", "tradeoffs"),
+        ("evidence", "data", "benchmark"),
+        ("risks", "limitations", "failure"),
+        ("implementation", "architecture", "production"),
+        ("case", "study", "deployment"),
+        ("metrics", "evaluation", "quality"),
+        ("standards", "guidance", "policy"),
+        ("roadmap", "changelog", "updates"),
+        ("expert", "review", "consensus"),
+    ]
     queries.extend(
-        [
-            _compact_search_query(question, extra_terms=("official", "documentation")),
-            _compact_search_query(question, extra_terms=("recent", "developments")),
-            _compact_search_query(question, extra_terms=("disagreement", "analysis")),
-        ]
+        _compact_search_query(question, extra_terms=angle)
+        for angle in discovery_angles
     )
-    return dedupe_preserve_order(queries)[: max(1, min(max_queries, budget.max_queries_per_stream))]
+    return dedupe_preserve_order(queries)[: max(1, max_queries)]
 
 
 def _derive_source_floor_targets(
@@ -1041,7 +1059,7 @@ class HeuristicPlanner(Planner):
                     budget=budget,
                     approved_plan=approved_plan,
                     available_documents=available_documents,
-                    max_queries=max(2, min(4, budget.max_queries_per_stream)),
+                    max_queries=max(10, min(16, budget.max_queries_per_stream)),
                 )
             ]
             if planning_stage != PlanningStage.PREVIEW
@@ -1170,6 +1188,11 @@ def _document_below_stream_trust_floor(
     agent_config: AgentConfig,
     stream_name: str,
 ) -> bool:
+    if (
+        document.retrieval_method == RetrievalMethod.MOCK
+        or bool(document.metadata.get("synthetic"))
+    ):
+        return False
     trust_tier_raw = str(document.metadata.get("trust_tier", "") or "").strip().lower()
     if not trust_tier_raw:
         return False
@@ -1606,70 +1629,96 @@ class OpenAIPlanner(Planner):
     ) -> list[PlanningDiscoveryRecord]:
         selected = set(source_selection or [])
         allowed_search = selected or None
+        max_discovery_queries = self.settings.planner_max_discovery_queries
+        if self.settings.resolved_search_backend == "openai":
+            max_discovery_queries = min(
+                max_discovery_queries,
+                max(4, budget.max_queries_per_stream + 2),
+            )
+        min_discovery_queries = min(
+            self.settings.planner_min_discovery_queries,
+            max_discovery_queries,
+        )
         queries = _build_discovery_queries(
             question=question,
             budget=budget,
             approved_plan=approved_plan,
             available_documents=available_documents,
-            max_queries=self.settings.planner_max_discovery_queries,
+            max_queries=max_discovery_queries,
         )
-        queries = queries[: max(self.settings.planner_min_discovery_queries, len(queries))]
+        queries = queries[: max(min_discovery_queries, len(queries))]
         providers = getattr(self.search_provider, "providers", None)
-        discovery_records: list[PlanningDiscoveryRecord] = []
-        for query in queries[: self.settings.planner_max_discovery_queries]:
+        bounded_queries = queries[:max_discovery_queries]
+        semaphore = asyncio.Semaphore(max(1, self.settings.planner_discovery_concurrency))
+
+        async def discover(query: str) -> PlanningDiscoveryRecord:
             collected = []
-            if providers:
-                seen_urls: set[str] = set()
-                for provider in providers:
-                    if allowed_search is not None and provider.provider_name not in allowed_search:
-                        continue
-                    results = await provider.search(
-                        query,
-                        max_results=min(5, budget.max_results_per_query),
-                    )
-                    for result in results:
-                        normalized = normalize_url(str(result.url))
-                        if normalized in seen_urls:
-                            continue
-                        seen_urls.add(normalized)
-                        collected.append(result)
-                    if len(collected) >= min(5, budget.max_results_per_query):
-                        break
-            else:
-                if allowed_search is None or self.search_provider.provider_name in allowed_search:
-                    collected = await self.search_provider.search(
-                        query,
-                        max_results=min(5, budget.max_results_per_query),
-                    )
+            try:
+                async with semaphore:
+                    if providers:
+                        seen_urls: set[str] = set()
+                        for provider in providers:
+                            if allowed_search is not None and provider.provider_name not in allowed_search:
+                                continue
+                            results = await provider.search(
+                                query,
+                                max_results=min(5, budget.max_results_per_query),
+                            )
+                            for result in results:
+                                normalized = normalize_url(str(result.url))
+                                if normalized in seen_urls:
+                                    continue
+                                seen_urls.add(normalized)
+                                collected.append(result)
+                            if len(collected) >= min(5, budget.max_results_per_query):
+                                break
+                    elif (
+                        allowed_search is None
+                        or self.search_provider.provider_name in allowed_search
+                    ):
+                        collected = await self.search_provider.search(
+                            query,
+                            max_results=min(5, budget.max_results_per_query),
+                        )
+            except Exception as exc:
+                return PlanningDiscoveryRecord(
+                    query=query,
+                    provider=None,
+                    result_count=0,
+                    titles=[],
+                    urls=[],
+                    summary=f"Discovery search failed: {exc}",
+                )
             if collected:
                 collected = sorted(
                     collected,
                     key=lambda result: _search_result_relevance(query=query, result=result),
                     reverse=True,
                 )[: min(5, budget.max_results_per_query)]
-            discovery_records.append(
-                PlanningDiscoveryRecord(
-                    query=query,
-                    provider=(
-                        ",".join(
-                            dedupe_preserve_order(result.provider for result in collected if result.provider)
+            return PlanningDiscoveryRecord(
+                query=query,
+                provider=(
+                    ",".join(
+                        dedupe_preserve_order(
+                            result.provider for result in collected if result.provider
                         )
-                        if collected
-                        else None
-                    ),
-                    result_count=len(collected),
-                    titles=[result.title for result in collected[:3]],
-                    urls=[str(result.url) for result in collected[:3]],
-                    summary=(
-                        "No search results were retrieved during planner discovery."
-                        if not collected
-                        else " | ".join(
-                            f"{result.title} ({result.provider})" for result in collected[:3]
-                        )
-                    ),
-                )
+                    )
+                    if collected
+                    else None
+                ),
+                result_count=len(collected),
+                titles=[result.title for result in collected[:3]],
+                urls=[str(result.url) for result in collected[:3]],
+                summary=(
+                    "No search results were retrieved during planner discovery."
+                    if not collected
+                    else " | ".join(
+                        f"{result.title} ({result.provider})" for result in collected[:3]
+                    )
+                ),
             )
-        return discovery_records
+
+        return list(await asyncio.gather(*(discover(query) for query in bounded_queries)))
 
     async def create_plan(
         self,
@@ -2253,10 +2302,15 @@ class OpenAIReportWriter(ReportWriter):
             reasoning_effort=self.settings.llm_reasoning_effort,
         )
         report = report_result.value
-        bounded_sections = [
-            section.model_copy(update={"claims": dedupe_preserve_order(section.claims)[:5]})
-            for section in report.sections[:8]
-        ]
+        claim_budget = max(1, self.settings.grounding_max_claims_per_run)
+        bounded_sections = []
+        for section in report.sections[:4]:
+            if claim_budget <= 0:
+                claims = []
+            else:
+                claims = dedupe_preserve_order(section.claims)[: min(3, claim_budget)]
+                claim_budget -= len(claims)
+            bounded_sections.append(section.model_copy(update={"claims": claims}))
         return GenerationResult(
             value=report.model_copy(
                 update={
@@ -2516,6 +2570,13 @@ class ResearchWorker:
         max_results: int,
         allowed_search: set[str] | None,
     ) -> list[Any]:
+        if self.settings.tool_registry_enabled:
+            await self._assert_tool_budget_available(
+                run_id=run_id,
+                tool_name=SEARCH_TOOL,
+                categories=SEARCH_BUDGET_CATEGORIES,
+                limit=self.settings.max_search_tool_calls_per_run,
+            )
         providers = getattr(self.search_provider, "providers", None)
         if providers:
             aggregated: list[Any] = []
@@ -2544,6 +2605,13 @@ class ResearchWorker:
         url: str,
         allowed_fetch: set[str] | None,
     ) -> FetchedDocument:
+        if self.settings.tool_registry_enabled:
+            await self._assert_tool_budget_available(
+                run_id=run_id,
+                tool_name=FETCH_TOOL,
+                categories=FETCH_BUDGET_CATEGORIES,
+                limit=self.settings.max_fetch_tool_calls_per_run,
+            )
         providers = getattr(self.fetch_provider, "providers", None)
         if providers:
             errors: list[str] = []
@@ -2559,6 +2627,114 @@ class ResearchWorker:
         if allowed_fetch is not None and self.fetch_provider.provider_name not in allowed_fetch:
             raise RuntimeError("Active fetch provider is not enabled for this run.")
         return await self.fetch_provider.fetch(url)
+
+    def _fallback_document_from_search_result(
+        self,
+        result: Any,
+        *,
+        fetch_error: str,
+        discovered_via: str,
+    ) -> FetchedDocument | None:
+        snippet = clean_text(str(getattr(result, "snippet", "") or ""))
+        if len(snippet) < 40:
+            return None
+        url = normalize_url(str(result.url))
+        title = clean_text(str(getattr(result, "title", "") or url))[:200]
+        provider = clean_text(str(getattr(result, "provider", "search") or "search"))
+        content = clean_text(f"{title}. {snippet}")
+        return FetchedDocument(
+            url=url,
+            canonical_url=url,
+            title=title,
+            content=content,
+            source_kind=SourceKind.WEB,
+            retrieval_method=RetrievalMethod.API_NATIVE,
+            metadata={
+                "provider": provider,
+                "fetch_fallback": "search_result_snippet",
+                "fetch_error": fetch_error[:500],
+                "discovered_via": discovered_via,
+                "search_score": float(getattr(result, "score", 0.0) or 0.0),
+            },
+        )
+
+    async def _fetch_search_result_document(
+        self,
+        *,
+        run_id: str,
+        stream_id: str | None,
+        result: Any,
+        allowed_fetch: set[str] | None,
+        discovered_via: str,
+    ) -> tuple[FetchedDocument, bool]:
+        try:
+            return (
+                await self._fetch(
+                    run_id=run_id,
+                    url=str(result.url),
+                    allowed_fetch=allowed_fetch,
+                ),
+                False,
+            )
+        except Exception as exc:
+            await self.events.publish(
+                run_id,
+                "source.fetch_failed",
+                {
+                    "stream_id": stream_id,
+                    "title": getattr(result, "title", None),
+                    "url": str(result.url),
+                    "search_provider": getattr(result, "provider", None),
+                    "error": str(exc),
+                    "discovered_via": discovered_via,
+                },
+            )
+            fallback = self._fallback_document_from_search_result(
+                result,
+                fetch_error=str(exc),
+                discovered_via=discovered_via,
+            )
+            if fallback is None:
+                raise
+            await self.events.publish(
+                run_id,
+                "source.fallback_document.created",
+                {
+                    "stream_id": stream_id,
+                    "title": fallback.title,
+                    "url": str(fallback.canonical_url),
+                    "provider": fallback.metadata.get("provider"),
+                    "discovered_via": discovered_via,
+                },
+            )
+            return fallback, True
+
+    async def _assert_tool_budget_available(
+        self,
+        *,
+        run_id: str,
+        tool_name: str,
+        categories: Sequence[str],
+        limit: int,
+    ) -> None:
+        budget_events = await self.store.list_budget_events(run_id)
+        remaining = assert_tool_budget_available(
+            tool_name=tool_name,
+            budget_events=budget_events,
+            categories=categories,
+            limit=limit,
+        )
+        if remaining <= max(1, limit // 20):
+            await self.events.publish(
+                run_id,
+                "tool.budget.low",
+                {
+                    "tool_name": tool_name,
+                    "remaining_calls": remaining,
+                    "limit": limit,
+                    "categories": list(categories),
+                },
+            )
 
     def _annotate_document_with_trust(self, document: FetchedDocument) -> FetchedDocument:
         assessment = assess_source_trust(
@@ -2784,6 +2960,27 @@ class ResearchWorker:
             metadata=dict(snapshot.get("metadata") or {}),
         )
 
+    @staticmethod
+    def _passages_from_source_snapshot(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+        document = ResearchWorker._document_from_source_snapshot(snapshot)
+        return [
+            {
+                "source_id": str(snapshot["id"]),
+                "source_title": document.title,
+                "source_url": str(document.canonical_url),
+                "passage_index": index,
+                "text": chunk["text"],
+                "start_offset": chunk["start_offset"],
+                "end_offset": chunk["end_offset"],
+                "token_count": len(tokenize(chunk["text"])),
+                "source_kind": document.source_kind.value,
+                "retrieval_method": document.retrieval_method.value,
+                "trust_tier": str(document.metadata.get("trust_tier", "")) or None,
+                "trust_rationale": str(document.metadata.get("trust_rationale", "")) or None,
+            }
+            for index, chunk in enumerate(chunk_text(document.content))
+        ]
+
     async def _write_note_for_document(
         self,
         *,
@@ -2844,6 +3041,8 @@ class ResearchWorker:
                 "artifact_count": len(list(artifacts or [])),
                 "discovered_via": discovered_via,
                 "reused_existing": reused_existing,
+                "search_result_fallback": document.metadata.get("fetch_fallback")
+                == "search_result_snippet",
             },
         )
         await self.events.publish(
@@ -3240,16 +3439,29 @@ class ResearchWorker:
                     selected_canonical_url,
                 )
                 if existing_source is not None:
+                    await self.events.publish(
+                        run_id,
+                        "source.cache.hit",
+                        {
+                            "stream_id": stream_view.id,
+                            "stream_name": stream_view.name,
+                            "source_id": existing_source["id"],
+                            "url": selected_canonical_url,
+                            "stage": "stream_fetch",
+                        },
+                    )
                     source_id = str(existing_source["id"])
                     if source_id not in reusable_source_ids:
                         reusable_source_ids.add(source_id)
                         reusable_sources.append(existing_source)
                     continue
                 fetch_started = perf_counter()
-                fetched_document = await self._fetch(
+                fetched_document, used_search_fallback = await self._fetch_search_result_document(
                     run_id=run_id,
-                    url=str(result.url),
+                    stream_id=stream_view.id,
+                    result=result,
                     allowed_fetch=allowed_fetch,
+                    discovered_via="fetch",
                 )
                 if self.telemetry is not None:
                     fetch_provider = str(
@@ -3306,6 +3518,7 @@ class ResearchWorker:
                     metadata={
                         "provider": document_provider,
                         "url": str(document.canonical_url),
+                        "search_result_fallback": used_search_fallback,
                     },
                     stream_id=stream_view.id,
                 )
@@ -3582,11 +3795,32 @@ class ResearchWorker:
         new_passages: list[dict[str, Any]] = []
         for result in selected_results:
             await self._ensure_run_active(run_id)
+            selected_canonical_url = normalize_url(str(result.url))
+            existing_source = await self.store.get_run_source_snapshot(run_id, selected_canonical_url)
+            if existing_source is not None:
+                await self.events.publish(
+                    run_id,
+                    "source.cache.hit",
+                    {
+                        "source_id": existing_source["id"],
+                        "url": selected_canonical_url,
+                        "stage": "claim_repair",
+                        "claim": claim,
+                    },
+                )
+                new_passages.extend(
+                    self._passages_from_source_snapshot(existing_source)[
+                        : self.settings.grounding_candidate_limit
+                    ]
+                )
+                continue
             fetch_started = perf_counter()
-            fetched_document = await self._fetch(
+            fetched_document, used_search_fallback = await self._fetch_search_result_document(
                 run_id=run_id,
-                url=str(result.url),
+                stream_id=None,
+                result=result,
                 allowed_fetch=allowed_fetch,
+                discovered_via="claim_repair_fetch",
             )
             if self.telemetry is not None:
                 fetch_provider = str(
@@ -3609,6 +3843,7 @@ class ResearchWorker:
                 metadata={
                     "provider": document_provider,
                     "url": str(document.canonical_url),
+                    "search_result_fallback": used_search_fallback,
                 },
             )
             source_id, is_new = await self.store.save_source(run_id, None, document)
@@ -3677,6 +3912,8 @@ class ResearchWorker:
                     "provider": document_provider,
                     "trust_tier": str(document.metadata.get("trust_tier", "")) or None,
                     "artifact_count": len(artifacts),
+                    "search_result_fallback": document.metadata.get("fetch_fallback")
+                    == "search_result_snippet",
                 },
             )
 
@@ -4495,10 +4732,41 @@ class ResearchOrchestrator:
 
         claim_rows_by_key: dict[tuple[str, int], dict[str, Any]] = {}
         citation_candidates: list[CitationCandidate] = []
+        verified_claims = 0
+        max_verified_claims = max(1, self.worker.settings.grounding_max_claims_per_run)
 
         for section in draft.sections:
             for ordinal, claim in enumerate(section.claims, start=1):
                 await self._ensure_run_active(run_id)
+                claim_key = (section.title, ordinal)
+                if verified_claims >= max_verified_claims:
+                    claim_rows_by_key[claim_key] = {
+                        "section_title": section.title,
+                        "ordinal": ordinal,
+                        "claim_text": claim,
+                        "support_label": CitationSupportLabel.UNSUPPORTED.value,
+                        "confidence": 0.0,
+                    }
+                    citation_candidates.append(
+                        CitationCandidate(
+                            section_title=section.title,
+                            ordinal=ordinal,
+                            claim=claim,
+                            citation=None,
+                        )
+                    )
+                    await self.events.publish(
+                        run_id,
+                        "citation.verification.skipped",
+                        {
+                            "section_title": section.title,
+                            "claim": claim,
+                            "reason": "grounding_max_claims_per_run",
+                            "limit": max_verified_claims,
+                        },
+                    )
+                    continue
+                verified_claims += 1
                 candidates = await self._retrieve_supporting_passages(run_id=run_id, claim=claim)
                 verification_result = await self.verifier.verify(
                     claim=claim,
@@ -4567,7 +4835,6 @@ class ResearchOrchestrator:
                         ),
                     },
                 )
-                claim_key = (section.title, ordinal)
                 claim_rows_by_key[claim_key] = {
                     "section_title": section.title,
                     "ordinal": ordinal,
@@ -4760,20 +5027,25 @@ class ResearchOrchestrator:
         citations: Sequence[CitationRecord],
         unsupported_claims: Sequence[str],
     ) -> str:
-        markdown_lines = ["# Research Report", "", draft.executive_summary, ""]
-        citation_index = 1
+        citation_numbers = _citation_numbers_by_record(citations)
+        markdown_lines = ["# Research Report", "", draft.executive_summary.strip(), ""]
+        citation_index = 0
         for section in draft.sections:
             markdown_lines.extend([f"## {section.title}", "", section.overview, ""])
             for ordinal, claim in enumerate(section.claims, start=1):
                 if (section.title, ordinal) not in kept_keys:
                     continue
-                citation = citations[citation_index - 1]
+                if citation_index >= len(citations):
+                    continue
+                citation = citations[citation_index]
                 support_suffix = (
                     " (partial support)"
                     if citation.support_label == CitationSupportLabel.PARTIAL
                     else ""
                 )
-                markdown_lines.append(f"- {claim}{support_suffix} [{citation_index}]")
+                citation_number = citation_numbers[id(citation)]
+                claim_text = claim.strip().rstrip(".")
+                markdown_lines.append(f"{claim_text}{support_suffix}. [{citation_number}]")
                 citation_index += 1
             markdown_lines.append("")
 
@@ -4785,12 +5057,35 @@ class ResearchOrchestrator:
 
         if citations:
             markdown_lines.extend(["## Citations", ""])
-            for index, citation in enumerate(citations, start=1):
-                markdown_lines.append(f"[{index}] {citation.source_title} ({citation.source_url})")
-                markdown_lines.append(f"> {citation.quote}")
+            seen_numbers: set[int] = set()
+            for citation in citations:
+                citation_number = citation_numbers[id(citation)]
+                if citation_number in seen_numbers:
+                    continue
+                seen_numbers.add(citation_number)
+                markdown_lines.append(
+                    f"[{citation_number}] {citation.source_title}: {citation.source_url}"
+                )
+                if citation.quote.strip():
+                    markdown_lines.append(f"Supporting excerpt: {citation.quote.strip()}")
                 markdown_lines.append("")
 
         return "\n".join(markdown_lines).strip()
+
+
+def _citation_numbers_by_record(citations: Sequence[CitationRecord]) -> dict[int, int]:
+    by_url: dict[str, int] = {}
+    by_record: dict[int, int] = {}
+    next_number = 1
+    for citation in citations:
+        key = normalize_url(str(citation.source_url))
+        number = by_url.get(key)
+        if number is None:
+            number = next_number
+            by_url[key] = number
+            next_number += 1
+        by_record[id(citation)] = number
+    return by_record
 
 
 def _render_notes(notes: Sequence[dict[str, Any]]) -> str:

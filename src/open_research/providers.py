@@ -5,6 +5,7 @@ import base64
 import binascii
 import contextvars
 import json
+import re
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
@@ -12,6 +13,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from hashlib import sha256
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 import orjson
@@ -57,7 +59,21 @@ class ProviderRetryNotice:
 
 
 @dataclass(slots=True)
+class ProviderCallNotice:
+    provider_name: str
+    category: str
+    attempt: int
+    query: str | None = None
+    url: str | None = None
+    max_results: int | None = None
+    result_count: int | None = None
+    elapsed_seconds: float | None = None
+
+
+@dataclass(slots=True)
 class ProviderHooks:
+    on_start: Any | None = None
+    on_success: Any | None = None
     on_retry: Any | None = None
     on_error: Any | None = None
 
@@ -82,6 +98,20 @@ async def _emit_provider_retry(notice: ProviderRetryNotice) -> None:
     if hooks is None or hooks.on_retry is None:
         return
     await hooks.on_retry(notice)
+
+
+async def _emit_provider_start(notice: ProviderCallNotice) -> None:
+    hooks = _provider_hooks_var.get()
+    if hooks is None or hooks.on_start is None:
+        return
+    await hooks.on_start(notice)
+
+
+async def _emit_provider_success(notice: ProviderCallNotice) -> None:
+    hooks = _provider_hooks_var.get()
+    if hooks is None or hooks.on_success is None:
+        return
+    await hooks.on_success(notice)
 
 
 async def _emit_provider_error(notice: ProviderRetryNotice) -> None:
@@ -219,6 +249,16 @@ class RetriedSearchProvider(_RetriedProviderMixin, SearchProvider):
     async def search(self, query: str, *, max_results: int) -> list[SearchResult]:
         await self._before_call()
         for attempt in range(1, self.max_attempts + 1):
+            started = time.monotonic()
+            await _emit_provider_start(
+                ProviderCallNotice(
+                    provider_name=self.provider_name,
+                    category=self.category,
+                    attempt=attempt,
+                    query=query,
+                    max_results=max_results,
+                )
+            )
             try:
                 results = await self.provider.search(query, max_results=max_results)
             except ProviderError as exc:
@@ -227,6 +267,17 @@ class RetriedSearchProvider(_RetriedProviderMixin, SearchProvider):
                     raise
                 continue
             await self._mark_success()
+            await _emit_provider_success(
+                ProviderCallNotice(
+                    provider_name=self.provider_name,
+                    category=self.category,
+                    attempt=attempt,
+                    query=query,
+                    max_results=max_results,
+                    result_count=len(results),
+                    elapsed_seconds=round(time.monotonic() - started, 3),
+                )
+            )
             return results
         raise ProviderError(f"{self.provider_name} exhausted retries")
 
@@ -241,6 +292,15 @@ class RetriedFetchProvider(_RetriedProviderMixin, FetchProvider):
     async def fetch(self, url: str) -> FetchedDocument:
         await self._before_call()
         for attempt in range(1, self.max_attempts + 1):
+            started = time.monotonic()
+            await _emit_provider_start(
+                ProviderCallNotice(
+                    provider_name=self.provider_name,
+                    category=self.category,
+                    attempt=attempt,
+                    url=url,
+                )
+            )
             try:
                 document = await self.provider.fetch(url)
             except ProviderError as exc:
@@ -249,6 +309,16 @@ class RetriedFetchProvider(_RetriedProviderMixin, FetchProvider):
                     raise
                 continue
             await self._mark_success()
+            await _emit_provider_success(
+                ProviderCallNotice(
+                    provider_name=self.provider_name,
+                    category=self.category,
+                    attempt=attempt,
+                    url=url,
+                    result_count=1,
+                    elapsed_seconds=round(time.monotonic() - started, 3),
+                )
+            )
             return document
         raise ProviderError(f"{self.provider_name} exhausted retries")
 
@@ -432,6 +502,83 @@ class TavilySearchProvider(SearchProvider):
         return results
 
 
+_OPENAI_WEB_URL_RE = re.compile(r"https?://[^\s<>()\\[\\]{}\"']+")
+
+
+class OpenAIWebSearchProvider(SearchProvider):
+    provider_name = "openai"
+
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        model: str,
+        base_url: str | None = None,
+        timeout: float = 60.0,
+        search_context_size: str = "medium",
+        reasoning_effort: str = "low",
+        external_web_access: bool = True,
+        max_output_tokens: int = 1200,
+    ) -> None:
+        self.client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
+        self.model = model
+        self.search_context_size = search_context_size
+        self.reasoning_effort = reasoning_effort
+        self.external_web_access = external_web_access
+        self.max_output_tokens = max(256, max_output_tokens)
+
+    async def search(self, query: str, *, max_results: int) -> list[SearchResult]:
+        if max_results <= 0:
+            return []
+        tool: dict[str, Any] = {
+            "type": "web_search",
+            "search_context_size": self.search_context_size,
+            "external_web_access": self.external_web_access,
+        }
+        request_kwargs: dict[str, Any] = {
+            "model": self.model,
+            "instructions": (
+                "You are a web search adapter. Search the public web for directly "
+                "citable sources, prefer primary or official sources, and keep the "
+                "answer concise."
+            ),
+            "input": (
+                "Find current, citable web sources for this research query. "
+                "Return a concise synthesis with inline citations.\n\n"
+                f"Query: {query}"
+            ),
+            "tools": [tool],
+            "tool_choice": "required",
+            "include": ["web_search_call.action.sources"],
+            "max_output_tokens": self.max_output_tokens,
+            "store": False,
+        }
+        if self._model_supports_reasoning(self.model):
+            request_kwargs["reasoning"] = {"effort": self.reasoning_effort}
+
+        try:
+            response = await self.client.responses.create(**request_kwargs)
+        except Exception as exc:
+            raise ProviderError(f"OpenAI web search request failed: {exc}") from exc
+
+        payload = _response_model_dump(response)
+        summary = _extract_response_text(response, payload)
+        results = _extract_openai_web_search_results(
+            payload=payload,
+            summary=summary,
+            max_results=max_results,
+            provider_name=self.provider_name,
+        )
+        if not results:
+            raise ProviderError("OpenAI web search returned no cited URLs.")
+        return results
+
+    @staticmethod
+    def _model_supports_reasoning(model: str) -> bool:
+        lowered = model.lower()
+        return lowered.startswith("gpt-5") or lowered.startswith("o")
+
+
 class SearchPipeline(SearchProvider):
     provider_name = "search-broker"
 
@@ -479,9 +626,9 @@ class SearchPipeline(SearchProvider):
             )
         )
         preferred = (
-            ["exa", "brave", "tavily", "mock"]
+            ["exa", "brave", "openai", "tavily", "mock"]
             if semantic_priority
-            else ["brave", "exa", "tavily", "mock"]
+            else ["brave", "exa", "openai", "tavily", "mock"]
         )
         by_name = {provider.provider_name: provider for provider in self.providers}
         ordered: list[SearchProvider] = []
@@ -1246,10 +1393,139 @@ class OpenAIJsonClient:
 
 
 MODEL_PRICING_USD_PER_1M: dict[str, tuple[float, float]] = {
+    "gpt-5.5": (5.00, 30.00),
     "gpt-5.4": (2.50, 15.00),
     "gpt-5.4-mini": (0.75, 4.50),
     "gpt-5.4-nano": (0.20, 1.00),
 }
+
+
+def _response_model_dump(response: Any) -> Mapping[str, Any]:
+    model_dump = getattr(response, "model_dump", None)
+    if callable(model_dump):
+        try:
+            dumped = model_dump(mode="json")
+        except TypeError:
+            dumped = model_dump()
+        if isinstance(dumped, Mapping):
+            return dumped
+    if isinstance(response, Mapping):
+        return response
+    return {}
+
+
+def _extract_response_text(response: Any, payload: Mapping[str, Any]) -> str:
+    output_text = getattr(response, "output_text", None)
+    if isinstance(output_text, str) and output_text.strip():
+        return clean_text(output_text)
+    object_text = _extract_output_text(response)
+    if object_text.strip():
+        return clean_text(object_text)
+    parts: list[str] = []
+    for item in _walk_values(payload):
+        if not isinstance(item, Mapping):
+            continue
+        text = item.get("text")
+        if item.get("type") in {"output_text", "text"} and isinstance(text, str):
+            parts.append(text)
+    return clean_text("\n".join(parts))
+
+
+def _extract_openai_web_search_results(
+    *,
+    payload: Mapping[str, Any],
+    summary: str,
+    max_results: int,
+    provider_name: str,
+) -> list[SearchResult]:
+    sources: dict[str, dict[str, str]] = {}
+
+    def add_source(
+        raw_url: Any,
+        *,
+        title: Any = None,
+        snippet: Any = None,
+    ) -> None:
+        normalized = _clean_http_source_url(raw_url)
+        if normalized is None:
+            return
+        record = sources.setdefault(normalized, {"url": normalized})
+        if isinstance(title, str) and title.strip() and not record.get("title"):
+            record["title"] = clean_text(title)[:200]
+        if isinstance(snippet, str) and snippet.strip() and not record.get("snippet"):
+            record["snippet"] = clean_text(snippet)[:500]
+
+    for item in _walk_values(payload):
+        if not isinstance(item, Mapping):
+            continue
+        item_type = item.get("type")
+        if item_type == "url_citation":
+            add_source(item.get("url"), title=item.get("title"), snippet=summary)
+            continue
+        if item_type == "url":
+            add_source(item.get("url"), title=item.get("title"), snippet=summary)
+            continue
+        if "url" in item and item_type in {
+            "search",
+            "open_page",
+            "find_in_page",
+            "source",
+            "webpage",
+            None,
+        }:
+            add_source(item.get("url"), title=item.get("title"), snippet=summary)
+
+    for match in _OPENAI_WEB_URL_RE.finditer(summary):
+        add_source(match.group(0), snippet=summary)
+
+    results: list[SearchResult] = []
+    for index, record in enumerate(sources.values()):
+        if len(results) >= max_results:
+            break
+        url = record["url"]
+        try:
+            results.append(
+                SearchResult(
+                    title=record.get("title") or _title_from_url(url),
+                    url=url,
+                    snippet=record.get("snippet") or summary[:500],
+                    provider=provider_name,
+                    score=float(max_results - index),
+                )
+            )
+        except ValueError:
+            continue
+    return results
+
+
+def _walk_values(value: Any):
+    if isinstance(value, Mapping):
+        yield value
+        for child in value.values():
+            yield from _walk_values(child)
+    elif isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
+        for child in value:
+            yield from _walk_values(child)
+
+
+def _clean_http_source_url(raw_url: Any) -> str | None:
+    if not isinstance(raw_url, str):
+        return None
+    candidate = raw_url.strip().rstrip(".,;:!?)\\]}\"'")
+    if not candidate.startswith(("http://", "https://")):
+        return None
+    parsed = urlparse(candidate)
+    if not parsed.netloc:
+        return None
+    return normalize_url(candidate)
+
+
+def _title_from_url(url: str) -> str:
+    parsed = urlparse(url)
+    path_tail = parsed.path.rstrip("/").rsplit("/", maxsplit=1)[-1]
+    if path_tail:
+        return path_tail.replace("-", " ").replace("_", " ").title()
+    return parsed.netloc or url
 
 
 def _infer_source_kind(url: str, metadata: Mapping[str, Any] | None = None) -> SourceKind:

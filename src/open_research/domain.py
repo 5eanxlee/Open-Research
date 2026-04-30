@@ -702,6 +702,57 @@ class FinalReport(StrictModel):
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
 
 
+class CompletionGateResult(StrictModel):
+    passed: bool
+    char_count: int = Field(ge=0)
+    heading_count: int = Field(ge=0)
+    forbidden_phrases: list[str] = Field(default_factory=list)
+    reasons: list[str] = Field(default_factory=list)
+
+
+class ResearchReportSource(StrictModel):
+    citation_number: int | None = None
+    title: str | None = None
+    original_url: str
+    normalized_url: str
+    provider: str | None = None
+    first_seen_agent: str | None = None
+    first_seen_at: datetime | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ResearchOptions(StrictModel):
+    budget: BudgetPolicy | None = None
+    agent_config: AgentConfig | None = None
+    model_config_override: ModelConfigOverride | None = None
+    profile_id: str = Field(default="default", min_length=1, max_length=128)
+    project_id: str | None = Field(default=None, min_length=1, max_length=36)
+    memory_policy_override: MemoryInfluencePolicy | None = None
+    execution_mode: ExecutionMode = ExecutionMode.DEEP
+    require_plan_approval: bool = False
+    source_selection: list[str] | None = None
+    input_assets: list[ResearchInputAsset] = Field(default_factory=list)
+    staged_asset_ids: list[str] = Field(default_factory=list)
+    timeout_seconds: float | None = Field(default=None, ge=1.0, le=21600.0)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ResearchRequest(StrictModel):
+    prompt: str = Field(min_length=1, max_length=20_000)
+    options: ResearchOptions | None = None
+
+
+class ResearchReport(StrictModel):
+    report_markdown: str
+    sources: list[ResearchReportSource] = Field(default_factory=list)
+    run_id: str
+    model_usage: dict[str, Any] = Field(default_factory=dict)
+    tool_usage: dict[str, Any] = Field(default_factory=dict)
+    warnings: list[str] = Field(default_factory=list)
+    trace_url: str | None = None
+    completion_gate: CompletionGateResult | None = None
+
+
 class RunEvent(StrictModel):
     id: int
     run_id: str
@@ -819,6 +870,22 @@ class SourceRegistryEntry(StrictModel):
     created_at: datetime = Field(default_factory=utc_now)
 
 
+class ToolCatalogEntry(StrictModel):
+    name: str
+    display_name: str
+    category: str
+    owner: str
+    description: str
+    enabled: bool = True
+    backend: str | None = None
+    provider: str | None = None
+    budget_categories: list[str] = Field(default_factory=list)
+    per_run_limit: int | None = Field(default=None, ge=1)
+    risk: str = "low"
+    requires_auth: bool = False
+    failure_mode: str = "surface_error"
+
+
 class CitationAuditRecord(StrictModel):
     id: str
     run_id: str
@@ -909,6 +976,7 @@ class PublicRuntimeConfig(StrictModel):
     prompt_mode: PromptMode = PromptMode.CODE
     available_sources: list[SourceCatalogEntry] = Field(default_factory=list)
     default_source_selection: list[str] = Field(default_factory=list)
+    tool_catalog: list[ToolCatalogEntry] = Field(default_factory=list)
     capabilities: dict[str, Any] = Field(default_factory=dict)
 
 

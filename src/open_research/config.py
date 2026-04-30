@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 from functools import lru_cache
 from typing import Literal
 
@@ -33,7 +34,7 @@ class Settings(BaseSettings):
     )
 
     llm_backend: Literal["auto", "heuristic", "openai", "openai_compatible"] = "auto"
-    search_backend: Literal["auto", "mock", "brave", "exa", "tavily"] = "auto"
+    search_backend: Literal["auto", "mock", "openai", "brave", "exa", "tavily"] = "auto"
     fetch_backend: Literal[
         "auto",
         "mock",
@@ -92,6 +93,10 @@ class Settings(BaseSettings):
         default=None,
         validation_alias=AliasChoices("TAVILY_API_KEY", "OPEN_RESEARCH_TAVILY_API_KEY"),
     )
+    serper_api_key: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices("SERPER_API_KEY", "OPEN_RESEARCH_SERPER_API_KEY"),
+    )
     firecrawl_api_key: SecretStr | None = Field(
         default=None,
         validation_alias=AliasChoices("FIRECRAWL_API_KEY", "OPEN_RESEARCH_FIRECRAWL_API_KEY"),
@@ -148,13 +153,19 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("TEMPORAL_TLS", "OPEN_RESEARCH_TEMPORAL_TLS"),
     )
 
-    lead_model: str = "gpt-5.4"
-    planner_model: str = "gpt-5.4"
-    worker_model: str = "gpt-5.4-mini"
-    verifier_model: str = "gpt-5.4-mini"
+    lead_model: str = "gpt-5.5"
+    planner_model: str = "gpt-5.5"
+    worker_model: str = "gpt-5.5"
+    verifier_model: str = "gpt-5.5"
     embedding_model: str = "text-embedding-3-large"
     reranker_model: str = "BAAI/bge-reranker-v2-m3"
-    llm_reasoning_effort: Literal["minimal", "low", "medium", "high"] = "high"
+    openai_web_search_model: str | None = None
+    openai_web_search_context_size: Literal["low", "medium", "high"] = "medium"
+    openai_web_search_reasoning_effort: Literal["low", "medium", "high"] = "high"
+    openai_web_search_external_web_access: bool = True
+    openai_web_search_max_output_tokens: int = 1200
+    openai_web_search_timeout_seconds: float = 180.0
+    llm_reasoning_effort: Literal["minimal", "low", "medium", "high", "xhigh"] = "high"
     llm_api_style: Literal["auto", "responses", "chat_completions"] = "auto"
     llm_structured_output_mode: Literal["auto", "parse", "json_schema", "prompted"] = "auto"
     llm_supports_reasoning_effort: bool | None = None
@@ -165,6 +176,7 @@ class Settings(BaseSettings):
     prompt_template_family_fallback: bool = True
     prompt_reload_in_dev: bool = True
     prompt_externalization_enabled: bool = True
+    custom_responses_runtime_backend: Literal["auto", "pipeline", "deepagents"] = "auto"
     deep_plan_approval_enabled: bool = True
     source_registry_ui_enabled: bool = True
     async_jobs_enabled: bool = True
@@ -177,12 +189,20 @@ class Settings(BaseSettings):
     max_results_per_query: int = 5
     max_sources_per_stream: int = 3
     per_domain_limit: int = 2
-    planner_min_discovery_queries: int = 2
-    planner_max_discovery_queries: int = 6
+    planner_min_discovery_queries: int = 10
+    planner_max_discovery_queries: int = 16
     planner_min_total_sources_retrieved: int = 8
     planner_min_total_cited_sources: int = 4
     planner_validation_enabled: bool = True
     planner_max_validation_retries: int = 2
+    planner_discovery_concurrency: int = 3
+    completion_gate_min_chars: int = 2000
+    completion_gate_min_headings: int = 2
+    completion_gate_max_attempts: int = 5
+    tool_registry_enabled: bool = True
+    max_search_tool_calls_per_run: int = 200
+    max_fetch_tool_calls_per_run: int = 200
+    max_embedding_tool_calls_per_run: int = 500
     max_upload_file_size_bytes: int = 50 * 1024 * 1024
     max_upload_files_per_batch: int = 20
     max_ocr_pdf_pages: int = 200
@@ -212,6 +232,7 @@ class Settings(BaseSettings):
     artifact_store_s3_endpoint_url: str | None = None
     embedding_dimensions: int = 1536
     grounding_candidate_limit: int = 12
+    grounding_max_claims_per_run: int = 4
     provider_retry_attempts: int = 3
     provider_retry_base_seconds: float = 0.5
     provider_retry_max_seconds: float = 4.0
@@ -302,7 +323,20 @@ class Settings(BaseSettings):
         return "generic"
 
     @property
-    def resolved_search_backend(self) -> Literal["mock", "brave", "exa", "tavily"]:
+    def resolved_custom_responses_runtime_backend(self) -> Literal["pipeline", "deepagents"]:
+        if self.custom_responses_runtime_backend != "auto":
+            return self.custom_responses_runtime_backend
+        if (
+            self.resolved_llm_backend == "openai"
+            and _looks_like_openai_key(self.openai_api_key)
+            and importlib.util.find_spec("deepagents") is not None
+            and importlib.util.find_spec("langchain_openai") is not None
+        ):
+            return "deepagents"
+        return "pipeline"
+
+    @property
+    def resolved_search_backend(self) -> Literal["mock", "openai", "brave", "exa", "tavily"]:
         if self.search_backend != "auto":
             return self.search_backend
         if self.brave_api_key:
@@ -311,6 +345,8 @@ class Settings(BaseSettings):
             return "exa"
         if self.tavily_api_key:
             return "tavily"
+        if _looks_like_openai_key(self.openai_api_key):
+            return "openai"
         return "mock"
 
     @property

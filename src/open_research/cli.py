@@ -6,8 +6,8 @@ import os
 import shutil
 import subprocess
 import sys
-from contextlib import suppress
 from collections.abc import Sequence
+from contextlib import suppress
 from pathlib import Path
 
 from rich.console import Console
@@ -22,8 +22,8 @@ from .domain import (
     BudgetPolicy,
     ContextPack,
     ExecutionMode,
+    ModelConfigOverride,
     PassageInspectionRecord,
-    PlanPreview,
     PublicRuntimeConfig,
     RunDetail,
     RunEvent,
@@ -159,7 +159,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     serve = subparsers.add_parser("serve", help="Run the backend API server.")
     serve.add_argument("--host", default=DEFAULT_API_HOST, help="Host for the backend server.")
-    serve.add_argument("--port", type=int, default=DEFAULT_API_PORT, help="Port for the backend server.")
+    serve.add_argument(
+        "--port",
+        type=int,
+        default=DEFAULT_API_PORT,
+        help="Port for the backend server.",
+    )
     serve.set_defaults(reload=True)
     serve.add_argument(
         "--reload",
@@ -179,7 +184,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Run the backend API and frontend dashboard together from a repo checkout.",
     )
     dev.add_argument("--host", default=DEFAULT_API_HOST, help="Host for the backend server.")
-    dev.add_argument("--port", type=int, default=DEFAULT_API_PORT, help="Port for the backend server.")
+    dev.add_argument(
+        "--port",
+        type=int,
+        default=DEFAULT_API_PORT,
+        help="Port for the backend server.",
+    )
     dev.add_argument(
         "--frontend-port",
         type=int,
@@ -286,6 +296,10 @@ def _add_request_options(parser: argparse.ArgumentParser) -> None:
         "--source-trust-floor",
         choices=["standard", "high", "primary", "low"],
     )
+    parser.add_argument("--lead-model", help="Override the lead/orchestrator model for this run.")
+    parser.add_argument("--planner-model", help="Override the planner model for this run.")
+    parser.add_argument("--worker-model", help="Override the worker/researcher model for this run.")
+    parser.add_argument("--verifier-model", help="Override the verifier model for this run.")
     parser.add_argument(
         "--include-counterevidence",
         action="store_true",
@@ -355,7 +369,8 @@ def _run_dev_server(args: argparse.Namespace) -> int:
     frontend_dir = _frontend_dir()
     if not frontend_dir.exists():
         raise TerminalClientError(
-            "The frontend workspace was not found. `ore dev` must be run from a repository checkout."
+            "The frontend workspace was not found. "
+            "`ore dev` must be run from a repository checkout."
         )
 
     npm = _require_command(
@@ -570,6 +585,7 @@ async def _run_ask(
         execution_mode=ExecutionMode(args.execution_mode),
         require_plan_approval=args.require_plan_approval,
         source_selection=source_selection,
+        model_config_override=_model_config_override_from_args(args),
         metadata={"client": {"surface": "terminal-cli"}},
     )
     console.print(
@@ -614,6 +630,7 @@ async def _run_submit_job(
         execution_mode=ExecutionMode(args.execution_mode),
         require_plan_approval=args.require_plan_approval,
         source_selection=_source_selection_from_args(args),
+        model_config_override=_model_config_override_from_args(args),
         metadata={"client": {"surface": "terminal-cli", "mode": "submit-job"}},
     )
     job = await client.create_job(request=request)
@@ -678,6 +695,18 @@ def _agent_config_from_args(args: argparse.Namespace, config: PublicRuntimeConfi
             if value is not None
         }
     )
+
+
+def _model_config_override_from_args(args: argparse.Namespace) -> ModelConfigOverride | None:
+    values = {
+        "lead_model": args.lead_model,
+        "planner_model": args.planner_model,
+        "worker_model": args.worker_model,
+        "verifier_model": args.verifier_model,
+    }
+    if not any(values.values()):
+        return None
+    return ModelConfigOverride(**values)
 
 
 def _render_run_detail(detail: RunDetail) -> None:
@@ -963,7 +992,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             OpenResearchTerminalApp(api_base_url=args.api_base_url).run()
             return
         if args.command == "serve":
-            raise SystemExit(_run_backend_server(host=args.host, port=args.port, reload=args.reload))
+            raise SystemExit(
+                _run_backend_server(host=args.host, port=args.port, reload=args.reload)
+            )
         if args.command == "dev":
             raise SystemExit(_run_dev_server(args))
         raise SystemExit(asyncio.run(_run_async(args)))

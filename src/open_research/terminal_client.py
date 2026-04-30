@@ -10,18 +10,19 @@ import httpx
 
 from .domain import (
     AgentConfig,
-    AsyncJob,
     ArtifactRecord,
-    ClarificationSession,
+    AsyncJob,
     BehaviorAssessment,
     BudgetPolicy,
     CitationAuditRecord,
     ClarificationResponseRequest,
+    ClarificationSession,
     ContextPack,
     CreateRunRequest,
     ExecutionMode,
     FinalReport,
     MemoryInfluencePolicy,
+    ModelConfigOverride,
     PassageInspectionRecord,
     PlanApprovalRequest,
     PlanPreview,
@@ -61,9 +62,10 @@ def build_request(
     agent_config: AgentConfig,
     profile_id: str = "default",
     memory_policy_override: MemoryInfluencePolicy | None = None,
-    execution_mode: ExecutionMode = ExecutionMode.DEEP,
-    require_plan_approval: bool | None = None,
+    execution_mode: ExecutionMode = ExecutionMode.STANDARD,
+    require_plan_approval: bool | None = False,
     source_selection: list[str] | None = None,
+    model_config_override: ModelConfigOverride | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> CreateRunRequest:
     return CreateRunRequest(
@@ -75,6 +77,7 @@ def build_request(
         execution_mode=execution_mode,
         require_plan_approval=require_plan_approval,
         source_selection=source_selection,
+        model_config_override=model_config_override,
         metadata=metadata or {},
     )
 
@@ -200,9 +203,10 @@ class ResearchTerminalClient:
         agent_config: AgentConfig,
         profile_id: str = "default",
         memory_policy_override: MemoryInfluencePolicy | None = None,
-        execution_mode: ExecutionMode = ExecutionMode.DEEP,
-        require_plan_approval: bool | None = None,
+        execution_mode: ExecutionMode = ExecutionMode.STANDARD,
+        require_plan_approval: bool | None = False,
         source_selection: list[str] | None = None,
+        model_config_override: ModelConfigOverride | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> RunSummary:
         request = build_request(
@@ -214,6 +218,7 @@ class ResearchTerminalClient:
             execution_mode=execution_mode,
             require_plan_approval=require_plan_approval,
             source_selection=source_selection,
+            model_config_override=model_config_override,
             metadata=metadata,
         )
         return await self._request_json(

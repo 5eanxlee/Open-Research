@@ -239,7 +239,7 @@ The strict deep-research path now supports both backends as long as they provide
 
 - a real LLM endpoint
 - a real embedding endpoint
-- Exa, Brave, or Tavily for search
+- OpenAI Web Search, Exa, Brave, or Tavily for search
 - Firecrawl, Browserbase, Browserbase Session, or Playwright for fetch
 - `sentence-transformers` reranking
 
@@ -252,8 +252,12 @@ Key runtime switches:
 - `OPEN_RESEARCH_LLM_STRUCTURED_OUTPUT_MODE=auto|parse|json_schema|prompted`
 - `OPEN_RESEARCH_LLM_MODEL_FAMILY=auto|generic|openai|glm|qwen|deepseek`
 - `OPEN_RESEARCH_LLM_REASONING_EFFORT=minimal|low|medium|high`
-- `OPEN_RESEARCH_SEARCH_BACKEND=auto|mock|brave|exa|tavily`
+- `OPEN_RESEARCH_SEARCH_BACKEND=auto|mock|openai|brave|exa|tavily`
 - `OPEN_RESEARCH_FETCH_BACKEND=auto|mock|firecrawl|browserbase|browserbase_session|playwright`
+- `OPEN_RESEARCH_CUSTOM_RESPONSES_RUNTIME_BACKEND=auto|pipeline|deepagents`
+- `OPEN_RESEARCH_TOOL_REGISTRY_ENABLED=true|false`
+- `OPEN_RESEARCH_MAX_SEARCH_TOOL_CALLS_PER_RUN`
+- `OPEN_RESEARCH_MAX_FETCH_TOOL_CALLS_PER_RUN`
 - `OPEN_RESEARCH_WORKFLOW_BACKEND=auto|local|temporal`
 - `OPEN_RESEARCH_PROCESS_ROLE=all|api|worker`
 - `OPEN_RESEARCH_DATABASE_BOOTSTRAP_MODE=auto|create_all|alembic`

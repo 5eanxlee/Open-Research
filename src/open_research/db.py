@@ -39,12 +39,12 @@ from .domain import (
     AgentConfig,
     AnswerStyle,
     ApprovalDecision,
-    AssetExtractionMethod,
-    AssetProcessingStatus,
     ArtifactRecord,
-    AsyncJob,
     AssessmentKind,
     AssessmentSource,
+    AssetExtractionMethod,
+    AssetProcessingStatus,
+    AsyncJob,
     BehaviorAssessment,
     BudgetPolicy,
     CitationAuditDecision,
@@ -65,9 +65,9 @@ from .domain import (
     PlanPreview,
     ProfileFeedback,
     ProfilePreferences,
+    ProfileRecord,
     ProjectDetail,
     ProjectSummary,
-    ProfileRecord,
     RecommendedBudget,
     ResearchAssetRecord,
     ResearchAssetType,
@@ -83,10 +83,10 @@ from .domain import (
     RunExecutionState,
     RunStatus,
     RunSummary,
-    StagedAssetRecord,
     SourceKind,
     SourceRegistryEntry,
     SourceTrustTier,
+    StagedAssetRecord,
     StreamStatus,
     TaskStatus,
 )
@@ -1880,6 +1880,26 @@ class ResearchStore:
                     metadata_json=metadata or {},
                 )
             )
+
+    async def list_budget_events(self, run_id: str) -> list[dict[str, Any]]:
+        async with self.session_factory() as session:
+            stmt = (
+                select(BudgetEventORM)
+                .where(BudgetEventORM.run_id == run_id)
+                .order_by(BudgetEventORM.created_at.asc())
+            )
+            events = (await session.execute(stmt)).scalars().all()
+            return [
+                {
+                    "id": event.id,
+                    "run_id": event.run_id,
+                    "category": event.category,
+                    "delta": event.delta,
+                    "metadata": dict(event.metadata_json or {}),
+                    "created_at": event.created_at,
+                }
+                for event in events
+            ]
 
     async def has_source(self, run_id: str, canonical_url: str) -> bool:
         async with self.session_factory() as session:

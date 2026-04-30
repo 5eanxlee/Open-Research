@@ -10,9 +10,6 @@ from .domain import (
     ApprovalDecision,
     CitationAuditDecision,
     CitationSupportLabel,
-    ResearchAssetRecord,
-    ResearchAssetUsage,
-    ResearchPlan,
     RunDetail,
     RunEvent,
     RunNoteRecord,
@@ -38,7 +35,6 @@ from .domain import (
     WorkspaceStreamView,
     WorkspaceTaskView,
 )
-
 
 PHASE_ORDER: list[WorkspacePhaseKey] = [
     WorkspacePhaseKey.INTAKE,
@@ -74,6 +70,9 @@ EVENT_PHASES: dict[str, WorkspacePhaseKey] = {
     "stream.created": WorkspacePhaseKey.EXECUTE,
     "task.started": WorkspacePhaseKey.EXECUTE,
     "search.performed": WorkspacePhaseKey.EXECUTE,
+    "source.cache.hit": WorkspacePhaseKey.EXECUTE,
+    "source.fetch_failed": WorkspacePhaseKey.EXECUTE,
+    "source.fallback_document.created": WorkspacePhaseKey.EXECUTE,
     "source.fetched": WorkspacePhaseKey.EXECUTE,
     "note.saved": WorkspacePhaseKey.EXECUTE,
     "input_assets.ingested": WorkspacePhaseKey.EXECUTE,
@@ -83,6 +82,7 @@ EVENT_PHASES: dict[str, WorkspacePhaseKey] = {
     "citation.verified": WorkspacePhaseKey.GROUND,
     "claim.repair.started": WorkspacePhaseKey.GROUND,
     "claim.repair.search_performed": WorkspacePhaseKey.GROUND,
+    "tool.budget.low": WorkspacePhaseKey.GROUND,
     "claim.repair.source_fetched": WorkspacePhaseKey.GROUND,
     "claim.repair.completed": WorkspacePhaseKey.GROUND,
     "citation.removed": WorkspacePhaseKey.AUDIT,

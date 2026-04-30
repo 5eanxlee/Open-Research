@@ -12,10 +12,10 @@ from .domain import (
     ClaimGranularity,
     FetchedDocument,
     PlanningStage,
+    PromptMode,
     RecencyPolicy,
     ResearchProfile,
     RetrievalMethod,
-    PromptMode,
     SourceKind,
     SourceTrustTier,
 )
@@ -638,7 +638,9 @@ def report_writer_system_prompt(
         "- If the only support for a claim comes from low- or unknown-trust notes, either "
         "qualify the claim clearly or move it into open questions.\n"
         "- Do not invent citations or imply support that the notes do not carry.\n"
-        "- Optimize for downstream grounding: every claim should be narrow enough to verify."
+        "- Optimize for downstream grounding: every claim should be narrow enough to verify.\n"
+        f"- Produce no more than {settings.grounding_max_claims_per_run} total groundable "
+        "claims across all report sections."
     )
     prompt_role = _resolve_role_prompt(
         settings=settings,

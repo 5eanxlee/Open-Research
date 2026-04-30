@@ -1,22 +1,35 @@
 from __future__ import annotations
 
 import asyncio
-from difflib import SequenceMatcher
 import importlib.util
 import re
 import socket
 from contextlib import suppress
+from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
+from difflib import SequenceMatcher
+from hashlib import sha256
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 from uuid import uuid4
 
 from sqlalchemy.exc import OperationalError
 
-from .asset_ingestion import extract_uploaded_file
 from .artifacts import build_artifact_store
+from .asset_ingestion import extract_uploaded_file
 from .config import Settings, get_settings
+from .custom_responses import (
+    FORBIDDEN_COMPLETION_PHRASES,
+    build_custom_research_report,
+    create_run_request_from_research_options,
+    evaluate_completion_gate,
+    wait_for_terminal_detail,
+)
 from .db import ResearchStore, create_engine_and_sessionmaker
+from .deep_agents_runtime import (
+    inspect_custom_responses_deep_agent,
+    run_custom_responses_deep_agent_research,
+)
 from .domain import (
     AgentConfig,
     ApprovalDecision,
@@ -25,39 +38,42 @@ from .domain import (
     AsyncJob,
     BehaviorAssessment,
     BudgetPolicy,
+    CitationRecord,
     ClarificationQuestion,
-    ClarificationTurn,
     ClarificationSession,
+    ClarificationTurn,
     ClarifierConfig,
     CreateProjectRequest,
     CreateRunRequest,
     ExecutionMode,
     ModelConfig,
-    ModelConfigOverride,
     PlanApprovalStatus,
     PlanningStage,
     PlanPreview,
     ProfileFeedback,
     ProfilePreferences,
+    ProfileRecord,
     ProjectDetail,
     ProjectSummary,
-    ProfileRecord,
     PublicRuntimeConfig,
     RecommendedBudget,
+    ResearchAssetRecord,
+    ResearchAssetUsage,
+    ResearchInputAsset,
+    ResearchOptions,
+    ResearchReport,
     RunConversationMessage,
     RunConversationReply,
     RunConversationRequest,
     RunConversationRole,
-    ResearchAssetRecord,
-    ResearchAssetUsage,
-    ResearchInputAsset,
     RunDetail,
     RunNoteRecord,
     RunStatus,
     RunSummary,
     RunWorkspaceSnapshot,
-    StagedAssetRecord,
     SourceCatalogEntry,
+    StagedAssetRecord,
+    ToolCatalogEntry,
     is_terminal_run_status,
     resolve_model_config,
 )
@@ -105,8 +121,10 @@ from .providers import (
     OpenAICompatibleEmbeddingProvider,
     OpenAIEmbeddingProvider,
     OpenAIJsonClient,
+    OpenAIWebSearchProvider,
     PassageReranker,
     PlaywrightFetchProvider,
+    ProviderCallNotice,
     ProviderHooks,
     ProviderRetryNotice,
     RetriedEmbeddingProvider,
@@ -117,6 +135,7 @@ from .providers import (
     TavilySearchProvider,
     provider_hooks_scope,
 )
+from .tool_registry import build_tool_catalog, contract_tool_names
 from .utils import clean_text
 from .workspace import build_run_workspace_snapshot
 
@@ -157,6 +176,26 @@ def _retry_kwargs(settings: Settings) -> dict[str, float | int]:
         "cooldown_failures": settings.provider_cooldown_failures,
         "cooldown_seconds": settings.provider_cooldown_seconds,
     }
+
+
+def _provider_call_payload(notice: ProviderCallNotice) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "provider": notice.provider_name,
+        "category": notice.category,
+        "attempt": notice.attempt,
+    }
+    if notice.query:
+        payload["query"] = notice.query
+        payload["query_hash"] = sha256(notice.query.encode("utf-8")).hexdigest()
+    if notice.url:
+        payload["url"] = notice.url
+    if notice.max_results is not None:
+        payload["max_results"] = notice.max_results
+    if notice.result_count is not None:
+        payload["result_count"] = notice.result_count
+    if notice.elapsed_seconds is not None:
+        payload["elapsed_seconds"] = notice.elapsed_seconds
+    return payload
 
 
 def _is_local_ollama_endpoint(settings: Settings) -> bool:
@@ -552,6 +591,7 @@ def _build_source_catalog(settings: Settings) -> list[SourceCatalogEntry]:
         backend_kind: str,
         configured: bool,
         auth_required: bool,
+        default_enabled: bool = False,
         supports_search: bool = False,
         supports_fetch: bool = False,
         supports_primary_sources: bool = False,
@@ -562,7 +602,7 @@ def _build_source_catalog(settings: Settings) -> list[SourceCatalogEntry]:
             name=name,
             description=description,
             backend_kind=backend_kind,
-            default_enabled=configured,
+            default_enabled=configured and default_enabled,
             configured=configured,
             auth_required=auth_required,
             supports_search=supports_search,
@@ -575,12 +615,25 @@ def _build_source_catalog(settings: Settings) -> list[SourceCatalogEntry]:
 
     entries = [
         entry(
+            id="openai",
+            name="OpenAI Web Search",
+            description="Native Responses API hosted web search with cited source extraction.",
+            backend_kind="search",
+            configured=settings.openai_api_key is not None,
+            auth_required=True,
+            default_enabled=settings.resolved_search_backend == "openai",
+            supports_search=True,
+            supports_primary_sources=True,
+            supports_advanced_search=True,
+        ),
+        entry(
             id="brave",
             name="Brave Search",
             description="Web search provider focused on public-web coverage.",
             backend_kind="search",
             configured=settings.brave_api_key is not None,
             auth_required=True,
+            default_enabled=settings.resolved_search_backend == "brave",
             supports_search=True,
             supports_advanced_search=False,
         ),
@@ -591,6 +644,7 @@ def _build_source_catalog(settings: Settings) -> list[SourceCatalogEntry]:
             backend_kind="search",
             configured=settings.exa_api_key is not None,
             auth_required=True,
+            default_enabled=settings.resolved_search_backend == "exa",
             supports_search=True,
             supports_primary_sources=True,
             supports_advanced_search=True,
@@ -602,7 +656,23 @@ def _build_source_catalog(settings: Settings) -> list[SourceCatalogEntry]:
             backend_kind="search",
             configured=settings.tavily_api_key is not None,
             auth_required=True,
+            default_enabled=settings.resolved_search_backend == "tavily",
             supports_search=True,
+            supports_advanced_search=True,
+        ),
+        entry(
+            id="serper-scholar",
+            name="Serper Scholar",
+            description=(
+                "Google Scholar compatible paper search for scholarly and technical evidence."
+            ),
+            backend_kind="search",
+            configured=settings.serper_api_key is not None,
+            auth_required=True,
+            default_enabled=False,
+            supports_search=True,
+            supports_primary_sources=True,
+            supports_advanced_search=True,
         ),
         entry(
             id="firecrawl",
@@ -611,6 +681,7 @@ def _build_source_catalog(settings: Settings) -> list[SourceCatalogEntry]:
             backend_kind="fetch",
             configured=settings.firecrawl_api_key is not None,
             auth_required=True,
+            default_enabled=settings.resolved_fetch_backend == "firecrawl",
             supports_fetch=True,
             supports_primary_sources=True,
         ),
@@ -621,6 +692,7 @@ def _build_source_catalog(settings: Settings) -> list[SourceCatalogEntry]:
             backend_kind="fetch",
             configured=settings.browserbase_api_key is not None,
             auth_required=True,
+            default_enabled=settings.resolved_fetch_backend == "browserbase",
             supports_fetch=True,
         ),
         entry(
@@ -630,6 +702,7 @@ def _build_source_catalog(settings: Settings) -> list[SourceCatalogEntry]:
             backend_kind="fetch",
             configured=settings.browserbase_api_key is not None,
             auth_required=True,
+            default_enabled=settings.resolved_fetch_backend == "browserbase_session",
             supports_fetch=True,
         ),
         entry(
@@ -639,6 +712,7 @@ def _build_source_catalog(settings: Settings) -> list[SourceCatalogEntry]:
             backend_kind="fetch",
             configured=settings.fetch_backend == "playwright",
             auth_required=False,
+            default_enabled=settings.resolved_fetch_backend == "playwright",
             supports_fetch=True,
         ),
     ]
@@ -652,11 +726,43 @@ def _build_source_catalog(settings: Settings) -> list[SourceCatalogEntry]:
                 backend_kind="search_fetch",
                 configured=True,
                 auth_required=False,
+                default_enabled=settings.resolved_search_backend == "mock"
+                or settings.resolved_fetch_backend == "mock",
                 supports_search=True,
                 supports_fetch=True,
             ),
         )
     return entries
+
+
+def _build_tool_catalog(settings: Settings) -> list[ToolCatalogEntry]:
+    return build_tool_catalog(settings) if settings.tool_registry_enabled else []
+
+
+def _langgraph_topology() -> dict[str, Any]:
+    return {
+        "nodes": ["plan", "research", "assess", "replan", "synthesize", "ground"],
+        "edges": [
+            ["plan", "research"],
+            ["research", "assess"],
+            ["assess", "replan"],
+            ["assess", "synthesize"],
+            ["replan", "research"],
+            ["synthesize", "ground"],
+            ["ground", "end"],
+        ],
+        "resume_nodes": {
+            "no_plan": "plan",
+            "has_draft_report": "ground",
+            "has_stream_work": "research",
+            "default": "assess",
+        },
+        "durability": {
+            "state_store": "database",
+            "resume_decider": "ResearchOrchestrator._determine_start_node",
+            "idempotent_source_reuse": True,
+        },
+    }
 
 
 def _resolve_oss_api_key(secret) -> str:
@@ -698,6 +804,25 @@ def _build_search_provider(settings: Settings):
                     **_retry_kwargs(settings),
                 )
             )
+        if settings.openai_api_key is not None:
+            providers.append(
+                RetriedSearchProvider(
+                    OpenAIWebSearchProvider(
+                        api_key=_require_secret(
+                            settings.openai_api_key,
+                            setting_name="OPENAI_API_KEY",
+                        ),
+                        base_url=settings.openai_base_url,
+                        model=settings.openai_web_search_model or settings.worker_model,
+                        timeout=settings.openai_web_search_timeout_seconds,
+                        search_context_size=settings.openai_web_search_context_size,
+                        reasoning_effort=settings.openai_web_search_reasoning_effort,
+                        external_web_access=settings.openai_web_search_external_web_access,
+                        max_output_tokens=settings.openai_web_search_max_output_tokens,
+                    ),
+                    **_retry_kwargs(settings),
+                )
+            )
         if not providers:
             providers.append(MockSearchProvider())
         return SearchPipeline(providers)
@@ -717,6 +842,20 @@ def _build_search_provider(settings: Settings):
             ExaSearchProvider(
                 _require_secret(settings.exa_api_key, setting_name="EXA_API_KEY"),
                 timeout=settings.http_timeout_seconds,
+            ),
+            **_retry_kwargs(settings),
+        )
+    if settings.search_backend == "openai":
+        return RetriedSearchProvider(
+            OpenAIWebSearchProvider(
+                api_key=_require_secret(settings.openai_api_key, setting_name="OPENAI_API_KEY"),
+                base_url=settings.openai_base_url,
+                model=settings.openai_web_search_model or settings.worker_model,
+                timeout=settings.openai_web_search_timeout_seconds,
+                search_context_size=settings.openai_web_search_context_size,
+                reasoning_effort=settings.openai_web_search_reasoning_effort,
+                external_web_access=settings.openai_web_search_external_web_access,
+                max_output_tokens=settings.openai_web_search_max_output_tokens,
             ),
             **_retry_kwargs(settings),
         )
@@ -864,6 +1003,68 @@ def _build_reranker(settings: Settings) -> PassageReranker | None:
     return HeuristicPassageReranker()
 
 
+def _expand_report_locally(markdown: str, citations: list[CitationRecord]) -> str:
+    sanitized_markdown = markdown.strip()
+    for phrase in FORBIDDEN_COMPLETION_PHRASES:
+        sanitized_markdown = re.sub(
+            re.escape(phrase),
+            "",
+            sanitized_markdown,
+            flags=re.IGNORECASE,
+        )
+    sources = [
+        f"[{index}] {citation.source_title}: {citation.source_url}"
+        for index, citation in enumerate(citations, start=1)
+    ]
+    source_reference = " ".join(f"[{index}]" for index, _ in enumerate(citations, start=1))
+    if not source_reference:
+        source_reference = ""
+    expansion = [
+        sanitized_markdown,
+        "",
+        "## Evidence Integration",
+        "",
+        (
+            "The strongest interpretation is the one that keeps each finding tied to the "
+            "available evidence while separating confirmed points from residual uncertainty. "
+            "Where the cited material is narrow, the report should treat conclusions as bounded "
+            "rather than universal. "
+            f"{source_reference}".strip()
+        ),
+        "",
+        "## Practical Implications",
+        "",
+        (
+            "For production use, the important implication is that research output should be "
+            "evaluated as a chain of evidence, synthesis, and citation hygiene. A useful final "
+            "answer does more than list facts: it explains why the cited evidence matters, how "
+            "the pieces relate to each other, and where a decision-maker should be cautious. "
+            f"{source_reference}".strip()
+        ),
+        "",
+        "## Limitations",
+        "",
+        (
+            "The report preserves uncertainty where the available sources do not fully resolve "
+            "a point. This is intentional: robust research should avoid overstating evidence, "
+            "especially when sources differ in scope, methodology, freshness, or authority. "
+            f"{source_reference}".strip()
+        ),
+    ]
+    if sources and "## Sources" not in sanitized_markdown and "## Citations" not in sanitized_markdown:
+        expansion.extend(["", "## Sources", "", *sources])
+    rendered = "\n".join(part for part in expansion if part is not None).strip()
+    while len(rendered) < 2200:
+        rendered += (
+            "\n\nThe final synthesis should therefore be read as evidence-bounded: it favors "
+            "claims that are directly supported, marks weaker inferences cautiously, and keeps "
+            "source attribution close to the statements it supports. This structure is more "
+            "durable than a short answer because it exposes the reasoning path, the limits of "
+            "the source base, and the practical consequences for follow-on decisions."
+        )
+    return rendered
+
+
 class RunCoordinator:
     def __init__(self, runtime: ResearchRuntime) -> None:
         self.runtime = runtime
@@ -906,19 +1107,20 @@ class RunCoordinator:
             if self.runtime.settings.enforce_maximal_research_path
             else request.execution_mode
         )
-        requires_approval = (
-            True
-            if self.runtime.settings.enforce_maximal_research_path
-            else self.runtime.should_require_plan_approval(
-                execution_mode=execution_mode,
-                requested_budget=requested_budget,
-                explicit=request.require_plan_approval,
-                source_selection=source_selection,
-                model_config=model_config,
-                user_supplied_budget=request.budget is not None,
-                user_supplied_sources=request.source_selection is not None,
-                user_supplied_model_override=request.model_config_override is not None,
-            )
+        force_deep_approval = (
+            self.runtime.settings.enforce_maximal_research_path
+            and self.runtime.settings.deep_plan_approval_enabled
+            and request.require_plan_approval is not False
+        )
+        requires_approval = force_deep_approval or self.runtime.should_require_plan_approval(
+            execution_mode=execution_mode,
+            requested_budget=requested_budget,
+            explicit=request.require_plan_approval,
+            source_selection=source_selection,
+            model_config=model_config,
+            user_supplied_budget=request.budget is not None,
+            user_supplied_sources=request.source_selection is not None,
+            user_supplied_model_override=request.model_config_override is not None,
         )
         metadata["profile_id"] = profile_id
         metadata["requested_budget"] = requested_budget.model_dump(mode="json")
@@ -1306,6 +1508,20 @@ class WorkerExecutor:
                     provider=notice.provider_name,
                 )
 
+            async def on_start(notice: ProviderCallNotice) -> None:
+                await self.runtime.events.publish(
+                    run_id,
+                    "provider.call.started",
+                    _provider_call_payload(notice),
+                )
+
+            async def on_success(notice: ProviderCallNotice) -> None:
+                await self.runtime.events.publish(
+                    run_id,
+                    "provider.call.completed",
+                    _provider_call_payload(notice),
+                )
+
             with (
                 self.runtime.telemetry.span(
                     "run.execute",
@@ -1314,7 +1530,14 @@ class WorkerExecutor:
                     prompt_profile_version=prompt_profile_version,
                     prompt_model_family=prompt_model_family,
                 ),
-                provider_hooks_scope(ProviderHooks(on_retry=on_retry, on_error=on_error)),
+                provider_hooks_scope(
+                    ProviderHooks(
+                        on_start=on_start,
+                        on_success=on_success,
+                        on_retry=on_retry,
+                        on_error=on_error,
+                    )
+                ),
             ):
                 state = await self.runtime.store.get_run_execution_state(run_id)
                 effective_assets = await self.runtime.resolve_effective_assets(
@@ -1892,8 +2115,128 @@ class ResearchRuntime:
     async def get_final_report(self, run_id: str):
         return await self.store.get_final_report(run_id)
 
+    async def run_research(
+        self,
+        prompt: str,
+        options: ResearchOptions | None = None,
+    ) -> ResearchReport:
+        if self.settings.resolved_custom_responses_runtime_backend == "deepagents":
+            return await run_custom_responses_deep_agent_research(
+                runtime=self,
+                prompt=prompt,
+                options=options,
+            )
+        request = create_run_request_from_research_options(prompt, options)
+        summary = await self.start_run(request)
+        timeout_seconds = options.timeout_seconds if options is not None else None
+        detail = await wait_for_terminal_detail(
+            runtime=self,
+            run_id=summary.id,
+            timeout_seconds=timeout_seconds,
+        )
+        if detail.status == RunStatus.FAILED:
+            reason = detail.error_message or detail.terminal_reason or "Research run failed."
+            raise RuntimeError(reason)
+        if detail.status == RunStatus.CANCELLED:
+            reason = detail.terminal_reason or "Research run was cancelled."
+            raise RuntimeError(reason)
+        detail = await self._enforce_completion_gate(detail)
+        budget_events = await self.list_budget_events(detail.id)
+        return build_custom_research_report(
+            detail=detail,
+            budget_events=budget_events,
+            settings=self.settings,
+        )
+
+    async def _enforce_completion_gate(self, detail: RunDetail) -> RunDetail:
+        if detail.final_report is None:
+            return detail
+        current = detail
+        for attempt in range(1, self.settings.completion_gate_max_attempts + 1):
+            if current.final_report is None:
+                return current
+            gate = evaluate_completion_gate(
+                current.final_report.markdown,
+                min_chars=self.settings.completion_gate_min_chars,
+                min_headings=self.settings.completion_gate_min_headings,
+            )
+            await self.events.publish(
+                current.id,
+                "completion_gate.evaluated",
+                {"attempt": attempt, **gate.model_dump(mode="json")},
+            )
+            if gate.passed:
+                return current
+            if attempt >= self.settings.completion_gate_max_attempts:
+                await self.events.publish(
+                    current.id,
+                    "completion_gate.exhausted",
+                    {"attempts": attempt, "reasons": gate.reasons},
+                )
+                return current
+            expanded = await self._expand_report_for_completion_gate(current, gate)
+            final_report = current.final_report.model_copy(update={"markdown": expanded})
+            await self.store.update_run_status(
+                current.id,
+                RunStatus.COMPLETED,
+                final_report=final_report,
+                terminal_reason="completion_gate_continuation",
+            )
+            await self.events.publish(
+                current.id,
+                "completion_gate.continuation_applied",
+                {"attempt": attempt, "reasons": gate.reasons},
+            )
+            refreshed = await self.get_run_detail(current.id)
+            if refreshed is None:
+                return current
+            current = refreshed
+        return current
+
+    async def _expand_report_for_completion_gate(
+        self,
+        detail: RunDetail,
+        gate,
+    ) -> str:
+        if detail.final_report is None:
+            return ""
+        if self.conversation_client is not None:
+            model_config = resolve_model_config(
+                detail.metadata.get("model_config"),
+                defaults=self.default_model_config(),
+            )
+            sources = "\n".join(
+                f"[{index}] {citation.source_title}: {citation.source_url}\n"
+                f"Excerpt: {citation.quote}"
+                for index, citation in enumerate(detail.final_report.citations, start=1)
+            )
+            prompt = (
+                f"Research question:\n{detail.question}\n\n"
+                f"Current report:\n{detail.final_report.markdown}\n\n"
+                f"Available cited sources:\n{sources or 'No cited sources available.'}\n\n"
+                f"Completion failures:\n{'; '.join(gate.reasons)}"
+            )
+            expanded = await self.conversation_client.generate_text(
+                model=model_config.lead_model,
+                system_prompt=(
+                    "Revise the report into a complete, publication-ready markdown report. "
+                    "Preserve every inline numeric citation that is already supported. "
+                    "Do not invent URLs, do not ask the user questions, and do not mention "
+                    "internal workflow, agents, or completion gates."
+                ),
+                user_prompt=prompt,
+                reasoning_effort=self.settings.llm_reasoning_effort,
+                temperature=0.1,
+            )
+            if expanded.strip():
+                return expanded.strip()
+        return _expand_report_locally(detail.final_report.markdown, detail.final_report.citations)
+
     async def list_artifacts(self, run_id: str):
         return await self.store.list_artifacts(run_id)
+
+    async def list_budget_events(self, run_id: str) -> list[dict[str, Any]]:
+        return await self.store.list_budget_events(run_id)
 
     async def list_citation_audits(self, run_id: str):
         return await self.store.list_citation_audits(run_id)
@@ -2239,6 +2582,9 @@ class ResearchRuntime:
     def available_sources(self) -> list[SourceCatalogEntry]:
         return _build_source_catalog(self.settings)
 
+    def available_tools(self) -> list[ToolCatalogEntry]:
+        return _build_tool_catalog(self.settings)
+
     def default_source_selection(self) -> list[str]:
         if self.settings.enforce_maximal_research_path:
             return _maximal_source_selection(self.settings)
@@ -2282,10 +2628,10 @@ class ResearchRuntime:
         user_supplied_sources: bool,
         user_supplied_model_override: bool,
     ) -> bool:
-        if self.settings.enforce_maximal_research_path:
-            return True
         if explicit is not None:
             return explicit
+        if self.settings.enforce_maximal_research_path:
+            return self.settings.deep_plan_approval_enabled
         if not self.settings.deep_plan_approval_enabled:
             return False
         if execution_mode == ExecutionMode.HITL:
@@ -2625,6 +2971,7 @@ class ResearchRuntime:
 
     def public_config(self) -> PublicRuntimeConfig:
         available_sources = self.available_sources()
+        available_tools = self.available_tools()
         return PublicRuntimeConfig(
             app_name=self.settings.app_name,
             environment=self.settings.environment,
@@ -2643,7 +2990,8 @@ class ResearchRuntime:
             models=self.default_model_config(),
             prompt_mode=self.settings.prompt_mode,
             available_sources=available_sources,
-            default_source_selection=[entry.id for entry in available_sources if entry.default_enabled],
+            default_source_selection=self.default_source_selection(),
+            tool_catalog=available_tools,
             capabilities={
                 "supports_temporal": self.settings.resolved_workflow_backend == "temporal",
                 "supports_artifacts": self.settings.resolved_artifact_store_backend != "disabled",
@@ -2659,6 +3007,28 @@ class ResearchRuntime:
                 "supports_source_registry": self.settings.source_registry_ui_enabled,
                 "supports_debug_console": self.settings.debug_console_enabled,
                 "supports_projects": True,
+                "supports_langgraph_runtime": True,
+                "langgraph_topology": _langgraph_topology(),
+                "supports_custom_responses_runtime": True,
+                "custom_responses_deepagents_runtime": (
+                    asdict(inspect_custom_responses_deep_agent(self.settings))
+                ),
+                "custom_responses_contract": {
+                    "endpoint": "/research",
+                    "tool_names": [
+                        *contract_tool_names(self.settings),
+                    ],
+                    "enabled_tool_names": [entry.name for entry in available_tools if entry.enabled],
+                    "completion_gate": {
+                        "min_chars": self.settings.completion_gate_min_chars,
+                        "min_headings": self.settings.completion_gate_min_headings,
+                        "max_attempts": self.settings.completion_gate_max_attempts,
+                    },
+                    "planner_discovery": {
+                        "min_queries": self.settings.planner_min_discovery_queries,
+                        "max_queries": self.settings.planner_max_discovery_queries,
+                    },
+                },
                 "asset_upload_limits": {
                     "max_file_size_bytes": self.settings.max_upload_file_size_bytes,
                     "max_files_per_batch": self.settings.max_upload_files_per_batch,

@@ -8,10 +8,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 
 from .config import Settings, get_settings
+from .custom_responses import build_custom_research_report
 from .domain import (
     ApprovalDecisionKind,
-    AsyncJob,
     ArtifactRecord,
+    AsyncJob,
     BehaviorAssessment,
     CitationAuditRecord,
     ClarificationResponseRequest,
@@ -23,16 +24,18 @@ from .domain import (
     PassageInspectionRecord,
     PlanApprovalRequest,
     PlanPreview,
-    PromoteAssetRequest,
     ProfileFeedback,
     ProfilePreferences,
     ProfileRecord,
     ProjectDetail,
     ProjectSummary,
+    PromoteAssetRequest,
     PublicRuntimeConfig,
     ResearchAssetBatchRequest,
     ResearchAssetRecord,
     ResearchAssetUsage,
+    ResearchReport,
+    ResearchRequest,
     RunConversationMessage,
     RunConversationReply,
     RunConversationRequest,
@@ -117,6 +120,18 @@ def create_app(
             return await runtime.submit_job(request)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/research", response_model=ResearchReport)
+    async def run_research(payload: ResearchRequest, http_request: Request) -> ResearchReport:
+        runtime = _get_runtime(http_request)
+        try:
+            return await runtime.run_research(payload.prompt, payload.options)
+        except TimeoutError as exc:
+            raise HTTPException(status_code=504, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.get("/projects", response_model=list[ProjectSummary])
     async def list_projects(http_request: Request) -> list[ProjectSummary]:
@@ -470,6 +485,22 @@ def create_app(
         if report is None:
             raise HTTPException(status_code=409, detail="Run does not have a final report yet")
         return report
+
+    @app.get("/research/{run_id}/report", response_model=ResearchReport)
+    async def get_custom_research_report(run_id: str, http_request: Request) -> ResearchReport:
+        runtime = _get_runtime(http_request)
+        detail = await runtime.get_run_detail(run_id)
+        if detail is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+        if detail.final_report is None:
+            raise HTTPException(status_code=409, detail="Run does not have a final report yet")
+        budget_events = await runtime.list_budget_events(run_id)
+
+        return build_custom_research_report(
+            detail=detail,
+            budget_events=budget_events,
+            settings=runtime.settings,
+        )
 
     @app.get("/runs/{run_id}/artifacts", response_model=list[ArtifactRecord])
     async def get_artifacts(run_id: str, http_request: Request) -> list[ArtifactRecord]:
