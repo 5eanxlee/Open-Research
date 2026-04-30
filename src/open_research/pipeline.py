@@ -5328,6 +5328,20 @@ class ResearchOrchestrator:
                 markdown_lines.append(f"- {claim}")
             markdown_lines.append("")
 
+        open_questions = [
+            question.strip()
+            for question in dedupe_preserve_order(draft.open_questions)
+            if question and question.strip()
+        ][:8]
+        if open_questions:
+            markdown_lines.extend(["## Open Questions", ""])
+            for question in open_questions:
+                question_text = question.rstrip(".")
+                if not question_text.endswith("?"):
+                    question_text = f"{question_text}."
+                markdown_lines.append(f"- {question_text}")
+            markdown_lines.append("")
+
         if citations:
             markdown_lines.extend(["## Citations", ""])
             seen_numbers: set[int] = set()
@@ -5440,6 +5454,10 @@ def _render_output_contract(output_contract: Mapping[str, Any] | None) -> str:
             "- To meet the length target, expand the executive summary and section "
             "overviews with supported analysis, caveats, comparison logic, and evidence "
             "gaps; do not add unsupported claims or filler."
+        )
+        lines.append(
+            "- Put unresolved verification gaps in open_questions so the final report can "
+            "surface them without presenting them as supported claims."
         )
         lines.append(
             "- Preserve citation support and uncertainty handling over hitting the "
