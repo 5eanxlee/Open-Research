@@ -502,7 +502,12 @@ class TavilySearchProvider(SearchProvider):
         return results
 
 
-_OPENAI_WEB_URL_RE = re.compile(r"https?://[^\s<>()\\[\\]{}\"']+")
+_OPENAI_WEB_URL_RE = re.compile(r"https?://[^\s<>()\[\]{}\"'`*]+")
+_OPENAI_SUMMARY_SOURCE_MARKER_RE = re.compile(
+    r"(^|\s)[-*]\s+(?:(?:\*\*)?(?:source\s+url|url):(?:\*\*)?\s*)?(?:`|\*\*)?https?://",
+    re.IGNORECASE,
+)
+_OPENAI_SUMMARY_BULLET_MARKER_RE = re.compile(r"(^|\s)[-*]\s+")
 
 
 class OpenAIWebSearchProvider(SearchProvider):
@@ -1451,6 +1456,7 @@ def _extract_openai_web_search_results(
         *,
         title: Any = None,
         snippet: Any = None,
+        prefer_snippet: bool = False,
     ) -> None:
         normalized = _clean_http_source_url(raw_url)
         if normalized is None:
@@ -1458,8 +1464,13 @@ def _extract_openai_web_search_results(
         record = sources.setdefault(normalized, {"url": normalized})
         if isinstance(title, str) and title.strip() and not record.get("title"):
             record["title"] = clean_text(title)[:200]
-        if isinstance(snippet, str) and snippet.strip() and not record.get("snippet"):
+        if isinstance(snippet, str) and snippet.strip() and (
+            prefer_snippet or not record.get("snippet")
+        ):
             record["snippet"] = clean_text(snippet)[:500]
+
+    for url, snippet in _extract_summary_url_contexts(summary):
+        add_source(url, snippet=snippet, prefer_snippet=True)
 
     for item in _walk_values(payload):
         if not isinstance(item, Mapping):
@@ -1469,7 +1480,7 @@ def _extract_openai_web_search_results(
             add_source(item.get("url"), title=item.get("title"), snippet=summary)
             continue
         if item_type == "url":
-            add_source(item.get("url"), title=item.get("title"), snippet=summary)
+            add_source(item.get("url"), title=item.get("title"))
             continue
         if "url" in item and item_type in {
             "search",
@@ -1479,10 +1490,7 @@ def _extract_openai_web_search_results(
             "webpage",
             None,
         }:
-            add_source(item.get("url"), title=item.get("title"), snippet=summary)
-
-    for match in _OPENAI_WEB_URL_RE.finditer(summary):
-        add_source(match.group(0), snippet=summary)
+            add_source(item.get("url"), title=item.get("title"))
 
     results: list[SearchResult] = []
     for index, record in enumerate(sources.values()):
@@ -1504,6 +1512,41 @@ def _extract_openai_web_search_results(
     return results
 
 
+def _extract_summary_url_contexts(summary: str) -> list[tuple[str, str]]:
+    contexts: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for match in _OPENAI_WEB_URL_RE.finditer(summary):
+        normalized = _clean_http_source_url(match.group(0))
+        if normalized is None or normalized in seen:
+            continue
+        seen.add(normalized)
+        contexts.append((normalized, _summary_context_for_match(summary, match.start(), match.end())))
+    return contexts
+
+
+def _summary_context_for_match(summary: str, start: int, end: int) -> str:
+    marker_positions = _summary_source_marker_positions(summary)
+    context_start = max((position for position in marker_positions if position <= start), default=0)
+    context_end = min(
+        (position for position in marker_positions if position > start),
+        default=min(len(summary), end + 700),
+    )
+    return clean_text(summary[context_start:context_end])[:500]
+
+
+def _summary_source_marker_positions(summary: str) -> list[int]:
+    positions = {0}
+    for marker in _OPENAI_SUMMARY_SOURCE_MARKER_RE.finditer(summary):
+        prefix = marker.group(1) or ""
+        positions.add(marker.start() + len(prefix))
+    for marker in _OPENAI_SUMMARY_BULLET_MARKER_RE.finditer(summary):
+        prefix = marker.group(1) or ""
+        position = marker.start() + len(prefix)
+        if _OPENAI_WEB_URL_RE.search(summary[position : position + 500]):
+            positions.add(position)
+    return sorted(positions)
+
+
 def _walk_values(value: Any):
     if isinstance(value, Mapping):
         yield value
@@ -1517,7 +1560,7 @@ def _walk_values(value: Any):
 def _clean_http_source_url(raw_url: Any) -> str | None:
     if not isinstance(raw_url, str):
         return None
-    candidate = raw_url.strip().rstrip(".,;:!?)\\]}\"'")
+    candidate = raw_url.strip().rstrip(".,;:!?)\\]}\"'`*")
     if not candidate.startswith(("http://", "https://")):
         return None
     parsed = urlparse(candidate)

@@ -700,6 +700,61 @@ def _claim_repair_should_skip_search(claim: str) -> bool:
     return any(marker in lowered for marker in uncertainty_markers)
 
 
+def _absence_claim_contradicted_by_passage(claim: str, passage: str) -> bool:
+    lowered_claim = clean_text(claim).lower()
+    if not any(
+        marker in lowered_claim
+        for marker in (
+            "no benchmark",
+            "no quantitative",
+            "no ablation",
+            "no evaluation",
+            "no metric",
+            "no retrieved fragment provides",
+            "does not include",
+            "does not provide",
+            "do not include",
+            "do not provide",
+            "not include",
+            "not provide",
+        )
+    ):
+        return False
+    if not any(
+        subject in lowered_claim
+        for subject in (
+            "benchmark",
+            "quantitative",
+            "ablation",
+            "metric",
+            "evaluation",
+            "result",
+            "score",
+        )
+    ):
+        return False
+    lowered_passage = clean_text(passage).lower()
+    counterevidence_terms = (
+        "benchmark",
+        "ablation",
+        "baseline",
+        "dataset",
+        "accuracy",
+        "score",
+        "improvement",
+        "latency",
+        "token-cost",
+        "cost savings",
+        "locomo",
+        "hotpotqa",
+        "wikimultihop",
+        "longmemevals",
+    )
+    if not any(term in lowered_passage for term in counterevidence_terms):
+        return False
+    return bool(re.search(r"\d+(?:\.\d+)?\s*%|\b\d+\.\d+\b|\b\d+\s*x\b", lowered_passage))
+
+
 def _derive_recommended_budget(
     *,
     question: str,
@@ -5028,7 +5083,41 @@ class ResearchOrchestrator:
                     ),
                     candidates[0] if candidates else None,
                 )
-                if verification.support_label == CitationSupportLabel.UNSUPPORTED or chosen is None:
+                if (
+                    chosen is not None
+                    and verification.support_label != CitationSupportLabel.UNSUPPORTED
+                    and _absence_claim_contradicted_by_passage(claim, chosen.text)
+                ):
+                    verification = ClaimVerification(
+                        support_label=CitationSupportLabel.CONTRADICTED,
+                        reason=(
+                            "The selected passage contains concrete benchmark, metric, or "
+                            "ablation evidence that contradicts the claim's absence-of-evidence "
+                            "wording."
+                        ),
+                        selected_source_id=chosen.source_id,
+                        selected_passage_index=chosen.passage_index,
+                        quote=(verification.quote or chosen.text[:240]),
+                        confidence=max(verification.confidence, 0.85),
+                    )
+                    claim_rows_by_key[claim_key]["support_label"] = verification.support_label.value
+                    claim_rows_by_key[claim_key]["confidence"] = verification.confidence
+                    await self.events.publish(
+                        run_id,
+                        "citation.contradicted",
+                        {
+                            "section_title": section.title,
+                            "claim": claim,
+                            "source_id": chosen.source_id,
+                            "passage_index": chosen.passage_index,
+                            "reason": "absence_claim_counterevidence",
+                        },
+                    )
+                if (
+                    verification.support_label
+                    in {CitationSupportLabel.UNSUPPORTED, CitationSupportLabel.CONTRADICTED}
+                    or chosen is None
+                ):
                     citation_candidates.append(
                         CitationCandidate(
                             section_title=section.title,
