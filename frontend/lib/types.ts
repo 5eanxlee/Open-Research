@@ -63,6 +63,11 @@ export interface BudgetPolicy {
   per_domain_limit: number;
 }
 
+export interface ReportOutputConfig {
+  min_words: number;
+  max_words: number;
+}
+
 export interface RecommendedBudget extends BudgetPolicy {
   rationale_summary: string | null;
 }

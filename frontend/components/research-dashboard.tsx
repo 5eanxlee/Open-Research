@@ -67,9 +67,9 @@ const DRAWER_META: Record<
     description: "Search, fetch, and tools.",
   },
   budget: {
-    eyebrow: "Budget",
-    title: "Budget controls",
-    description: "Caps and run limits.",
+    eyebrow: "Configuration",
+    title: "Run configuration",
+    description: "Depth, query, source, and report targets.",
   },
   models: {
     eyebrow: "Models",
@@ -154,6 +154,7 @@ export function ResearchDashboard() {
   const questionDraft = useResearchStore((state) => state.questionDraft);
   const setQuestionDraft = useResearchStore((state) => state.setQuestionDraft);
   const budget = useResearchStore((state) => state.budget);
+  const reportOutputConfig = useResearchStore((state) => state.reportOutputConfig);
   const agentConfig = useResearchStore((state) => state.agentConfig);
   const modelConfigOverride = useResearchStore((state) => state.modelConfigOverride);
   const hydrateFromServerConfig = useResearchStore((state) => state.hydrateFromServerConfig);
@@ -283,6 +284,10 @@ export function ResearchDashboard() {
             surface: "nextjs-dashboard",
             build: "2026-04-12.2",
           },
+          output_contract: {
+            report_min_words: reportOutputConfig.min_words,
+            report_max_words: reportOutputConfig.max_words,
+          },
         },
       };
       if (asyncSubmit) {
@@ -389,7 +394,14 @@ export function ResearchDashboard() {
   const chatMutation = useMutation({
     mutationFn: ({ runId, message }: { runId: string; message: string }) =>
       sendRunMessage(apiBaseUrl, runId, message),
+    onMutate: async ({ message }) => {
+      pendingQuestionRef.current = message;
+      setSubmitError(null);
+      setQuestionDraft("");
+      if (textareaRef.current) textareaRef.current.style.height = "";
+    },
     onSuccess: async (reply) => {
+      pendingQuestionRef.current = "";
       queryClient.setQueryData<RunConversationMessage[]>(
         ["run-messages", apiBaseUrl, reply.user_message.run_id],
         (current) => [
@@ -401,6 +413,12 @@ export function ResearchDashboard() {
       await queryClient.invalidateQueries({
         queryKey: ["run-detail", apiBaseUrl, reply.user_message.run_id],
       });
+    },
+    onError: (error) => {
+      setSubmitError(error instanceof Error ? error.message : "Failed to send message.");
+      setQuestionDraft(pendingQuestionRef.current);
+      pendingQuestionRef.current = "";
+      requestAnimationFrame(() => autoResizeTextarea());
     },
   });
 
@@ -418,6 +436,14 @@ export function ResearchDashboard() {
     [activeDetail?.events, streamState?.events],
   );
   const conversationMessages = messagesQuery.data ?? activeDetail?.conversation_messages ?? [];
+  const activeRunStatus = activeWorkspace?.status ?? activeDetail?.status;
+  const hasCompletedReport = Boolean(
+    activeWorkspace?.final_report_markdown ?? activeDetail?.final_report,
+  );
+  const composerMode =
+    selectedRunId && activeRunStatus === "completed" && hasCompletedReport
+      ? "message"
+      : "research";
   const displayConnectionState =
     activeWorkspace &&
     (activeWorkspace.status === "completed" ||
@@ -427,9 +453,15 @@ export function ResearchDashboard() {
       ? "terminal"
       : streamState?.connectionState ?? "idle";
   const handleSubmit = () => {
-    const trimmedQuestion = questionDraft.trim();
-    if (trimmedQuestion.length >= 12 && !createRunMutation.isPending) {
-      createRunMutation.mutate(trimmedQuestion);
+    const trimmedInput = questionDraft.trim();
+    if (composerMode === "message") {
+      if (trimmedInput && selectedRunId && !chatMutation.isPending) {
+        chatMutation.mutate({ runId: selectedRunId, message: trimmedInput });
+      }
+      return;
+    }
+    if (trimmedInput.length >= 12 && !createRunMutation.isPending) {
+      createRunMutation.mutate(trimmedInput);
     }
   };
 
@@ -451,6 +483,19 @@ export function ResearchDashboard() {
   const projects = projectsQuery.data ?? [];
   const activeProject = projects.find((project) => project.id === selectedProjectId) ?? null;
   const isLanding = !selectedRunId;
+  const composerDisabled =
+    composerMode === "message"
+      ? !questionDraft.trim() || chatMutation.isPending
+      : questionDraft.trim().length < 12 || createRunMutation.isPending;
+  const composerPlaceholder = composerMode === "message" ? "Message" : "Research topic";
+  const composerButtonLabel =
+    composerMode === "message"
+      ? chatMutation.isPending
+        ? "..."
+        : "Send"
+      : createRunMutation.isPending
+        ? "..."
+        : "Run";
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -497,6 +542,15 @@ export function ResearchDashboard() {
             type="button"
           >
             Sources
+          </button>
+          <button
+            className={`config-action ${activeDrawer === "budget" ? "active" : ""}`}
+            onClick={() =>
+              setActiveDrawer((prev) => (prev === "budget" ? null : "budget"))
+            }
+            type="button"
+          >
+            Config
           </button>
           <button
             className={`config-action ${activeDrawer === "models" ? "active" : ""}`}
@@ -604,7 +658,6 @@ export function ResearchDashboard() {
                 onRequestChanges={(runId, note) =>
                   requestChangesMutation.mutate({ runId, note })
                 }
-                onSendMessage={(runId, message) => chatMutation.mutate({ runId, message })}
                 pending={{
                   cancel: cancelMutation.isPending,
                   resume: resumeMutation.isPending,
@@ -613,7 +666,6 @@ export function ResearchDashboard() {
                   approve: approveMutation.isPending,
                   reject: rejectMutation.isPending,
                   requestChanges: requestChangesMutation.isPending,
-                  chat: chatMutation.isPending,
                 }}
               />
             </div>
@@ -639,18 +691,16 @@ export function ResearchDashboard() {
                     autoResizeTextarea();
                   }}
                   onKeyDown={handleKeyDown}
-                  placeholder="Research topic"
+                  placeholder={composerPlaceholder}
                   rows={1}
                 />
                 <button
                   className="primary-button"
-                  disabled={
-                    questionDraft.trim().length < 12 || createRunMutation.isPending
-                  }
+                  disabled={composerDisabled}
                   onClick={handleSubmit}
                   type="button"
                 >
-                  {createRunMutation.isPending ? "..." : "Run"}
+                  {composerButtonLabel}
                 </button>
               </div>
             </div>

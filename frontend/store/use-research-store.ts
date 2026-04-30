@@ -9,6 +9,7 @@ import {
   DEFAULT_BUDGET,
   DEFAULT_MEMORY_POLICY,
   DEFAULT_PROFILE_PREFERENCES,
+  DEFAULT_REPORT_OUTPUT_CONFIG,
 } from "@/lib/defaults";
 import type {
   AgentConfig,
@@ -19,6 +20,7 @@ import type {
   ModelConfigOverride,
   ProfilePreferences,
   PublicRuntimeConfig,
+  ReportOutputConfig,
   ResearchInputAsset,
   RunEvent,
   RunWorkspaceSnapshot,
@@ -49,6 +51,7 @@ interface ResearchStoreState {
   asyncSubmit: boolean;
   questionDraft: string;
   budget: BudgetPolicy;
+  reportOutputConfig: ReportOutputConfig;
   agentConfig: AgentConfig;
   modelConfigOverride: ModelConfigOverride;
   serverDefaultsApplied: boolean;
@@ -75,6 +78,7 @@ interface ResearchStoreState {
   setAsyncSubmit: (value: boolean) => void;
   setQuestionDraft: (value: string) => void;
   updateBudget: (patch: Partial<BudgetPolicy>) => void;
+  updateReportOutputConfig: (patch: Partial<ReportOutputConfig>) => void;
   updateAgentConfig: (patch: Partial<AgentConfig>) => void;
   updateModelConfigOverride: (patch: Partial<ModelConfigOverride>) => void;
   resetModelConfigOverride: () => void;
@@ -125,6 +129,7 @@ export const useResearchStore = create<ResearchStoreState>()(
       asyncSubmit: false,
       questionDraft: "",
       budget: DEFAULT_BUDGET,
+      reportOutputConfig: DEFAULT_REPORT_OUTPUT_CONFIG,
       agentConfig: DEFAULT_AGENT_CONFIG,
       modelConfigOverride: {},
       serverDefaultsApplied: false,
@@ -192,6 +197,21 @@ export const useResearchStore = create<ResearchStoreState>()(
             ...patch,
           },
         })),
+      updateReportOutputConfig: (patch) =>
+        set((state) => {
+          const next = {
+            ...state.reportOutputConfig,
+            ...patch,
+          };
+          const minWords = Math.max(100, Math.round(next.min_words));
+          const maxWords = Math.max(minWords, Math.round(next.max_words));
+          return {
+            reportOutputConfig: {
+              min_words: minWords,
+              max_words: maxWords,
+            },
+          };
+        }),
       updateAgentConfig: (patch) =>
         set((state) => ({
           agentConfig: {
@@ -242,6 +262,7 @@ export const useResearchStore = create<ResearchStoreState>()(
           asyncSubmit: false,
           questionDraft: "",
           budget: DEFAULT_BUDGET,
+          reportOutputConfig: DEFAULT_REPORT_OUTPUT_CONFIG,
           agentConfig: DEFAULT_AGENT_CONFIG,
           modelConfigOverride: {},
         }),
@@ -352,6 +373,7 @@ export const useResearchStore = create<ResearchStoreState>()(
           stagedRunAssets: state.stagedRunAssets ?? [],
           asyncSubmit: state.asyncSubmit ?? false,
           budget: state.budget ?? DEFAULT_BUDGET,
+          reportOutputConfig: state.reportOutputConfig ?? DEFAULT_REPORT_OUTPUT_CONFIG,
           agentConfig: state.agentConfig ?? DEFAULT_AGENT_CONFIG,
           modelConfigOverride: state.modelConfigOverride ?? {},
           serverDefaultsApplied: state.serverDefaultsApplied ?? false,
@@ -364,14 +386,15 @@ export const useResearchStore = create<ResearchStoreState>()(
         profileId: state.profileId,
         profilePreferences: state.profilePreferences,
         memoryPolicyOverride: state.memoryPolicyOverride,
-          executionMode: "deep",
-          requirePlanApproval: state.requirePlanApproval,
+        executionMode: "deep",
+        requirePlanApproval: state.requirePlanApproval,
         clarifierConfig: state.clarifierConfig,
         sourceSelection: state.sourceSelection,
         runInputAssets: state.runInputAssets,
         stagedRunAssets: state.stagedRunAssets,
         asyncSubmit: state.asyncSubmit,
         budget: state.budget,
+        reportOutputConfig: state.reportOutputConfig,
         agentConfig: state.agentConfig,
         modelConfigOverride: state.modelConfigOverride,
         serverDefaultsApplied: state.serverDefaultsApplied,

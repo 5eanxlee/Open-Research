@@ -170,6 +170,7 @@ class ReportWriter(ABC):
         agent_config: AgentConfig | None = None,
         model_config: ModelConfig | None = None,
         context_pack: ContextPack | None = None,
+        output_contract: dict[str, Any] | None = None,
     ) -> GenerationResult[DraftReport]:
         raise NotImplementedError
 
@@ -2346,6 +2347,7 @@ class HeuristicReportWriter(ReportWriter):
         agent_config: AgentConfig | None = None,
         model_config: ModelConfig | None = None,
         context_pack: ContextPack | None = None,
+        output_contract: dict[str, Any] | None = None,
     ) -> GenerationResult[DraftReport]:
         notes_by_stream: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for note in notes:
@@ -2445,6 +2447,7 @@ class OpenAIReportWriter(ReportWriter):
         agent_config: AgentConfig | None = None,
         model_config: ModelConfig | None = None,
         context_pack: ContextPack | None = None,
+        output_contract: dict[str, Any] | None = None,
     ) -> GenerationResult[DraftReport]:
         effective_lead_model = (
             model_config.lead_model if model_config is not None else self.lead_model
@@ -2457,6 +2460,7 @@ class OpenAIReportWriter(ReportWriter):
             f"Question:\n{question}\n\n"
             f"Plan:\n{plan.model_dump_json(indent=2)}\n\n"
             f"Retrieved memory:\n{render_context_pack(context_pack)}\n\n"
+            f"Output contract:\n{_render_output_contract(output_contract)}\n\n"
             f"Notes:\n{_render_notes(notes)}"
         )
         report_result = await self.client.generate_json(
@@ -4875,6 +4879,7 @@ class ResearchOrchestrator:
 
     async def _synthesize_node(self, state: ResearchGraphState) -> dict[str, Any]:
         run_id = state["run_id"]
+        run_state = await self.store.get_run_execution_state(run_id)
         agent_config = await self._get_agent_config(run_id)
         model_config = await self._get_model_config(run_id)
         profile_id, memory_policy = await self._get_run_profile(run_id)
@@ -4901,6 +4906,9 @@ class ResearchOrchestrator:
             agent_config=agent_config,
             model_config=model_config,
             context_pack=context_pack,
+            output_contract=_output_contract_from_metadata(
+                run_state.metadata if run_state is not None else {}
+            ),
         )
         draft_report = report_result.value
         await self.store.save_draft_report(run_id, draft_report.model_dump(mode="json"))
@@ -5382,3 +5390,54 @@ def _render_notes(notes: Sequence[dict[str, Any]]) -> str:
             }
         )
     return str(rendered)
+
+
+def _output_contract_from_metadata(metadata: Mapping[str, Any]) -> dict[str, Any] | None:
+    raw = metadata.get("output_contract")
+    if not isinstance(raw, Mapping):
+        return None
+    contract: dict[str, Any] = {}
+    min_words = _coerce_positive_int(raw.get("report_min_words"))
+    max_words = _coerce_positive_int(raw.get("report_max_words"))
+    if min_words is not None:
+        contract["report_min_words"] = min_words
+    if max_words is not None:
+        contract["report_max_words"] = max(max_words, min_words or 0)
+    return contract or None
+
+
+def _coerce_positive_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def _render_output_contract(output_contract: Mapping[str, Any] | None) -> str:
+    if not output_contract:
+        return "- Use the default report length and sectioning contract."
+    lines = []
+    min_words = output_contract.get("report_min_words")
+    max_words = output_contract.get("report_max_words")
+    if min_words or max_words:
+        if min_words and max_words:
+            lines.append(
+                "- Target final report length: "
+                f"{min_words}-{max_words} words before source excerpts."
+            )
+        elif min_words:
+            lines.append(f"- Target final report length: at least {min_words} words.")
+        elif max_words:
+            lines.append(f"- Target final report length: no more than {max_words} words.")
+        lines.append(
+            "- Preserve citation support and uncertainty handling over hitting the "
+            "length target exactly."
+        )
+    return (
+        "\n".join(lines)
+        if lines
+        else "- Use the default report length and sectioning contract."
+    )

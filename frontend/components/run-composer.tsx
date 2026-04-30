@@ -40,43 +40,43 @@ interface RunComposerProps {
 const budgetFields = [
   {
     key: "max_streams",
-    label: "Max streams",
-    description: "Named parallel investigations in the run.",
+    label: "Research streams",
+    description: "Planner lanes.",
     min: 1,
     max: 30,
   },
   {
     key: "max_replans",
-    label: "Max replans",
-    description: "How many gap-closure loops the orchestrator can trigger.",
+    label: "Replans",
+    description: "Gap-closure loops.",
     min: 0,
     max: 5,
   },
   {
     key: "max_queries_per_stream",
     label: "Queries per stream",
-    description: "Upper bound for search passes inside each stream.",
+    description: "Researcher queries.",
     min: 1,
     max: 25,
   },
   {
     key: "max_results_per_query",
     label: "Results per query",
-    description: "Candidates retained from each search call before filtering.",
+    description: "Results retained.",
     min: 1,
     max: 20,
   },
   {
     key: "max_sources_per_stream",
     label: "Sources per stream",
-    description: "Fetched sources allowed to survive domain de-duplication.",
+    description: "Fetched sources kept.",
     min: 1,
     max: 20,
   },
   {
     key: "per_domain_limit",
     label: "Per-domain cap",
-    description: "How aggressively to avoid monoculture sourcing.",
+    description: "Per-domain source limit.",
     min: 1,
     max: 10,
   },
@@ -992,6 +992,7 @@ function CommonSettingsFields({ publicConfig, onOpenPanel }: RunComposerProps) {
   const profileId = useResearchStore((state) => state.profileId);
   const setProfileId = useResearchStore((state) => state.setProfileId);
   const budget = useResearchStore((state) => state.budget);
+  const reportOutputConfig = useResearchStore((state) => state.reportOutputConfig);
   const sourceSelection = useResearchStore((state) => state.sourceSelection);
   const requirePlanApproval = useResearchStore((state) => state.requirePlanApproval);
   const selectedProjectId = useResearchStore((state) => state.selectedProjectId);
@@ -1028,6 +1029,12 @@ function CommonSettingsFields({ publicConfig, onOpenPanel }: RunComposerProps) {
             <dt>Budget</dt>
             <dd>
               {budget.max_streams} streams / {budget.max_queries_per_stream} queries
+            </dd>
+          </div>
+          <div className="settings-summary-row">
+            <dt>Report</dt>
+            <dd>
+              {reportOutputConfig.min_words}-{reportOutputConfig.max_words} words
             </dd>
           </div>
           <div className="settings-summary-row">
@@ -1393,6 +1400,7 @@ function ModelSelectionFields({ publicConfig }: RunComposerProps) {
             onChange={handleModelChange("embedding_model")}
             placeholder={publicConfig?.models.embedding_model ?? "text-embedding-3-large"}
           />
+          <span className="field-hint">Vectors for semantic retrieval.</span>
         </label>
 
         <label className="field">
@@ -1403,6 +1411,7 @@ function ModelSelectionFields({ publicConfig }: RunComposerProps) {
             onChange={handleModelChange("reranker_model")}
             placeholder={publicConfig?.models.reranker_model ?? "BAAI/bge-reranker-v2-m3"}
           />
+          <span className="field-hint">Reorders passages before grounding.</span>
         </label>
       </div>
 
@@ -1713,12 +1722,65 @@ function BudgetFields({ publicConfig }: RunComposerProps) {
             onChange={handleBudgetChange(field.key)}
           />
           <span className="field-hint">
-            {budgetLimits?.[field.key]?.min ?? field.min}-
-            {budgetLimits?.[field.key]?.max ?? field.max}
+            {field.description} {budgetLimits?.[field.key]?.min ?? field.min}-
+            {budgetLimits?.[field.key]?.max ?? field.max}.
           </span>
         </label>
       ))}
     </div>
+  );
+}
+
+function ReportOutputFields({ publicConfig }: RunComposerProps) {
+  const reportOutputConfig = useResearchStore((state) => state.reportOutputConfig);
+  const updateReportOutputConfig = useResearchStore(
+    (state) => state.updateReportOutputConfig,
+  );
+  const completionGate =
+    publicConfig?.capabilities.custom_responses_contract?.completion_gate;
+
+  return (
+    <>
+      <div className="settings-grid">
+        <label className="field">
+          <span className="field-label">Minimum words</span>
+          <input
+            className="text-input"
+            type="number"
+            min={100}
+            max={8000}
+            step={100}
+            value={reportOutputConfig.min_words}
+            onChange={(event) =>
+              updateReportOutputConfig({ min_words: Number(event.target.value) })
+            }
+          />
+          <span className="field-hint">Target floor for the final report draft.</span>
+        </label>
+
+        <label className="field">
+          <span className="field-label">Maximum words</span>
+          <input
+            className="text-input"
+            type="number"
+            min={reportOutputConfig.min_words}
+            max={12000}
+            step={100}
+            value={reportOutputConfig.max_words}
+            onChange={(event) =>
+              updateReportOutputConfig({ max_words: Number(event.target.value) })
+            }
+          />
+          <span className="field-hint">Target ceiling before citations and source notes.</span>
+        </label>
+      </div>
+      {completionGate ? (
+        <p className="muted-text">
+          Completion gate: {completionGate.min_chars} chars, {completionGate.min_headings} headings,
+          {` ${completionGate.max_attempts}`} attempts.
+        </p>
+      ) : null}
+    </>
   );
 }
 
@@ -1747,7 +1809,11 @@ export function SourcesDrawerPanel({ publicConfig }: RunComposerProps) {
 export function BudgetDrawerPanel({ publicConfig }: RunComposerProps) {
   return (
     <div className="drawer-section-stack">
+      <p className="drawer-section-label">Research depth</p>
       <BudgetFields publicConfig={publicConfig} />
+      <div className="drawer-divider" />
+      <p className="drawer-section-label">Report length</p>
+      <ReportOutputFields publicConfig={publicConfig} />
     </div>
   );
 }

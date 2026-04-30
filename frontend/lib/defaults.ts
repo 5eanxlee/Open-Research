@@ -1,4 +1,10 @@
-import type { AgentConfig, BudgetPolicy, MemoryInfluencePolicy, ProfilePreferences } from "./types";
+import type {
+  AgentConfig,
+  BudgetPolicy,
+  MemoryInfluencePolicy,
+  ProfilePreferences,
+  ReportOutputConfig,
+} from "./types";
 
 export const DEFAULT_API_BASE_URL =
   process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
@@ -20,6 +26,11 @@ export const DEFAULT_AGENT_CONFIG: AgentConfig = {
   claim_granularity: "atomic",
   source_trust_floor: "standard",
   include_counterevidence: true,
+};
+
+export const DEFAULT_REPORT_OUTPUT_CONFIG: ReportOutputConfig = {
+  min_words: 900,
+  max_words: 2400,
 };
 
 export const DEFAULT_MEMORY_POLICY: MemoryInfluencePolicy = {

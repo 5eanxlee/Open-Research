@@ -41,6 +41,16 @@ const PHASE_TO_DETAILS_TAB: Record<WorkspacePhaseKey, WorkspaceDetailsTab> = {
   deliver: "overview",
 };
 
+const DETAIL_TAB_LABELS: Record<WorkspaceDetailsTab, string> = {
+  overview: "Pipeline",
+  plan: "Plan",
+  tasks: "Agents",
+  thinking: "Thinking",
+  sources: "Sources",
+  citations: "Report",
+  trace: "Tool calls",
+};
+
 function formatTime(value: string | null | undefined): string {
   if (!value) return "n/a";
   return new Date(value).toLocaleString(undefined, {
@@ -237,7 +247,6 @@ interface RunWorkspaceProps {
   onApprove?: (runId: string, note?: string) => void;
   onReject?: (runId: string, note?: string) => void;
   onRequestChanges?: (runId: string, note?: string) => void;
-  onSendMessage?: (runId: string, message: string) => void;
   pending?: {
     cancel?: boolean;
     resume?: boolean;
@@ -246,7 +255,6 @@ interface RunWorkspaceProps {
     approve?: boolean;
     reject?: boolean;
     requestChanges?: boolean;
-    chat?: boolean;
   };
 }
 
@@ -263,7 +271,6 @@ export function RunWorkspace({
   onApprove,
   onReject,
   onRequestChanges,
-  onSendMessage,
   pending,
 }: RunWorkspaceProps) {
   const [detailsTab, setDetailsTab] = useState<WorkspaceDetailsTab>("overview");
@@ -277,7 +284,6 @@ export function RunWorkspace({
   const [selectedCitationId, setSelectedCitationId] = useState<string | null>(null);
   const [clarificationDraft, setClarificationDraft] = useState("");
   const [approvalNote, setApprovalNote] = useState("");
-  const [chatDraft, setChatDraft] = useState("");
   const [reportExpanded, setReportExpanded] = useState(false);
   const [reportActionNotice, setReportActionNotice] = useState<string | null>(null);
 
@@ -500,7 +506,6 @@ export function RunWorkspace({
   const reportFilename = `${slugifyFilename(workspace.question)}-report.md`;
   const plannedStreams =
     workspace.plan.plan_preview?.plan.streams ?? workspace.plan.approved_plan?.streams ?? [];
-  const latestConversationModel = conversationMessages.at(-1)?.model ?? null;
   const shellSummary = [
     {
       label: "Phase",
@@ -536,23 +541,19 @@ export function RunWorkspace({
   };
 
   return (
-    <section className="panel workspace-panel workspace-shell-panel">
+    <section
+      className={`panel workspace-panel workspace-shell-panel ${
+        detailsOpen ? "activity-open" : ""
+      }`}
+    >
       <div className="workspace-shell-header">
         <div className="workspace-shell-title">
-          <p className="eyebrow">Research chat</p>
-          <h2 className="panel-title">{workspace.question}</h2>
-          <div className="workspace-shell-meta">
-            <span className={`pill status-${workspace.status}`}>{titleCase(workspace.status)}</span>
-            {workspace.approval_status ? (
-              <span className="pill muted">
-                Approval: {workspace.approval_status.replaceAll("_", " ")}
-              </span>
-            ) : null}
-            {workspace.project_id ? <span className="pill muted">Project attached</span> : null}
-            <span className="workspace-shell-timestamp">
-              Updated {formatTime(workspace.updated_at)}
-            </span>
-          </div>
+          <span className={`workspace-run-status status-${workspace.status}`}>
+            {titleCase(workspace.status)}
+          </span>
+          <span className="workspace-shell-timestamp">
+            Updated {formatTime(workspace.updated_at)}
+          </span>
         </div>
         <div className="workspace-shell-actions">
           <div className="workspace-primary-tabs">
@@ -574,10 +575,11 @@ export function RunWorkspace({
           </div>
           <button
             className="secondary-button"
+            aria-label={detailsOpen ? "Hide research activity" : "Show research activity"}
             onClick={() => setDetailsOpen((current) => !current)}
             type="button"
           >
-            {detailsOpen ? "Hide details" : "Run details"}
+            {detailsOpen ? "Hide" : "Activity"}
           </button>
           {workspace.status !== "completed" &&
           workspace.status !== "failed" &&
@@ -654,13 +656,9 @@ export function RunWorkspace({
                   <p>{workspace.question}</p>
                 </article>
 
-                {workspace.plan.plan_preview ? (
+                {workspace.status === "awaiting_plan_approval" && workspace.plan.plan_preview ? (
                   <article className="thread-item conversation-turn system">
-                    <strong>
-                      {workspace.status === "awaiting_plan_approval"
-                        ? "Plan preview"
-                        : "Planning summary"}
-                    </strong>
+                    <strong>Plan preview</strong>
                     <div className="workspace-stack compact">
                       <span>{workspace.plan.plan_preview.summary}</span>
                       <small>{workspace.plan.plan_preview.hypothesis}</small>
@@ -675,63 +673,50 @@ export function RunWorkspace({
                         </span>
                       </div>
                     </div>
-                    {workspace.status === "awaiting_plan_approval" ? (
-                      <div className="workspace-form">
-                        <textarea
-                          className="textarea-input"
-                          value={approvalNote}
-                          onChange={(event) => setApprovalNote(event.target.value)}
-                          rows={3}
-                          placeholder="Optional note or requested changes."
-                        />
-                        <div className="button-row">
-                          <button
-                            className="primary-button"
-                            onClick={() =>
-                              onApprove?.(workspace.run_id, approvalNote.trim() || undefined)
-                            }
-                            type="button"
-                            disabled={pending?.approve}
-                          >
-                            Approve
-                          </button>
-                          <button
-                            className="secondary-button"
-                            onClick={() =>
-                              onRequestChanges?.(
-                                workspace.run_id,
-                                approvalNote.trim() || undefined,
-                              )
-                            }
-                            type="button"
-                            disabled={pending?.requestChanges}
-                          >
-                            Request changes
-                          </button>
-                          <button
-                            className="secondary-button"
-                            onClick={() =>
-                              onReject?.(workspace.run_id, approvalNote.trim() || undefined)
-                            }
-                            type="button"
-                            disabled={pending?.reject}
-                          >
-                            Reject
-                          </button>
-                        </div>
+                    <div className="workspace-form">
+                      <textarea
+                        className="textarea-input"
+                        value={approvalNote}
+                        onChange={(event) => setApprovalNote(event.target.value)}
+                        rows={3}
+                        placeholder="Optional note or requested changes."
+                      />
+                      <div className="button-row">
+                        <button
+                          className="primary-button"
+                          onClick={() =>
+                            onApprove?.(workspace.run_id, approvalNote.trim() || undefined)
+                          }
+                          type="button"
+                          disabled={pending?.approve}
+                        >
+                          Approve
+                        </button>
+                        <button
+                          className="secondary-button"
+                          onClick={() =>
+                            onRequestChanges?.(
+                              workspace.run_id,
+                              approvalNote.trim() || undefined,
+                            )
+                          }
+                          type="button"
+                          disabled={pending?.requestChanges}
+                        >
+                          Request changes
+                        </button>
+                        <button
+                          className="secondary-button"
+                          onClick={() =>
+                            onReject?.(workspace.run_id, approvalNote.trim() || undefined)
+                          }
+                          type="button"
+                          disabled={pending?.reject}
+                        >
+                          Reject
+                        </button>
                       </div>
-                    ) : (
-                      <button
-                        className="ghost-button"
-                        onClick={() => {
-                          setDetailsOpen(true);
-                          setDetailsTab("plan");
-                        }}
-                        type="button"
-                      >
-                        Open planning details
-                      </button>
-                    )}
+                    </div>
                   </article>
                 ) : null}
 
@@ -773,7 +758,7 @@ export function RunWorkspace({
                 {reportReady ? (
                   <article className="thread-item conversation-turn assistant report-turn">
                     <div className="conversation-turn-header">
-                      <strong>Final report</strong>
+                      <strong>Assistant</strong>
                       <div className="workspace-report-actions">
                         <button
                           className="ghost-button"
@@ -913,45 +898,6 @@ export function RunWorkspace({
                 ))}
               </div>
 
-              {workspace.status === "completed" && reportReady ? (
-                <div className="workspace-form conversation-composer">
-                  <div className="conversation-composer-meta">
-                    <span>
-                      Continue the conversation with{" "}
-                      {latestConversationModel ?? "the configured run model"}.
-                    </span>
-                  </div>
-                  <textarea
-                    className="textarea-input"
-                    value={chatDraft}
-                    onChange={(event) => setChatDraft(event.target.value)}
-                    rows={4}
-                    placeholder="Ask a follow-up about the completed research..."
-                  />
-                  <div className="button-row">
-                    <button
-                      className="primary-button"
-                      onClick={() => {
-                        const trimmed = chatDraft.trim();
-                        if (!trimmed) return;
-                        onSendMessage?.(workspace.run_id, trimmed);
-                        setChatDraft("");
-                      }}
-                      type="button"
-                      disabled={!chatDraft.trim() || pending?.chat}
-                    >
-                      {pending?.chat ? "Sending..." : "Send"}
-                    </button>
-                    <button
-                      className="ghost-button"
-                      onClick={() => setPrimaryView("report")}
-                      type="button"
-                    >
-                      Focus report
-                    </button>
-                  </div>
-                </div>
-              ) : null}
             </div>
           ) : (
             <div className="workspace-report-shell">
@@ -1021,7 +967,21 @@ export function RunWorkspace({
         </section>
 
         {detailsOpen ? (
-          <aside className="workspace-details-panel">
+          <aside className="workspace-details-panel" aria-label="Research Activity">
+            <div className="workspace-details-heading">
+              <div>
+                <strong>Research Activity</strong>
+                <span>{activePhase?.label ?? titleCase(workspace.current_phase)}</span>
+              </div>
+              <button
+                className="ghost-button"
+                onClick={() => setDetailsOpen(false)}
+                type="button"
+              >
+                Close
+              </button>
+            </div>
+
             <div className="workspace-details-summary">
               {shellSummary.map((item) => (
                 <article className="workspace-context-card" key={item.label}>
@@ -1081,7 +1041,7 @@ export function RunWorkspace({
                   onClick={() => setDetailsTab(tab)}
                   type="button"
                 >
-                  {titleCase(tab)}
+                  {DETAIL_TAB_LABELS[tab]}
                 </button>
               ))}
             </div>
