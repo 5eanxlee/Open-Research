@@ -5426,12 +5426,21 @@ def _render_output_contract(output_contract: Mapping[str, Any] | None) -> str:
         if min_words and max_words:
             lines.append(
                 "- Target final report length: "
-                f"{min_words}-{max_words} words before source excerpts."
+                f"{min_words}-{max_words} words before source excerpts. Treat the "
+                "minimum as a hard floor unless the notes are genuinely too sparse."
             )
         elif min_words:
-            lines.append(f"- Target final report length: at least {min_words} words.")
+            lines.append(
+                f"- Target final report length: at least {min_words} words. Treat this "
+                "minimum as a hard floor unless the notes are genuinely too sparse."
+            )
         elif max_words:
             lines.append(f"- Target final report length: no more than {max_words} words.")
+        lines.append(
+            "- To meet the length target, expand the executive summary and section "
+            "overviews with supported analysis, caveats, comparison logic, and evidence "
+            "gaps; do not add unsupported claims or filler."
+        )
         lines.append(
             "- Preserve citation support and uncertainty handling over hitting the "
             "length target exactly."
