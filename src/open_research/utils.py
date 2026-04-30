@@ -5,6 +5,9 @@ import re
 from collections.abc import Iterable
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+_ARXIV_ABS_ID_RE = re.compile(r"https?://arxiv\.org/abs/([0-9]{4}\.[0-9]{4,5})(?:v\d+)?")
+_ARXIV_TEXT_ID_RE = re.compile(r"\barxiv\s*:?\s*([0-9]{4}\.[0-9]{4,5})(?:v\d+)?\b", re.I)
+
 
 def slugify(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-") or "item"
@@ -26,6 +29,30 @@ def normalize_url(url: str) -> str:
     ]
     query = urlencode(sorted(query_pairs))
     return urlunsplit((scheme, netloc, path.rstrip("/") or "/", query, ""))
+
+
+def arxiv_id_from_url(url: str) -> str | None:
+    match = _ARXIV_ABS_ID_RE.search(url)
+    return match.group(1) if match else None
+
+
+def arxiv_ids_from_text(text: str) -> set[str]:
+    return set(_ARXIV_ABS_ID_RE.findall(text)) | set(_ARXIV_TEXT_ID_RE.findall(text))
+
+
+def source_text_has_arxiv_mismatch(*, url: str, text: str) -> bool:
+    url_arxiv_id = arxiv_id_from_url(url)
+    if url_arxiv_id is None:
+        return False
+    text_arxiv_ids = arxiv_ids_from_text(text)
+    return bool(text_arxiv_ids and url_arxiv_id not in text_arxiv_ids)
+
+
+def sanitize_source_snippet_for_url(*, url: str, snippet: str) -> str:
+    sanitized = clean_text(snippet)
+    if source_text_has_arxiv_mismatch(url=url, text=sanitized):
+        return ""
+    return sanitized
 
 
 def domain_for_url(url: str) -> str:

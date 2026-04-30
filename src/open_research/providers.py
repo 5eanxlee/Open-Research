@@ -24,7 +24,14 @@ from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt,
 
 from .artifacts import ArtifactPayload
 from .domain import FetchedDocument, RetrievalMethod, RetrievedPassage, SearchResult, SourceKind
-from .utils import clean_text, normalize_url, slugify, strip_markdown_fences, tokenize
+from .utils import (
+    clean_text,
+    normalize_url,
+    sanitize_source_snippet_for_url,
+    slugify,
+    strip_markdown_fences,
+    tokenize,
+)
 
 
 @dataclass(slots=True)
@@ -1467,7 +1474,12 @@ def _extract_openai_web_search_results(
         if isinstance(snippet, str) and snippet.strip() and (
             prefer_snippet or not record.get("snippet")
         ):
-            record["snippet"] = clean_text(snippet)[:500]
+            sanitized_snippet = sanitize_source_snippet_for_url(
+                url=normalized,
+                snippet=snippet,
+            )
+            if sanitized_snippet:
+                record["snippet"] = sanitized_snippet[:500]
 
     for url, snippet in _extract_summary_url_contexts(summary):
         add_source(url, snippet=snippet, prefer_snippet=True)
@@ -1497,12 +1509,16 @@ def _extract_openai_web_search_results(
         if len(results) >= max_results:
             break
         url = record["url"]
+        snippet = record.get("snippet") or sanitize_source_snippet_for_url(
+            url=url,
+            snippet=summary[:500],
+        )
         try:
             results.append(
                 SearchResult(
                     title=record.get("title") or _title_from_url(url),
                     url=url,
-                    snippet=record.get("snippet") or summary[:500],
+                    snippet=snippet,
                     provider=provider_name,
                     score=float(max_results - index),
                 )

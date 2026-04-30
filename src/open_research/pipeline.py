@@ -102,6 +102,7 @@ from .utils import (
     domain_for_url,
     extract_sentences,
     normalize_url,
+    sanitize_source_snippet_for_url,
     strip_markdown_fences,
     tokenize,
 )
@@ -549,8 +550,11 @@ def _search_result_relevance(
         return 0.0
     priority_tokens = _priority_query_tokens(query)
     title = clean_text(str(getattr(result, "title", "") or ""))
-    snippet = clean_text(str(getattr(result, "snippet", "") or ""))
     url = str(getattr(result, "url", "") or "")
+    snippet = sanitize_source_snippet_for_url(
+        url=url,
+        snippet=str(getattr(result, "snippet", "") or ""),
+    )
     title_tokens = set(tokenize(title))
     snippet_tokens = set(tokenize(snippet))
     url_tokens = set(tokenize(url))
@@ -2804,7 +2808,10 @@ class ResearchWorker:
         fetch_error: str,
         discovered_via: str,
     ) -> FetchedDocument | None:
-        snippet = clean_text(str(getattr(result, "snippet", "") or ""))
+        snippet = sanitize_source_snippet_for_url(
+            url=str(getattr(result, "url", "") or ""),
+            snippet=str(getattr(result, "snippet", "") or ""),
+        )
         if len(snippet) < 40:
             return None
         url = normalize_url(str(result.url))
@@ -3037,7 +3044,10 @@ class ResearchWorker:
                 "discovered_via": "search",
                 "metadata": {
                     "query": query,
-                    "snippet": getattr(result, "snippet", ""),
+                    "snippet": sanitize_source_snippet_for_url(
+                        url=str(result.url),
+                        snippet=str(getattr(result, "snippet", "") or ""),
+                    ),
                     "score": getattr(result, "score", 0.0),
                     "discovered_stage": "search",
                 },
