@@ -163,7 +163,7 @@ class Settings(BaseSettings):
     openai_web_search_context_size: Literal["low", "medium", "high"] = "medium"
     openai_web_search_reasoning_effort: Literal["low", "medium", "high"] = "high"
     openai_web_search_external_web_access: bool = True
-    openai_web_search_max_output_tokens: int = 1200
+    openai_web_search_max_output_tokens: int = 4096
     openai_web_search_timeout_seconds: float = 180.0
     llm_reasoning_effort: Literal["minimal", "low", "medium", "high", "xhigh"] = "high"
     llm_api_style: Literal["auto", "responses", "chat_completions"] = "auto"

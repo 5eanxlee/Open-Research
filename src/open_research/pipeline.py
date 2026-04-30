@@ -1633,8 +1633,9 @@ class OpenAIPlanner(Planner):
         if self.settings.resolved_search_backend == "openai":
             max_discovery_queries = min(
                 max_discovery_queries,
-                max(4, budget.max_queries_per_stream + 2),
+                budget.max_queries_per_stream,
             )
+        max_discovery_queries = max(1, max_discovery_queries)
         min_discovery_queries = min(
             self.settings.planner_min_discovery_queries,
             max_discovery_queries,
@@ -2560,7 +2561,7 @@ class ResearchWorker:
         }
         if not fetch_allowed and self.fetch_provider.provider_name in selected:
             fetch_allowed = {self.fetch_provider.provider_name}
-        return search_allowed or None, fetch_allowed or None
+        return search_allowed, fetch_allowed
 
     async def _search(
         self,

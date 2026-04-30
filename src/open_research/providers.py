@@ -518,7 +518,7 @@ class OpenAIWebSearchProvider(SearchProvider):
         search_context_size: str = "medium",
         reasoning_effort: str = "low",
         external_web_access: bool = True,
-        max_output_tokens: int = 1200,
+        max_output_tokens: int = 4096,
     ) -> None:
         self.client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
         self.model = model
@@ -538,17 +538,18 @@ class OpenAIWebSearchProvider(SearchProvider):
         request_kwargs: dict[str, Any] = {
             "model": self.model,
             "instructions": (
-                "You are a web search adapter. Search the public web for directly "
-                "citable sources, prefer primary or official sources, and keep the "
-                "answer concise."
+                "You are a web search adapter. Use web search for the query, prefer "
+                "primary or official sources, open at most three pages when useful, "
+                "then stop searching and write a concise source digest with citations."
             ),
             "input": (
-                "Find current, citable web sources for this research query. "
-                "Return a concise synthesis with inline citations.\n\n"
+                "Find current, citable web sources for this research query. Return "
+                f"up to {max_results} bullets, each with the source URL and the "
+                "specific evidence it supports. Avoid generic summaries.\n\n"
                 f"Query: {query}"
             ),
             "tools": [tool],
-            "tool_choice": "required",
+            "tool_choice": "auto",
             "include": ["web_search_call.action.sources"],
             "max_output_tokens": self.max_output_tokens,
             "store": False,

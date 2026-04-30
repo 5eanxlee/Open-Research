@@ -2592,13 +2592,18 @@ class ResearchRuntime:
 
     def resolve_source_selection(self, source_selection: list[str] | None) -> list[str]:
         if self.settings.enforce_maximal_research_path:
-            selected = source_selection or self.default_source_selection()
-            if list(dict.fromkeys(selected)) != self.default_source_selection():
+            selected = list(dict.fromkeys(source_selection or self.default_source_selection()))
+            native_openai_search_only = (
+                source_selection is not None
+                and self.settings.resolved_search_backend == "openai"
+                and selected == ["openai"]
+            )
+            if not native_openai_search_only and selected != self.default_source_selection():
                 raise ValueError(
                     "Custom source selection is disabled while maximal research path enforcement "
                     "is enabled."
                 )
-            return self.default_source_selection()
+            return selected if native_openai_search_only else self.default_source_selection()
         available = {entry.id: entry for entry in self.available_sources()}
         selected = source_selection or self.default_source_selection()
         unknown = [entry_id for entry_id in selected if entry_id not in available]
