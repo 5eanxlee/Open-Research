@@ -4,7 +4,7 @@ import asyncio
 import re
 from abc import ABC, abstractmethod
 from collections import Counter, defaultdict
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from time import perf_counter
 from typing import Any
 
@@ -227,6 +227,11 @@ _TRUST_DOMAIN_HINTS = (
     "ncbi.nlm.nih.gov",
     "pmc.ncbi.nlm.nih.gov",
     "journals.plos.org",
+)
+_PRIMARY_RECORD_DOMAIN_HINTS = (
+    "arxiv.org/abs/",
+    "openreview.net/forum",
+    "doi.org/",
 )
 _SOFT_PENALTY_HINTS = ("community", "newsletter", "weekly", "blog", "dev.to")
 _OFF_TOPIC_PENALTY_HINTS = (
@@ -562,6 +567,12 @@ def _search_result_relevance(
         part for part in (lowered_title, lowered_snippet, lowered_url) if part
     )
     trust_bonus = 0.2 if any(hint in lowered_url for hint in _TRUST_DOMAIN_HINTS) else 0.0
+    is_primary_record = any(hint in lowered_url for hint in _PRIMARY_RECORD_DOMAIN_HINTS)
+    asks_for_primary_record = bool(
+        query_tokens & {"arxiv", "official", "paper", "papers", "primary", "source"}
+    )
+    if is_primary_record and asks_for_primary_record and provider_score >= 0.6:
+        trust_bonus += 0.3
     if "official" in lowered_title or "/docs" in lowered_url or "documentation" in lowered_title:
         trust_bonus += 0.08
     soft_penalty = 0.0
@@ -573,7 +584,7 @@ def _search_result_relevance(
         soft_penalty -= 0.22
     if priority_tokens:
         if priority_overlap == 0:
-            soft_penalty -= 0.24
+            soft_penalty -= 0.08 if is_primary_record and asks_for_primary_record else 0.24
         elif priority_overlap == 1:
             trust_bonus += 0.04
         else:
@@ -589,6 +600,104 @@ def _search_result_relevance(
         + soft_penalty,
         4,
     )
+
+
+def _interleave_results_by_query(
+    results: Sequence[Any],
+    result_query_order: Mapping[str, int],
+) -> list[Any]:
+    buckets: dict[int, list[Any]] = {}
+    fallback_order = max(result_query_order.values(), default=-1) + 1
+    for result in results:
+        canonical_url = normalize_url(str(getattr(result, "url", "") or ""))
+        query_order = result_query_order.get(canonical_url, fallback_order)
+        buckets.setdefault(query_order, []).append(result)
+    if len(buckets) <= 1:
+        return list(results)
+    interleaved: list[Any] = []
+    max_bucket_size = max(len(bucket) for bucket in buckets.values())
+    for offset in range(max_bucket_size):
+        for query_order in sorted(buckets):
+            bucket = buckets[query_order]
+            if offset < len(bucket):
+                interleaved.append(bucket[offset])
+    return interleaved
+
+
+def _select_results_for_fetch(
+    results: Sequence[Any],
+    result_query_order: Mapping[str, int],
+    *,
+    max_sources: int,
+    per_domain_limit: int,
+) -> list[Any]:
+    buckets: dict[int, list[Any]] = {}
+    fallback_order = max(result_query_order.values(), default=-1) + 1
+    for result in results:
+        canonical_url = normalize_url(str(getattr(result, "url", "") or ""))
+        query_order = result_query_order.get(canonical_url, fallback_order)
+        buckets.setdefault(query_order, []).append(result)
+    if not buckets:
+        return []
+
+    selected: list[Any] = []
+    seen_urls: set[str] = set()
+    domain_counts: Counter[str] = Counter()
+    positions = {query_order: 0 for query_order in buckets}
+    max_sources = max(0, max_sources)
+    per_domain_limit = max(1, per_domain_limit)
+    target_query_coverage = min(len(buckets), max_sources)
+    covered_queries: set[int] = set()
+
+    while len(selected) < max_sources:
+        progressed = False
+        for query_order in sorted(buckets):
+            bucket = buckets[query_order]
+            while positions[query_order] < len(bucket):
+                candidate = bucket[positions[query_order]]
+                positions[query_order] += 1
+                canonical_url = normalize_url(str(getattr(candidate, "url", "") or ""))
+                if not canonical_url or canonical_url in seen_urls:
+                    continue
+                domain = domain_for_url(canonical_url)
+                needs_query_coverage = (
+                    query_order not in covered_queries
+                    and len(covered_queries) < target_query_coverage
+                )
+                if domain_counts[domain] >= per_domain_limit and not needs_query_coverage:
+                    continue
+                seen_urls.add(canonical_url)
+                domain_counts[domain] += 1
+                covered_queries.add(query_order)
+                selected.append(candidate)
+                progressed = True
+                break
+            if len(selected) >= max_sources:
+                break
+        if not progressed:
+            break
+    return selected
+
+
+def _claim_repair_should_skip_search(claim: str) -> bool:
+    lowered = clean_text(claim).lower()
+    uncertainty_markers = (
+        "does not establish",
+        "do not establish",
+        "does not verify",
+        "do not verify",
+        "insufficient evidence",
+        "not established",
+        "not verified",
+        "remain adoption risks",
+        "remains unresolved",
+        "remain unresolved",
+        "the supplied evidence does not",
+        "the retrieved evidence does not",
+        "the available evidence does not",
+        "the notes do not",
+    )
+    return any(marker in lowered for marker in uncertainty_markers)
 
 
 def _derive_recommended_budget(
@@ -3336,8 +3445,9 @@ class ResearchWorker:
         )
 
         selected_results: list[Any] = []
+        result_query_order: dict[str, int] = {}
         seen_urls: set[str] = set()
-        domain_counts: Counter[str] = Counter()
+        query_domain_counts: defaultdict[int, Counter[str]] = defaultdict(Counter)
         selection_target = min(
             budget.max_queries_per_stream * budget.max_results_per_query,
             max(budget.max_sources_per_stream, budget.max_sources_per_stream * 3),
@@ -3360,9 +3470,11 @@ class ResearchWorker:
             stream_name=stream_plan.name,
             max_queries=budget.max_queries_per_stream,
         )
+        query_batch = merged_queries[: budget.max_queries_per_stream]
+        minimum_queries_to_run = min(len(query_batch), max(1, min(3, budget.max_queries_per_stream)))
 
         try:
-            for query in merged_queries[: budget.max_queries_per_stream]:
+            for query_index, query in enumerate(query_batch):
                 await self._ensure_run_active(run_id)
                 results = await self._search(
                     run_id=run_id,
@@ -3418,16 +3530,48 @@ class ResearchWorker:
                         continue
                     if relevance < minimum_relevance:
                         continue
-                    if domain_counts[domain] >= budget.per_domain_limit:
+                    if query_domain_counts[query_index][domain] >= budget.per_domain_limit:
                         continue
                     seen_urls.add(canonical_url)
-                    domain_counts[domain] += 1
+                    result_query_order[canonical_url] = query_index
+                    query_domain_counts[query_index][domain] += 1
                     selected_results.append(result)
                     if len(selected_results) >= selection_target:
                         break
-                if len(selected_results) >= selection_target:
+                if (
+                    len(selected_results) >= selection_target
+                    and query_index + 1 >= minimum_queries_to_run
+                ):
                     break
 
+            selected_results = _select_results_for_fetch(
+                selected_results,
+                result_query_order,
+                max_sources=selection_target,
+                per_domain_limit=budget.per_domain_limit,
+            )
+            await self.events.publish(
+                run_id,
+                "source.selection.finalized",
+                {
+                    "stream_id": stream_view.id,
+                    "stream_name": stream_view.name,
+                    "candidate_count": len(result_query_order),
+                    "selected_count": len(selected_results),
+                    "per_domain_limit": budget.per_domain_limit,
+                    "selected": [
+                        {
+                            "title": clean_text(str(getattr(result, "title", "") or ""))[:200],
+                            "url": normalize_url(str(getattr(result, "url", "") or "")),
+                            "provider": str(getattr(result, "provider", "") or ""),
+                            "query_order": result_query_order.get(
+                                normalize_url(str(getattr(result, "url", "") or ""))
+                            ),
+                        }
+                        for result in selected_results
+                    ],
+                },
+            )
             reusable_sources: list[dict[str, Any]] = []
             reusable_source_ids: set[str] = set()
             for result in selected_results:
@@ -3457,13 +3601,30 @@ class ResearchWorker:
                         reusable_sources.append(existing_source)
                     continue
                 fetch_started = perf_counter()
-                fetched_document, used_search_fallback = await self._fetch_search_result_document(
-                    run_id=run_id,
-                    stream_id=stream_view.id,
-                    result=result,
-                    allowed_fetch=allowed_fetch,
-                    discovered_via="fetch",
-                )
+                try:
+                    fetched_document, used_search_fallback = await (
+                        self._fetch_search_result_document(
+                            run_id=run_id,
+                            stream_id=stream_view.id,
+                            result=result,
+                            allowed_fetch=allowed_fetch,
+                            discovered_via="fetch",
+                        )
+                    )
+                except Exception as exc:
+                    await self.events.publish(
+                        run_id,
+                        "source.skipped",
+                        {
+                            "stream_id": stream_view.id,
+                            "stream_name": stream_view.name,
+                            "title": getattr(result, "title", None),
+                            "url": str(getattr(result, "url", "")),
+                            "reason": "fetch_failed_without_fallback",
+                            "error": str(exc)[:500],
+                        },
+                    )
+                    continue
                 if self.telemetry is not None:
                     fetch_provider = str(
                         fetched_document.metadata.get("provider", self.fetch_provider.provider_name)
@@ -3637,7 +3798,7 @@ class ResearchWorker:
                     profile_id=profile_id,
                     stream_name=stream_view.name,
                     stream_objective=stream_view.objective,
-                    queries=merged_queries[: budget.max_queries_per_stream],
+                    queries=query_batch,
                     providers=dedupe_preserve_order(result_providers_seen),
                     sources_examined=sources_examined,
                     notes_written=notes_written,
@@ -4788,40 +4949,54 @@ class ResearchOrchestrator:
                 )
 
                 repair_attempts = 0
-                while (
+                if (
                     verification.support_label == CitationSupportLabel.UNSUPPORTED
-                    and repair_attempts < self.worker.settings.max_claim_repairs
+                    and _claim_repair_should_skip_search(claim)
                 ):
-                    repair_attempts += 1
-                    new_passages = await self.worker.collect_supporting_passages(
-                        run_id=run_id,
-                        claim=claim,
-                        section_title=section.title,
-                    )
-                    if not new_passages:
-                        break
-                    candidates = await self._retrieve_supporting_passages(
-                        run_id=run_id,
-                        claim=claim,
-                    )
-                    verification_result = await self.verifier.verify(
-                        claim=claim,
-                        candidates=candidates,
-                        agent_config=agent_config,
-                        model_config=model_config,
-                    )
-                    verification = verification_result.value
-                    await self._record_llm_usage(
-                        run_id=run_id,
-                        phase="claim_reverify",
-                        model=model_config.verifier_model,
-                        usage=verification_result.usage,
-                        metadata={
+                    await self.events.publish(
+                        run_id,
+                        "claim.repair.skipped",
+                        {
                             "section_title": section.title,
-                            "repair_attempt": repair_attempts,
-                            **(verification_result.metadata or {}),
+                            "claim": claim,
+                            "reason": "uncertainty_or_absence_claim",
                         },
                     )
+                else:
+                    while (
+                        verification.support_label == CitationSupportLabel.UNSUPPORTED
+                        and repair_attempts < self.worker.settings.max_claim_repairs
+                    ):
+                        repair_attempts += 1
+                        new_passages = await self.worker.collect_supporting_passages(
+                            run_id=run_id,
+                            claim=claim,
+                            section_title=section.title,
+                        )
+                        if not new_passages:
+                            break
+                        candidates = await self._retrieve_supporting_passages(
+                            run_id=run_id,
+                            claim=claim,
+                        )
+                        verification_result = await self.verifier.verify(
+                            claim=claim,
+                            candidates=candidates,
+                            agent_config=agent_config,
+                            model_config=model_config,
+                        )
+                        verification = verification_result.value
+                        await self._record_llm_usage(
+                            run_id=run_id,
+                            phase="claim_reverify",
+                            model=model_config.verifier_model,
+                            usage=verification_result.usage,
+                            metadata={
+                                "section_title": section.title,
+                                "repair_attempt": repair_attempts,
+                                **(verification_result.metadata or {}),
+                            },
+                        )
 
                 await self.events.publish(
                     run_id,

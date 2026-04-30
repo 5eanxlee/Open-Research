@@ -540,7 +540,12 @@ class OpenAIWebSearchProvider(SearchProvider):
             "instructions": (
                 "You are a web search adapter. Use web search for the query, prefer "
                 "primary or official sources, open at most three pages when useful, "
-                "then stop searching and write a concise source digest with citations."
+                "then stop searching and write a concise source digest with citations. "
+                "For broad technical surveys, diversify results across source types: "
+                "include at least one paper or benchmark record, one official project "
+                "or documentation page, and one limitations or evaluation source when "
+                "available. Avoid returning more than two URLs from the same organization "
+                "unless the query is specifically about that organization."
             ),
             "input": (
                 "Find current, citable web sources for this research query. Return "

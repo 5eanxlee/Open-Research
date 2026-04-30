@@ -112,7 +112,7 @@ export const useResearchStore = create<ResearchStoreState>()(
       profilePreferences: DEFAULT_PROFILE_PREFERENCES,
       memoryPolicyOverride: DEFAULT_MEMORY_POLICY,
       executionMode: "deep",
-      requirePlanApproval: true,
+      requirePlanApproval: false,
       clarifierConfig: {
         enabled: true,
         max_questions: 2,
@@ -229,7 +229,7 @@ export const useResearchStore = create<ResearchStoreState>()(
           profilePreferences: DEFAULT_PROFILE_PREFERENCES,
           memoryPolicyOverride: DEFAULT_MEMORY_POLICY,
           executionMode: "deep",
-          requirePlanApproval: true,
+          requirePlanApproval: false,
           clarifierConfig: {
             enabled: true,
             max_questions: 2,
@@ -340,7 +340,7 @@ export const useResearchStore = create<ResearchStoreState>()(
           profilePreferences: state.profilePreferences ?? DEFAULT_PROFILE_PREFERENCES,
           memoryPolicyOverride: state.memoryPolicyOverride ?? DEFAULT_MEMORY_POLICY,
           executionMode: "deep",
-          requirePlanApproval: true,
+          requirePlanApproval: state.requirePlanApproval ?? false,
           clarifierConfig: state.clarifierConfig ?? {
             enabled: true,
             max_questions: 2,
@@ -365,7 +365,7 @@ export const useResearchStore = create<ResearchStoreState>()(
         profilePreferences: state.profilePreferences,
         memoryPolicyOverride: state.memoryPolicyOverride,
           executionMode: "deep",
-          requirePlanApproval: true,
+          requirePlanApproval: state.requirePlanApproval,
         clarifierConfig: state.clarifierConfig,
         sourceSelection: state.sourceSelection,
         runInputAssets: state.runInputAssets,

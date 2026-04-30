@@ -993,6 +993,7 @@ function CommonSettingsFields({ publicConfig, onOpenPanel }: RunComposerProps) {
   const setProfileId = useResearchStore((state) => state.setProfileId);
   const budget = useResearchStore((state) => state.budget);
   const sourceSelection = useResearchStore((state) => state.sourceSelection);
+  const requirePlanApproval = useResearchStore((state) => state.requirePlanApproval);
   const selectedProjectId = useResearchStore((state) => state.selectedProjectId);
   const runInputAssets = useResearchStore((state) => state.runInputAssets);
   const stagedRunAssets = useResearchStore((state) => state.stagedRunAssets);
@@ -1031,7 +1032,7 @@ function CommonSettingsFields({ publicConfig, onOpenPanel }: RunComposerProps) {
           </div>
           <div className="settings-summary-row">
             <dt>Workflow</dt>
-            <dd>Approval-first research</dd>
+            <dd>{requirePlanApproval ? "Approval-first" : "Direct run"}</dd>
           </div>
           <div className="settings-summary-row">
             <dt>Project</dt>
@@ -1417,6 +1418,8 @@ function ModelSelectionFields({ publicConfig }: RunComposerProps) {
 function ExecutionWorkflowFields({ publicConfig }: RunComposerProps) {
   const clarifierConfig = useResearchStore((state) => state.clarifierConfig);
   const updateClarifierConfig = useResearchStore((state) => state.updateClarifierConfig);
+  const requirePlanApproval = useResearchStore((state) => state.requirePlanApproval);
+  const setRequirePlanApproval = useResearchStore((state) => state.setRequirePlanApproval);
   const asyncSubmit = useResearchStore((state) => state.asyncSubmit);
   const setAsyncSubmit = useResearchStore((state) => state.setAsyncSubmit);
 
@@ -1425,7 +1428,9 @@ function ExecutionWorkflowFields({ publicConfig }: RunComposerProps) {
       <div className="settings-grid">
         <div className="field static-field">
           <span className="field-label">Workflow</span>
-          <span className="field-static-value">Approval-first research</span>
+          <span className="field-static-value">
+            {requirePlanApproval ? "Approval-first" : "Direct run"}
+          </span>
         </div>
 
         <label className="field">
@@ -1459,6 +1464,15 @@ function ExecutionWorkflowFields({ publicConfig }: RunComposerProps) {
       </div>
 
       <div className="toggle-grid">
+        <label className="toggle-card">
+          <input
+            type="checkbox"
+            checked={requirePlanApproval}
+            onChange={(event) => setRequirePlanApproval(event.target.checked)}
+          />
+          <span>Require plan approval</span>
+        </label>
+
         <label className="toggle-card">
           <input
             type="checkbox"
