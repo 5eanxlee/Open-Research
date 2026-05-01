@@ -38,10 +38,10 @@ from .terminal_client import (
 )
 from .tui import OpenResearchTerminalApp
 
-DEFAULT_API_BASE_URL = os.environ.get("OPEN_RESEARCH_API_BASE_URL", "http://127.0.0.1:8000")
+DEFAULT_API_BASE_URL = os.environ.get("OPEN_RESEARCH_API_BASE_URL", "http://127.0.0.1:8010")
 DEFAULT_API_HOST = os.environ.get("OPEN_RESEARCH_API_HOST", "127.0.0.1")
-DEFAULT_API_PORT = int(os.environ.get("OPEN_RESEARCH_API_PORT", "8000"))
-DEFAULT_FRONTEND_PORT = int(os.environ.get("OPEN_RESEARCH_FRONTEND_PORT", "3000"))
+DEFAULT_API_PORT = int(os.environ.get("OPEN_RESEARCH_API_PORT", "8010"))
+DEFAULT_FRONTEND_PORT = int(os.environ.get("OPEN_RESEARCH_FRONTEND_PORT", "3010"))
 KNOWN_COMMANDS = {
     "tui",
     "ask",
@@ -400,7 +400,7 @@ def _run_dev_server(args: argparse.Namespace) -> int:
         )
     )
     frontend_process = subprocess.Popen(
-        [npm, "run", "dev", "--", "--port", str(args.frontend_port)],
+        [npm, "exec", "--", "next", "dev", "--port", str(args.frontend_port)],
         cwd=frontend_dir,
         env=frontend_env,
     )

@@ -1,6 +1,8 @@
 "use client";
 
-import { useEffect, useId, useMemo, useRef, useState } from "react";
+import * as Select from "@radix-ui/react-select";
+import { Check, ChevronDown } from "lucide-react";
+import { useId, useMemo } from "react";
 
 export interface CustomSelectOption {
   value: string;
@@ -17,6 +19,8 @@ interface CustomSelectProps {
   disabled?: boolean;
 }
 
+const EMPTY_VALUE = "__open_research_empty_select_value__";
+
 export function CustomSelect({
   value,
   onChange,
@@ -25,51 +29,30 @@ export function CustomSelect({
   ariaLabel,
   disabled = false,
 }: CustomSelectProps) {
-  const [open, setOpen] = useState(false);
-  const rootRef = useRef<HTMLDivElement | null>(null);
   const listboxId = useId();
+  const triggerLabelId = `${listboxId}-label`;
+  const selectValue = value === "" ? EMPTY_VALUE : value;
 
   const selectedOption = useMemo(
     () => options.find((option) => option.value === value) ?? null,
     [options, value],
   );
 
-  useEffect(() => {
-    if (!open) {
-      return undefined;
-    }
-
-    const handlePointerDown = (event: MouseEvent) => {
-      if (rootRef.current && !rootRef.current.contains(event.target as Node)) {
-        setOpen(false);
-      }
-    };
-
-    const handleEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        setOpen(false);
-      }
-    };
-
-    window.addEventListener("mousedown", handlePointerDown);
-    window.addEventListener("keydown", handleEscape);
-    return () => {
-      window.removeEventListener("mousedown", handlePointerDown);
-      window.removeEventListener("keydown", handleEscape);
-    };
-  }, [open]);
-
   return (
-    <div className={`custom-select ${open ? "open" : ""} ${disabled ? "disabled" : ""}`} ref={rootRef}>
-      <button
-        aria-controls={listboxId}
-        aria-expanded={open}
-        aria-haspopup="listbox"
-        aria-label={ariaLabel}
-        className="custom-select-trigger"
+    <div className={`custom-select ${disabled ? "disabled" : ""}`}>
+      <span className="sr-only" id={triggerLabelId}>
+        {ariaLabel ?? placeholder}
+      </span>
+      <Select.Root
         disabled={disabled}
-        onClick={() => setOpen((current) => !current)}
-        type="button"
+        onValueChange={(nextValue) => onChange(nextValue === EMPTY_VALUE ? "" : nextValue)}
+        value={selectValue}
+      >
+      <Select.Trigger
+        aria-controls={listboxId}
+        aria-label={ariaLabel}
+        aria-labelledby={triggerLabelId}
+        className="custom-select-trigger"
       >
         <span className="custom-select-trigger-copy">
           <span className="custom-select-value">
@@ -81,38 +64,50 @@ export function CustomSelect({
             </span>
           ) : null}
         </span>
-        <span aria-hidden className="custom-select-chevron">
-          {open ? "−" : "+"}
-        </span>
-      </button>
+        <Select.Icon className="custom-select-chevron">
+          <ChevronDown aria-hidden size={14} strokeWidth={2} />
+        </Select.Icon>
+      </Select.Trigger>
 
-      {open ? (
-        <div className="custom-select-menu" id={listboxId} role="listbox">
+      <Select.Portal>
+        <Select.Content
+          className="custom-select-menu"
+          id={listboxId}
+          onEscapeKeyDown={(event) => {
+            event.stopPropagation();
+          }}
+          position="popper"
+          sideOffset={4}
+        >
+          <Select.Viewport className="custom-select-viewport">
           {options.map((option) => {
             const isSelected = option.value === value;
+            const optionValue = option.value === "" ? EMPTY_VALUE : option.value;
             return (
-              <button
-                aria-selected={isSelected}
+              <Select.Item
                 className={`custom-select-option ${isSelected ? "selected" : ""}`}
+                data-selected={isSelected ? "true" : undefined}
                 key={option.value}
-                onClick={() => {
-                  onChange(option.value);
-                  setOpen(false);
-                }}
-                role="option"
-                type="button"
+                value={optionValue}
               >
-                <span className="custom-select-option-label">{option.label}</span>
+                <Select.ItemText>
+                  <span className="custom-select-option-label">{option.label}</span>
+                </Select.ItemText>
                 {option.description ? (
                   <span className="custom-select-option-description">
                     {option.description}
                   </span>
                 ) : null}
-              </button>
+                <Select.ItemIndicator className="custom-select-option-indicator">
+                  <Check aria-hidden size={14} strokeWidth={2} />
+                </Select.ItemIndicator>
+              </Select.Item>
             );
           })}
-        </div>
-      ) : null}
+          </Select.Viewport>
+        </Select.Content>
+      </Select.Portal>
+      </Select.Root>
     </div>
   );
 }

@@ -51,6 +51,85 @@ type WorkspacePrimaryView = "chat" | "report";
 type WorkspaceReportPanelTab = WorkspaceDetailsTab | "report";
 
 type ThinkingSubtab = "decisions" | "agents" | "tools" | "files";
+type CitationTraceFilter = "referenced" | "read";
+type LiveTraceStatus =
+  | "queued"
+  | "running"
+  | "completed"
+  | "failed"
+  | "warning"
+  | "skipped"
+  | "info";
+
+interface LiveTaskView {
+  id: string;
+  streamId: string | null;
+  streamName: string;
+  objective: string;
+  status: LiveTraceStatus;
+  startedAt: string | null;
+  updatedAt: string | null;
+  queryCount: number;
+  selectedSourceCount: number;
+  sourceCount: number;
+  noteCount: number;
+  latestSources: string[];
+  latestNoteSummary: string | null;
+  lastEventType: string | null;
+  blockerReason: string | null;
+  model: string | null;
+}
+
+interface LiveTaskBuilder extends LiveTaskView {
+  eventQueryCount: number;
+  eventSelectedSourceCount: number;
+  eventSourceCount: number;
+  eventNoteCount: number;
+}
+
+interface LiveAgentTrace {
+  id: string;
+  name: string;
+  role: string;
+  status: LiveTraceStatus;
+  summary: string;
+  updatedAt: string | null;
+  meta: string[];
+}
+
+interface LiveToolTrace {
+  id: string;
+  title: string;
+  status: LiveTraceStatus;
+  summary: string;
+  detail: string | null;
+  timestamp: string;
+  streamId: string | null;
+  streamName: string | null;
+  meta: string[];
+  rawEvent: RunEvent;
+}
+
+interface LiveFileTrace {
+  id: string;
+  title: string;
+  status: LiveTraceStatus;
+  summary: string;
+  meta: string[];
+  timestamp: string | null;
+}
+
+interface LiveCitationTrace {
+  id: string;
+  kind: CitationTraceFilter;
+  title: string;
+  status: LiveTraceStatus;
+  sourceLabel: string;
+  url: string | null;
+  timestamp: string | null;
+  meta: string[];
+  quote: string | null;
+}
 
 const PHASE_TO_DETAILS_TAB: Record<WorkspacePhaseKey, WorkspaceDetailsTab> = {
   intake: "overview",
@@ -263,6 +342,991 @@ function formatCitationHost(value: string | null): string | null {
   }
 }
 
+function payloadString(
+  payload: Record<string, unknown>,
+  keys: string[],
+): string | null {
+  for (const key of keys) {
+    const value = payload[key];
+    if (typeof value === "string") {
+      const normalized = normalizeInlineText(value);
+      if (normalized) return normalized;
+    }
+    if (typeof value === "number" || typeof value === "boolean") {
+      return String(value);
+    }
+  }
+  return null;
+}
+
+function payloadNumber(
+  payload: Record<string, unknown>,
+  keys: string[],
+): number | null {
+  for (const key of keys) {
+    const value = payload[key];
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+    if (typeof value === "string" && value.trim()) {
+      const parsed = Number(value);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+  }
+  return null;
+}
+
+function payloadStringList(
+  payload: Record<string, unknown>,
+  keys: string[],
+): string[] {
+  for (const key of keys) {
+    const value = payload[key];
+    if (Array.isArray(value)) {
+      return value
+        .map((item) => {
+          if (typeof item === "string") return normalizeInlineText(item);
+          if (item && typeof item === "object") {
+            const record = item as Record<string, unknown>;
+            return payloadString(record, ["title", "url", "name", "query"]);
+          }
+          return "";
+        })
+        .filter((item): item is string => Boolean(item));
+    }
+  }
+  return [];
+}
+
+function payloadRecordList(
+  payload: Record<string, unknown>,
+  key: string,
+): Record<string, unknown>[] {
+  const value = payload[key];
+  if (!Array.isArray(value)) return [];
+  return value.filter(
+    (item): item is Record<string, unknown> =>
+      Boolean(item) && typeof item === "object" && !Array.isArray(item),
+  );
+}
+
+function compactMeta(values: Array<string | null | undefined>): string[] {
+  return values
+    .map((value) => normalizeInlineText(value))
+    .filter((value, index, all) => Boolean(value) && all.indexOf(value) === index);
+}
+
+function statusFromTaskStatus(value: string | null | undefined): LiveTraceStatus {
+  const normalized = normalizeInlineText(value).toLowerCase();
+  if (["completed", "complete", "succeeded", "success", "kept"].includes(normalized)) {
+    return "completed";
+  }
+  if (["running", "active", "in_progress", "researching", "planning"].includes(normalized)) {
+    return "running";
+  }
+  if (["failed", "error", "cancelled", "canceled"].includes(normalized)) {
+    return "failed";
+  }
+  if (["skipped", "removed"].includes(normalized)) {
+    return "skipped";
+  }
+  if (["blocked", "warning", "contradicted", "unsupported"].includes(normalized)) {
+    return "warning";
+  }
+  if (normalized === "queued" || normalized === "pending") {
+    return "queued";
+  }
+  return "info";
+}
+
+function statusFromEventType(eventType: string): LiveTraceStatus {
+  if (
+    eventType.endsWith(".failed") ||
+    eventType.includes("fetch_failed") ||
+    eventType === "run.failed"
+  ) {
+    return "failed";
+  }
+  if (
+    eventType.endsWith(".started") ||
+    eventType === "task.started" ||
+    eventType === "stream.created"
+  ) {
+    return "running";
+  }
+  if (
+    eventType.endsWith(".completed") ||
+    eventType.endsWith(".passed") ||
+    eventType === "source.fetched" ||
+    eventType === "note.saved" ||
+    eventType === "report.sanitized"
+  ) {
+    return "completed";
+  }
+  if (
+    eventType.includes("skipped") ||
+    eventType === "source.skipped" ||
+    eventType === "citation.removed"
+  ) {
+    return "skipped";
+  }
+  if (
+    eventType.includes("retry") ||
+    eventType.includes("contradicted") ||
+    eventType.endsWith(".rejected") ||
+    eventType.endsWith(".changes_requested") ||
+    eventType === "planning.validation.failed" ||
+    eventType === "tool.budget.low"
+  ) {
+    return "warning";
+  }
+  return "info";
+}
+
+function statusClassName(status: LiveTraceStatus): string {
+  return `status-${status}`;
+}
+
+function displayEventType(value: string): string {
+  return titleCase(value.replace(/^deepagents\./, "").replace(/^provider\./, ""));
+}
+
+function eventStreamId(event: RunEvent): string | null {
+  return payloadString(event.payload, ["stream_id", "affected_stream_id"]);
+}
+
+function eventStreamName(event: RunEvent): string | null {
+  return payloadString(event.payload, ["stream_name", "name", "affected_stream_name"]);
+}
+
+function eventUrl(event: RunEvent): string | null {
+  const direct = payloadString(event.payload, ["url", "source_url", "canonical_url"]);
+  if (direct) return direct;
+  const urls = extractUrlsFromText(JSON.stringify(event.payload));
+  return urls[0] ?? null;
+}
+
+function getLatestEventTime(events: RunEvent[], predicate: (event: RunEvent) => boolean): string | null {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    if (predicate(events[index])) return events[index].created_at;
+  }
+  return null;
+}
+
+function buildLiveTasks(
+  workspace: RunWorkspaceSnapshot,
+  events: RunEvent[],
+): LiveTaskView[] {
+  const taskMap = new Map<string, LiveTaskBuilder>();
+  const streamIdByName = new Map<string, string>();
+  const hasTerminalReport = events.some((event) => event.event_type === "report.completed");
+
+  const ensureTask = ({
+    id,
+    streamId,
+    streamName,
+    objective,
+    model,
+    timestamp,
+  }: {
+    id: string;
+    streamId: string | null;
+    streamName: string | null;
+    objective: string | null;
+    model?: string | null;
+    timestamp?: string | null;
+  }): LiveTaskBuilder => {
+    const existing = taskMap.get(id);
+    if (existing) {
+      if (streamName && existing.streamName === "Research stream") existing.streamName = streamName;
+      if (objective && !existing.objective) existing.objective = objective;
+      if (model && !existing.model) existing.model = model;
+      if (timestamp) existing.updatedAt = timestamp;
+      return existing;
+    }
+    const created: LiveTaskBuilder = {
+      id,
+      streamId,
+      streamName: streamName ?? "Research stream",
+      objective: objective ?? "Awaiting task details.",
+      status: "queued",
+      startedAt: timestamp ?? null,
+      updatedAt: timestamp ?? null,
+      queryCount: 0,
+      selectedSourceCount: 0,
+      sourceCount: 0,
+      noteCount: 0,
+      latestSources: [],
+      latestNoteSummary: null,
+      lastEventType: null,
+      blockerReason: null,
+      model: model ?? null,
+      eventQueryCount: 0,
+      eventSelectedSourceCount: 0,
+      eventSourceCount: 0,
+      eventNoteCount: 0,
+    };
+    taskMap.set(id, created);
+    return created;
+  };
+
+  for (const stream of workspace.streams) {
+    streamIdByName.set(stream.name, stream.id);
+    if (!stream.tasks.length) {
+      const fallback = ensureTask({
+        id: `stream:${stream.id}`,
+        streamId: stream.id,
+        streamName: stream.name,
+        objective: stream.objective,
+        model: stream.model,
+      });
+      fallback.status = statusFromTaskStatus(stream.status);
+      fallback.queryCount = stream.query_count;
+      fallback.selectedSourceCount = stream.selected_source_count;
+      fallback.sourceCount = stream.selected_source_count;
+      fallback.noteCount = stream.note_count;
+      fallback.latestSources = stream.latest_source_titles.slice(0, 4);
+      fallback.latestNoteSummary = stream.latest_note_summary;
+      fallback.updatedAt = getLatestEventTime(
+        events,
+        (event) => eventStreamId(event) === stream.id,
+      );
+    }
+    for (const task of stream.tasks) {
+      const liveTask = ensureTask({
+        id: task.id,
+        streamId: task.stream_id ?? stream.id,
+        streamName: task.stream_name ?? stream.name,
+        objective: task.objective || stream.objective,
+        model: stream.model,
+      });
+      liveTask.status = statusFromTaskStatus(task.status);
+      liveTask.startedAt = task.started_at ?? liveTask.startedAt;
+      liveTask.updatedAt = task.completed_at ?? liveTask.updatedAt;
+      liveTask.queryCount = task.query_count;
+      liveTask.selectedSourceCount = task.selected_source_count;
+      liveTask.sourceCount = task.selected_source_count;
+      liveTask.noteCount = task.notes_produced;
+      liveTask.latestSources = task.latest_sources.slice(0, 4);
+      liveTask.latestNoteSummary = task.latest_note_summary;
+      liveTask.lastEventType = task.last_tool_call ?? task.last_decision;
+      liveTask.blockerReason = task.blocker_reason;
+    }
+  }
+
+  for (const event of events) {
+    const streamId = eventStreamId(event);
+    const streamName = eventStreamName(event);
+    const key = streamId
+      ? taskMap.has(`stream:${streamId}`)
+        ? `stream:${streamId}`
+        : Array.from(taskMap.values()).find((task) => task.streamId === streamId)?.id ??
+          `stream:${streamId}`
+      : streamName
+        ? `stream:${streamIdByName.get(streamName) ?? streamName}`
+        : null;
+    if (!key) continue;
+
+    const task = ensureTask({
+      id: key,
+      streamId,
+      streamName,
+      objective: payloadString(event.payload, ["objective", "query", "claim"]),
+      model: payloadString(event.payload, ["model"]),
+      timestamp: event.created_at,
+    });
+    task.updatedAt = event.created_at;
+    task.lastEventType = event.event_type;
+
+    if (event.event_type === "stream.created") {
+      task.status = "queued";
+      task.objective = payloadString(event.payload, ["objective"]) ?? task.objective;
+      task.model = payloadString(event.payload, ["model"]) ?? task.model;
+    } else if (event.event_type === "task.started") {
+      task.status = "running";
+      task.startedAt = task.startedAt ?? event.created_at;
+      task.objective = payloadString(event.payload, ["objective"]) ?? task.objective;
+    } else if (event.event_type === "search.performed") {
+      task.status = "running";
+      task.eventQueryCount += 1;
+    } else if (event.event_type === "source.selection.finalized") {
+      task.status = "running";
+      task.eventSelectedSourceCount = Math.max(
+        task.eventSelectedSourceCount,
+        payloadNumber(event.payload, ["selected_count"]) ?? 0,
+      );
+      const selectedTitles = payloadRecordList(event.payload, "selected")
+        .map((record) => payloadString(record, ["title", "url"]))
+        .filter((item): item is string => Boolean(item));
+      task.latestSources = [...selectedTitles, ...task.latestSources].slice(0, 4);
+    } else if (
+      event.event_type === "source.fetched" ||
+      event.event_type === "source.cache.hit" ||
+      event.event_type === "claim.repair.source_fetched"
+    ) {
+      task.status = task.status === "queued" ? "running" : task.status;
+      task.eventSourceCount += 1;
+      const sourceLabel = payloadString(event.payload, ["title", "url", "source_id"]);
+      if (sourceLabel) {
+        task.latestSources = [sourceLabel, ...task.latestSources]
+          .filter((value, index, all) => all.indexOf(value) === index)
+          .slice(0, 4);
+      }
+    } else if (event.event_type === "note.saved") {
+      task.status = task.status === "queued" ? "running" : task.status;
+      task.eventNoteCount += 1;
+      task.latestNoteSummary = payloadString(event.payload, ["summary"]) ?? task.latestNoteSummary;
+    } else if (event.event_type === "input_assets.ingested") {
+      task.status = task.status === "queued" ? "running" : task.status;
+      task.eventSourceCount += payloadNumber(event.payload, ["count"]) ?? 0;
+    } else if (event.event_type === "stream.failed") {
+      task.status = "failed";
+      task.blockerReason = payloadString(event.payload, ["error", "reason"]);
+    } else if (event.event_type === "stream.cancelled") {
+      task.status = "failed";
+      task.blockerReason = "Stream was cancelled.";
+    } else if (event.event_type === "source.skipped" || event.event_type === "source.fetch_failed") {
+      task.blockerReason = payloadString(event.payload, ["reason", "error"]) ?? task.blockerReason;
+    }
+  }
+
+  const tasks = Array.from(taskMap.values()).map((task) => {
+    task.queryCount = Math.max(task.queryCount, task.eventQueryCount);
+    task.selectedSourceCount = Math.max(
+      task.selectedSourceCount,
+      task.eventSelectedSourceCount,
+      task.eventSourceCount,
+    );
+    task.sourceCount = Math.max(task.sourceCount, task.eventSourceCount, task.selectedSourceCount);
+    task.noteCount = Math.max(task.noteCount, task.eventNoteCount);
+    if (
+      (hasTerminalReport || workspace.status === "completed") &&
+      task.status !== "failed" &&
+      task.status !== "skipped"
+    ) {
+      task.status = "completed";
+    }
+    return task;
+  });
+
+  return tasks.sort((first, second) => {
+    const firstTime = new Date(first.startedAt ?? first.updatedAt ?? workspace.created_at).getTime();
+    const secondTime = new Date(second.startedAt ?? second.updatedAt ?? workspace.created_at).getTime();
+    return firstTime - secondTime;
+  });
+}
+
+function toolTracePairKey(event: RunEvent): string | null {
+  if (event.event_type.startsWith("provider.call.")) {
+    return compactMeta([
+      "provider",
+      payloadString(event.payload, ["provider"]),
+      payloadString(event.payload, ["category"]),
+      payloadString(event.payload, ["attempt"]),
+      payloadString(event.payload, ["query", "url"]),
+    ]).join(":");
+  }
+  if (event.event_type.startsWith("deepagents.tool.")) {
+    return compactMeta([
+      "deepagents",
+      payloadString(event.payload, ["tool"]),
+      payloadString(event.payload, ["agent_role"]),
+      payloadString(event.payload, ["query_hash", "query"]),
+    ]).join(":");
+  }
+  return null;
+}
+
+function describeToolEvent(event: RunEvent): Omit<LiveToolTrace, "id" | "timestamp" | "rawEvent"> | null {
+  const payload = event.payload;
+  const streamId = eventStreamId(event);
+  const streamName = eventStreamName(event);
+  const provider = payloadString(payload, ["provider"]);
+  const query = payloadString(payload, ["query"]);
+  const url = payloadString(payload, ["url", "source_url"]);
+  const tool = payloadString(payload, ["tool", "tool_name"]);
+  const sourceTitle = payloadString(payload, ["title", "source_title"]);
+  const claim = payloadString(payload, ["claim"]);
+  const reason = payloadString(payload, ["reason", "error"]);
+
+  if (event.event_type.startsWith("provider.call.")) {
+    const category = payloadString(payload, ["category"]) ?? "provider";
+    return {
+      title: `${titleCase(category)} provider call`,
+      status: statusFromEventType(event.event_type),
+      summary: query ?? url ?? `${provider ?? "Provider"} ${category} call`,
+      detail: reason,
+      streamId,
+      streamName,
+      meta: compactMeta([
+        provider,
+        payloadString(payload, ["attempt"]) ? `attempt ${payloadString(payload, ["attempt"])}` : null,
+        payloadNumber(payload, ["result_count"]) != null
+          ? `${payloadNumber(payload, ["result_count"])} results`
+          : null,
+        payloadNumber(payload, ["elapsed_seconds"]) != null
+          ? `${payloadNumber(payload, ["elapsed_seconds"])}s`
+          : null,
+      ]),
+    };
+  }
+
+  if (event.event_type.startsWith("deepagents.tool.")) {
+    return {
+      title: tool ? titleCase(tool) : displayEventType(event.event_type),
+      status: statusFromEventType(event.event_type),
+      summary: query ?? reason ?? payloadString(payload, ["query_hash"]) ?? "Deep agent tool call",
+      detail: null,
+      streamId,
+      streamName,
+      meta: compactMeta([
+        payloadString(payload, ["agent_role"]),
+        provider,
+        payloadNumber(payload, ["source_count"]) != null
+          ? `${payloadNumber(payload, ["source_count"])} sources`
+          : null,
+        payloadString(payload, ["year"]) ? `year ${payloadString(payload, ["year"])}` : null,
+      ]),
+    };
+  }
+
+  if (event.event_type === "search.performed" || event.event_type === "claim.repair.search_performed") {
+    return {
+      title: event.event_type === "search.performed" ? "Search performed" : "Repair search",
+      status: "completed",
+      summary: query ?? claim ?? "Search query completed.",
+      detail: null,
+      streamId,
+      streamName,
+      meta: compactMeta([
+        provider,
+        payloadNumber(payload, ["result_count"]) != null
+          ? `${payloadNumber(payload, ["result_count"])} results`
+          : null,
+        payloadStringList(payload, ["result_providers"]).join(", "),
+      ]),
+    };
+  }
+
+  if (event.event_type === "source.selection.finalized") {
+    const selected = payloadRecordList(payload, "selected");
+    return {
+      title: "Source selection",
+      status: "completed",
+      summary: `${payloadNumber(payload, ["selected_count"]) ?? selected.length} selected from ${
+        payloadNumber(payload, ["candidate_count"]) ?? "candidate"
+      } results`,
+      detail: selected
+        .map((record) => payloadString(record, ["title", "url"]))
+        .filter((item): item is string => Boolean(item))
+        .slice(0, 5)
+        .join(" | ") || null,
+      streamId,
+      streamName,
+      meta: compactMeta([
+        payloadNumber(payload, ["per_domain_limit"]) != null
+          ? `domain cap ${payloadNumber(payload, ["per_domain_limit"])}`
+          : null,
+      ]),
+    };
+  }
+
+  if (
+    [
+      "source.cache.hit",
+      "source.fetch_failed",
+      "source.fallback_document.created",
+      "source.skipped",
+      "source.fetched",
+      "claim.repair.source_fetched",
+    ].includes(event.event_type)
+  ) {
+    return {
+      title: displayEventType(event.event_type),
+      status: statusFromEventType(event.event_type),
+      summary: sourceTitle ?? url ?? payloadString(payload, ["source_id"]) ?? "Source event",
+      detail: reason,
+      streamId,
+      streamName,
+      meta: compactMeta([
+        provider ?? payloadString(payload, ["search_provider"]),
+        payloadString(payload, ["trust_tier"]),
+        payloadString(payload, ["discovered_via"]),
+        payloadString(payload, ["stage"]),
+      ]),
+    };
+  }
+
+  if (event.event_type === "note.saved") {
+    return {
+      title: "Note saved",
+      status: "completed",
+      summary: payloadString(payload, ["summary"]) ?? "Worker note saved.",
+      detail: null,
+      streamId,
+      streamName,
+      meta: compactMeta([
+        payloadString(payload, ["source_id"]),
+        payloadNumber(payload, ["confidence"]) != null
+          ? `confidence ${payloadNumber(payload, ["confidence"])}`
+          : null,
+        payloadString(payload, ["trust_tier"]),
+      ]),
+    };
+  }
+
+  if (
+    [
+      "passages.reranked",
+      "claim.repair.started",
+      "claim.repair.completed",
+      "claim.repair.skipped",
+      "citation.verification.skipped",
+      "citation.verified",
+      "citation.contradicted",
+      "citation.removed",
+      "citation.audit.completed",
+      "report.drafted",
+      "report.sanitized",
+      "input_assets.ingested",
+      "tool.budget.low",
+      "memory.retrieved",
+      "memory.compiled",
+      "context.fragment.dropped",
+      "context.pack.created",
+      "completion_gate.evaluated",
+      "completion_gate.continuation_requested",
+      "completion_gate.continuation_applied",
+      "completion_gate.exhausted",
+    ].includes(event.event_type)
+  ) {
+    return {
+      title: displayEventType(event.event_type),
+      status: statusFromEventType(event.event_type),
+      summary:
+        claim ??
+        payloadString(payload, ["section_title", "summary", "reason", "tool_name"]) ??
+        normalizeInlineText(JSON.stringify(payload)),
+      detail: reason,
+      streamId,
+      streamName,
+      meta: compactMeta([
+        provider,
+        payloadNumber(payload, ["candidate_count"]) != null
+          ? `${payloadNumber(payload, ["candidate_count"])} candidates`
+          : null,
+        payloadNumber(payload, ["returned_count"]) != null
+          ? `${payloadNumber(payload, ["returned_count"])} returned`
+          : null,
+        payloadNumber(payload, ["citation_count"]) != null
+          ? `${payloadNumber(payload, ["citation_count"])} citations`
+          : null,
+        payloadNumber(payload, ["removed_citations"]) != null
+          ? `${payloadNumber(payload, ["removed_citations"])} removed`
+          : null,
+      ]),
+    };
+  }
+
+  return null;
+}
+
+function buildLiveToolTraces(events: RunEvent[]): LiveToolTrace[] {
+  const traces = new Map<string, LiveToolTrace>();
+
+  for (const event of events) {
+    const description = describeToolEvent(event);
+    if (!description) continue;
+    const pairedKey = toolTracePairKey(event);
+    const key = pairedKey ? `pair:${pairedKey}` : `event:${event.id}`;
+    const existing = traces.get(key);
+    const nextTrace: LiveToolTrace = {
+      id: key,
+      timestamp: event.created_at,
+      rawEvent: event,
+      ...description,
+    };
+    if (existing) {
+      traces.set(key, {
+        ...existing,
+        ...nextTrace,
+        meta: compactMeta([...existing.meta, ...nextTrace.meta]),
+        detail: nextTrace.detail ?? existing.detail,
+      });
+    } else {
+      traces.set(key, nextTrace);
+    }
+  }
+
+  return Array.from(traces.values()).sort(
+    (first, second) =>
+      new Date(second.timestamp).getTime() - new Date(first.timestamp).getTime(),
+  );
+}
+
+function buildLiveAgents(
+  workspace: RunWorkspaceSnapshot,
+  events: RunEvent[],
+): LiveAgentTrace[] {
+  const agents = new Map<string, LiveAgentTrace>();
+  const hasReportCompleted = workspace.status === "completed" || events.some(
+    (event) => event.event_type === "report.completed",
+  );
+
+  const upsert = (agent: LiveAgentTrace) => {
+    const existing = agents.get(agent.id);
+    if (!existing) {
+      agents.set(agent.id, agent);
+      return;
+    }
+    agents.set(agent.id, {
+      ...existing,
+      ...agent,
+      meta: compactMeta([...existing.meta, ...agent.meta]),
+      updatedAt: agent.updatedAt ?? existing.updatedAt,
+    });
+  };
+
+  const planningEvents = events.filter(
+    (event) => event.event_type.startsWith("planning.") || event.event_type.startsWith("plan."),
+  );
+  if (workspace.plan.plan_preview || workspace.plan.approved_plan || planningEvents.length) {
+    const latest = planningEvents[planningEvents.length - 1];
+    upsert({
+      id: "planner",
+      name: "Planner",
+      role: "Planning agent",
+      status:
+        workspace.current_phase === "plan" && workspace.status !== "completed"
+          ? "running"
+          : latest?.event_type === "planning.validation.failed"
+            ? "warning"
+            : workspace.plan.approved_plan || latest?.event_type === "plan.created"
+              ? "completed"
+              : "queued",
+      summary:
+        workspace.plan.approved_plan?.summary ??
+        workspace.plan.plan_preview?.summary ??
+        "Building the research plan.",
+      updatedAt: latest?.created_at ?? null,
+      meta: compactMeta([
+        workspace.plan.plan_preview
+          ? `${workspace.plan.plan_preview.plan.streams.length} preview streams`
+          : null,
+        workspace.plan.approved_plan
+          ? `${workspace.plan.approved_plan.streams.length} approved streams`
+          : null,
+        latest?.event_type,
+      ]),
+    });
+  }
+
+  for (const stream of workspace.streams) {
+    const latest = getLatestEventTime(events, (event) => eventStreamId(event) === stream.id);
+    upsert({
+      id: `stream:${stream.id}`,
+      name: stream.name,
+      role: "Research worker",
+      status: statusFromTaskStatus(stream.status),
+      summary: stream.objective,
+      updatedAt: latest,
+      meta: compactMeta([
+        stream.model,
+        `${stream.query_count} queries`,
+        `${stream.selected_source_count} sources`,
+        `${stream.note_count} notes`,
+      ]),
+    });
+  }
+
+  const citationEvents = events.filter(
+    (event) => event.event_type.startsWith("citation.") || event.event_type.startsWith("claim.repair."),
+  );
+  if (citationEvents.length || workspace.citations.length) {
+    const latest = citationEvents[citationEvents.length - 1];
+    upsert({
+      id: "verifier",
+      name: "Citation verifier",
+      role: "Grounding agent",
+      status:
+        workspace.current_phase === "ground" && !hasReportCompleted
+          ? "running"
+          : workspace.citations.length || hasReportCompleted
+            ? "completed"
+            : "queued",
+      summary: "Checks claims against retrieved passages and repairs unsupported claims.",
+      updatedAt: latest?.created_at ?? null,
+      meta: compactMeta([
+        `${workspace.citations.length} citations`,
+        latest?.event_type,
+      ]),
+    });
+  }
+
+  const reportEvents = events.filter((event) => event.event_type.startsWith("report."));
+  if (reportEvents.length || workspace.final_report_markdown) {
+    const latest = reportEvents[reportEvents.length - 1];
+    upsert({
+      id: "writer",
+      name: "Report writer",
+      role: "Synthesis agent",
+      status: workspace.final_report_markdown ? "completed" : "running",
+      summary: "Drafts, sanitizes, and publishes the final research report.",
+      updatedAt: latest?.created_at ?? null,
+      meta: compactMeta([
+        workspace.report_sections.length ? `${workspace.report_sections.length} sections` : null,
+        latest?.event_type,
+      ]),
+    });
+  }
+
+  for (const event of events) {
+    const role = payloadString(event.payload, ["agent_role"]);
+    if (!role) continue;
+    const existing = agents.get(`agent:${role}`);
+    upsert({
+      id: `agent:${role}`,
+      name: titleCase(role),
+      role: "DeepAgents role",
+      status:
+        event.event_type === "deepagents.tool.failed"
+          ? "failed"
+          : event.event_type === "deepagents.tool.started"
+            ? "running"
+            : "completed",
+      summary: payloadString(event.payload, ["tool", "query"]) ?? "Deep agent activity",
+      updatedAt: event.created_at,
+      meta: compactMeta([
+        ...(existing?.meta ?? []),
+        payloadString(event.payload, ["provider"]),
+        payloadString(event.payload, ["tool"]),
+      ]),
+    });
+  }
+
+  return Array.from(agents.values()).sort((first, second) => {
+    const order = ["planner", "writer", "verifier"];
+    const firstOrder = order.indexOf(first.id);
+    const secondOrder = order.indexOf(second.id);
+    if (firstOrder !== -1 || secondOrder !== -1) {
+      return (firstOrder === -1 ? 99 : firstOrder) - (secondOrder === -1 ? 99 : secondOrder);
+    }
+    return first.name.localeCompare(second.name);
+  });
+}
+
+function buildLiveFiles(
+  workspace: RunWorkspaceSnapshot,
+  events: RunEvent[],
+): LiveFileTrace[] {
+  const assets = workspace.project_assets_available.concat(workspace.run_assets_available);
+  const fileTraces: LiveFileTrace[] = assets.map((asset) => ({
+    id: asset.id,
+    title: asset.label,
+    status: statusFromTaskStatus(asset.processing_status),
+    summary: asset.preview_excerpt ?? asset.description ?? asset.processing_error ?? "Research asset",
+    meta: compactMeta([
+      asset.project_id ? "Project corpus" : "Run asset",
+      asset.usage.replaceAll("_", " "),
+      asset.extraction_method,
+      asset.page_count != null ? `${asset.page_count} pages` : null,
+    ]),
+    timestamp: asset.updated_at,
+  }));
+
+  for (const event of events) {
+    if (event.event_type === "input_assets.ingested") {
+      fileTraces.unshift({
+        id: `event:${event.id}`,
+        title: "Input assets ingested",
+        status: "completed",
+        summary: `${payloadNumber(event.payload, ["count"]) ?? 0} assets added to stream context.`,
+        meta: compactMeta([eventStreamId(event)]),
+        timestamp: event.created_at,
+      });
+    }
+    if (event.event_type === "context.pack.created") {
+      fileTraces.unshift({
+        id: `event:${event.id}`,
+        title: "Context pack created",
+        status: "completed",
+        summary: payloadString(event.payload, ["summary", "phase"]) ?? "Context pack assembled.",
+        meta: compactMeta([
+          payloadString(event.payload, ["phase"]),
+          payloadNumber(event.payload, ["used_tokens"]) != null
+            ? `${payloadNumber(event.payload, ["used_tokens"])} tokens`
+            : null,
+        ]),
+        timestamp: event.created_at,
+      });
+    }
+    if (event.event_type === "context.fragment.dropped") {
+      fileTraces.unshift({
+        id: `event:${event.id}`,
+        title: "Context fragment dropped",
+        status: "skipped",
+        summary: payloadString(event.payload, ["title", "reason", "dropped_reason"]) ?? "Context fragment removed.",
+        meta: compactMeta([payloadString(event.payload, ["phase"])]),
+        timestamp: event.created_at,
+      });
+    }
+  }
+
+  return fileTraces;
+}
+
+function citationTraceFromWorkspaceCitation(
+  citation: WorkspaceCitationView,
+  sources: WorkspaceSourceView[],
+): LiveCitationTrace {
+  const url = citation.source_url ?? resolveCitationSource(citation, sources)?.url ?? null;
+  return {
+    id: `citation:${citation.id}`,
+    kind: "referenced",
+    title: cleanCitationClaimText(citation.claim),
+    status: statusFromTaskStatus(citation.status),
+    sourceLabel: getCitationSourceLabel(citation, sources),
+    url,
+    timestamp: null,
+    meta: compactMeta([
+      citation.section_title,
+      citation.support_label,
+      citation.trust_tier,
+      citation.citation_number ? `#${citation.citation_number}` : null,
+    ]),
+    quote: citation.quote,
+  };
+}
+
+function buildLiveCitationTraces(
+  workspace: RunWorkspaceSnapshot,
+  events: RunEvent[],
+): LiveCitationTrace[] {
+  const traces = new Map<string, LiveCitationTrace>();
+
+  for (const citation of workspace.citations) {
+    const trace = citationTraceFromWorkspaceCitation(citation, workspace.sources);
+    traces.set(trace.id, trace);
+  }
+
+  for (const source of workspace.sources) {
+    const label = normalizeInlineText(source.title ?? source.url);
+    if (!label && !source.url) continue;
+    traces.set(`source:${source.id}`, {
+      id: `source:${source.id}`,
+      kind: "read",
+      title: label || "Source",
+      status: statusFromTaskStatus(source.state),
+      sourceLabel: formatCitationHost(source.url) ?? source.provider ?? "Source",
+      url: source.url,
+      timestamp: null,
+      meta: compactMeta([
+        source.provider,
+        source.origin.replaceAll("_", " "),
+        source.trust_tier,
+        source.stream_names.join(", "),
+      ]),
+      quote: source.note_summaries[0] ?? null,
+    });
+  }
+
+  for (const event of events) {
+    const url = eventUrl(event);
+    if (
+      [
+        "citation.verified",
+        "citation.verification.skipped",
+        "citation.contradicted",
+        "citation.removed",
+      ].includes(event.event_type)
+    ) {
+      const claim = payloadString(event.payload, ["claim"]) ?? displayEventType(event.event_type);
+      const sectionTitle = payloadString(event.payload, ["section_title"]);
+      traces.set(`citation-event:${event.id}`, {
+        id: `citation-event:${event.id}`,
+        kind: "referenced",
+        title: cleanCitationClaimText(claim),
+        status: statusFromEventType(event.event_type),
+        sourceLabel:
+          payloadString(event.payload, ["source_title", "source_id"]) ??
+          sectionTitle ??
+          "Claim audit",
+        url,
+        timestamp: event.created_at,
+        meta: compactMeta([
+          sectionTitle,
+          payloadString(event.payload, ["support_label"]),
+          payloadString(event.payload, ["reason"]),
+          payloadNumber(event.payload, ["repair_attempts"]) != null
+            ? `${payloadNumber(event.payload, ["repair_attempts"])} repairs`
+            : null,
+        ]),
+        quote: payloadString(event.payload, ["quote"]),
+      });
+    }
+
+    if (
+      [
+        "source.selection.finalized",
+        "source.cache.hit",
+        "source.fetch_failed",
+        "source.fallback_document.created",
+        "source.skipped",
+        "source.fetched",
+        "claim.repair.source_fetched",
+      ].includes(event.event_type)
+    ) {
+      const selected = payloadRecordList(event.payload, "selected");
+      if (event.event_type === "source.selection.finalized" && selected.length) {
+        selected.forEach((record, index) => {
+          const selectedUrl = payloadString(record, ["url"]);
+          traces.set(`selected:${event.id}:${index}`, {
+            id: `selected:${event.id}:${index}`,
+            kind: "read",
+            title: payloadString(record, ["title", "url"]) ?? "Selected source",
+            status: "queued",
+            sourceLabel: formatCitationHost(selectedUrl) ?? payloadString(record, ["provider"]) ?? "Selected",
+            url: selectedUrl,
+            timestamp: event.created_at,
+            meta: compactMeta([
+              eventStreamName(event),
+              payloadString(record, ["provider"]),
+              payloadNumber(record, ["query_order"]) != null
+                ? `query ${payloadNumber(record, ["query_order"])}`
+                : null,
+            ]),
+            quote: null,
+          });
+        });
+        continue;
+      }
+      traces.set(`source-event:${event.id}`, {
+        id: `source-event:${event.id}`,
+        kind: "read",
+        title: payloadString(event.payload, ["title", "url", "source_id"]) ?? displayEventType(event.event_type),
+        status: statusFromEventType(event.event_type),
+        sourceLabel:
+          formatCitationHost(url) ??
+          payloadString(event.payload, ["provider", "search_provider", "source_id"]) ??
+          "Source",
+        url,
+        timestamp: event.created_at,
+        meta: compactMeta([
+          eventStreamName(event),
+          payloadString(event.payload, ["provider", "search_provider"]),
+          payloadString(event.payload, ["trust_tier"]),
+          payloadString(event.payload, ["reason", "discovered_via"]),
+        ]),
+        quote: payloadString(event.payload, ["error"]),
+      });
+    }
+  }
+
+  return Array.from(traces.values()).sort((first, second) => {
+    const firstTime = first.timestamp ? new Date(first.timestamp).getTime() : 0;
+    const secondTime = second.timestamp ? new Date(second.timestamp).getTime() : 0;
+    return secondTime - firstTime;
+  });
+}
+
 function getMarkdownTitle(content: string, fallback: string): string {
   const match = content.match(/^#\s+(.+?)\s*$/m);
   return normalizeInlineText(match?.[1] ?? fallback);
@@ -422,7 +1486,7 @@ function CitationCluster({
   numbers: number[];
   lookup: CitationLookup;
 }) {
-  const clusterRef = useRef<HTMLSpanElement | null>(null);
+  const clusterRef = useRef<HTMLButtonElement | null>(null);
   const popoverRef = useRef<HTMLDivElement | null>(null);
   const closeTimerRef = useRef<number | null>(null);
   const [open, setOpen] = useState(false);
@@ -537,7 +1601,9 @@ function CitationCluster({
       : null;
 
   return (
-    <span
+    <button
+      aria-expanded={open}
+      aria-label={`Show sources ${label}`}
       className="citation-cluster"
       onBlur={scheduleClose}
       onClick={openPopover}
@@ -554,12 +1620,11 @@ function CitationCluster({
       onMouseEnter={openPopover}
       onMouseLeave={scheduleClose}
       ref={clusterRef}
-      role="button"
-      tabIndex={0}
+      type="button"
     >
       <span className="citation-cluster-label">{label}</span>
       {popover}
-    </span>
+    </button>
   );
 }
 
@@ -739,6 +1804,8 @@ function groupBySection<T extends { section_title: string }>(entries: T[]): Arra
 
 interface RunWorkspaceProps {
   workspace: RunWorkspaceSnapshot | undefined;
+  isLoading?: boolean;
+  errorMessage?: string | null;
   rawEvents: RunEvent[];
   conversationMessages: RunConversationMessage[];
   connectionState: StreamConnectionState;
@@ -763,6 +1830,8 @@ interface RunWorkspaceProps {
 
 export function RunWorkspace({
   workspace,
+  isLoading = false,
+  errorMessage = null,
   rawEvents,
   conversationMessages,
   connectionState,
@@ -783,6 +1852,8 @@ export function RunWorkspace({
   const [focusedPhase, setFocusedPhase] = useState<WorkspacePhaseKey | null>(null);
   const [selectedStreamId, setSelectedStreamId] = useState<string>("all");
   const [thinkingSubtab, setThinkingSubtab] = useState<ThinkingSubtab>("decisions");
+  const [citationTraceFilter, setCitationTraceFilter] =
+    useState<CitationTraceFilter>("referenced");
   const [selectedSourceId, setSelectedSourceId] = useState<string | null>(null);
   const [selectedSectionId, setSelectedSectionId] = useState<string | null>(null);
   const [selectedCitationId, setSelectedCitationId] = useState<string | null>(null);
@@ -818,11 +1889,12 @@ export function RunWorkspace({
     if (!workspace) return;
     setDetailsTab("overview");
     setPrimaryView("chat");
-    setReportPanelTab("report");
+    setReportPanelTab(workspace.final_report_markdown ? "report" : "tasks");
     setDetailsOpen(false);
     setFocusedPhase(null);
     setSelectedStreamId("all");
     setThinkingSubtab("decisions");
+    setCitationTraceFilter("referenced");
     setReportActionNotice(null);
   }, [workspace?.run_id]);
 
@@ -1018,6 +2090,99 @@ export function RunWorkspace({
       ["Removed in Audit", workspace.sources.filter((source) => source.state === "removed")],
     ] as const;
   }, [workspace]);
+
+  const liveTasks = useMemo(
+    () => (workspace ? buildLiveTasks(workspace, rawEvents) : []),
+    [rawEvents, workspace],
+  );
+
+  const liveToolTraces = useMemo(
+    () => buildLiveToolTraces(phaseFilteredEvents),
+    [phaseFilteredEvents],
+  );
+
+  const liveAgents = useMemo(
+    () => (workspace ? buildLiveAgents(workspace, rawEvents) : []),
+    [rawEvents, workspace],
+  );
+
+  const liveFiles = useMemo(
+    () => (workspace ? buildLiveFiles(workspace, rawEvents) : []),
+    [rawEvents, workspace],
+  );
+
+  const liveCitationTraces = useMemo(
+    () => (workspace ? buildLiveCitationTraces(workspace, rawEvents) : []),
+    [rawEvents, workspace],
+  );
+
+  const liveStreamFilters = useMemo(() => {
+    const filters = new Map<string, { id: string; name: string; count: number }>();
+    for (const stream of workspace?.streams ?? []) {
+      filters.set(stream.id, { id: stream.id, name: stream.name, count: 0 });
+    }
+    for (const task of liveTasks) {
+      const id = task.streamId ?? task.streamName;
+      const name = task.streamName;
+      const existing = filters.get(id) ?? { id, name, count: 0 };
+      existing.count += 1;
+      filters.set(id, existing);
+    }
+    return Array.from(filters.values());
+  }, [liveTasks, workspace?.streams]);
+
+  const visibleLiveTasks = useMemo(() => {
+    if (selectedStreamId === "all") return liveTasks;
+    return liveTasks.filter(
+      (task) => task.streamId === selectedStreamId || task.streamName === selectedStreamId,
+    );
+  }, [liveTasks, selectedStreamId]);
+
+  const liveTaskSummary = useMemo(() => {
+    const completed = liveTasks.filter((task) => task.status === "completed").length;
+    const running = liveTasks.filter((task) => task.status === "running").length;
+    const failed = liveTasks.filter((task) => task.status === "failed").length;
+    const total = liveTasks.length;
+    const progress = total ? Math.round((completed / total) * 100) : 0;
+    return { completed, failed, progress, running, total };
+  }, [liveTasks]);
+
+  const visibleLiveCitationTraces = useMemo(
+    () => liveCitationTraces.filter((trace) => trace.kind === citationTraceFilter),
+    [citationTraceFilter, liveCitationTraces],
+  );
+
+  if (!workspace && isLoading) {
+    return (
+      <section className="panel workspace-panel workspace-loading-panel" aria-busy="true">
+        <div className="workspace-loading-grid">
+          <div className="workspace-loading-main">
+            <span className="skeleton skeleton-kicker" />
+            <span className="skeleton skeleton-title" />
+            <span className="skeleton skeleton-line" />
+            <span className="skeleton skeleton-line short" />
+          </div>
+          <div className="workspace-loading-side">
+            {Array.from({ length: 5 }).map((_, index) => (
+              <span className="skeleton skeleton-card" key={index} />
+            ))}
+          </div>
+        </div>
+      </section>
+    );
+  }
+
+  if (!workspace && errorMessage) {
+    return (
+      <section className="panel workspace-panel workspace-empty-panel">
+        <div className="workspace-empty">
+          <p className="eyebrow">Workspace</p>
+          <h2 className="workspace-empty-title">Run unavailable</h2>
+          <p className="workspace-empty-copy">{errorMessage}</p>
+        </div>
+      </section>
+    );
+  }
 
   if (!workspace) {
     return (
@@ -1246,6 +2411,12 @@ export function RunWorkspace({
 
     if (reportPanelTab === "plan") {
       const streams = workspace.plan.plan_preview?.plan.streams ?? workspace.plan.approved_plan?.streams ?? [];
+      const planningEvents = rawEvents.filter(
+        (event) =>
+          event.event_type.startsWith("planning.") ||
+          event.event_type.startsWith("plan.") ||
+          event.event_type.startsWith("clarification."),
+      );
       return (
         <div className="workspace-report-detail">
           <header className="workspace-report-detail-header">
@@ -1309,6 +2480,46 @@ export function RunWorkspace({
               </div>
               <p className="muted-text">{workspace.plan.budget_decision_reason ?? "No explicit budget clamp reason."}</p>
             </article>
+          </section>
+          <section className="workspace-report-detail-section">
+            <div className="workspace-report-section-head">
+              <h2>Planning Trace</h2>
+              <span>{planningEvents.length}</span>
+            </div>
+            <div className="workspace-report-row-list">
+              {planningEvents
+                .slice()
+                .reverse()
+                .slice(0, 12)
+                .map((event) => (
+                  <article
+                    className={`workspace-report-row ${statusClassName(statusFromEventType(event.event_type))}`}
+                    key={event.id}
+                  >
+                    <div className="workspace-live-card-head">
+                      <div>
+                        <strong>{displayEventType(event.event_type)}</strong>
+                        <span>{formatTime(event.created_at)}</span>
+                      </div>
+                      <em>{statusFromEventType(event.event_type)}</em>
+                    </div>
+                    <details className="workspace-live-disclosure">
+                      <summary>Details</summary>
+                      <p>
+                        {payloadString(event.payload, ["summary", "rationale", "query", "note"]) ??
+                          "Planning event payload"}
+                      </p>
+                      <pre>{JSON.stringify(event.payload, null, 2)}</pre>
+                    </details>
+                  </article>
+                ))}
+              {planningEvents.length === 0 ? (
+                <article className="workspace-report-row">
+                  <strong>No planning events yet</strong>
+                  <span>Plan preview, validation, discovery, and approval events will appear here.</span>
+                </article>
+              ) : null}
+            </div>
           </section>
           <section className="workspace-report-detail-section">
             <div className="workspace-report-section-head">
@@ -1395,8 +2606,40 @@ export function RunWorkspace({
           <header className="workspace-report-detail-header">
             <span>Tasks</span>
             <h1>Execution Board</h1>
-            <p>{workspace.streams.length} streams, {workspace.streams.reduce((total, stream) => total + stream.tasks.length, 0)} task records.</p>
+            <p>
+              {liveTaskSummary.running} running, {liveTaskSummary.completed} complete,{" "}
+              {liveTaskSummary.failed} blocked across {liveTaskSummary.total} live task records.
+            </p>
           </header>
+          <section className="workspace-live-summary">
+            <div className="workspace-live-progress-head">
+              <strong>{liveTaskSummary.progress}% complete</strong>
+              <span>
+                {liveTaskSummary.completed}/{liveTaskSummary.total || 0} tasks
+              </span>
+            </div>
+            <div className="workspace-live-progress-track" aria-hidden>
+              <span style={{ width: `${liveTaskSummary.progress}%` }} />
+            </div>
+            <div className="workspace-live-summary-grid">
+              <article>
+                <strong>{liveTaskSummary.running}</strong>
+                <span>Running</span>
+              </article>
+              <article>
+                <strong>{liveTaskSummary.completed}</strong>
+                <span>Complete</span>
+              </article>
+              <article>
+                <strong>{liveTaskSummary.failed}</strong>
+                <span>Blocked</span>
+              </article>
+              <article>
+                <strong>{workspace.connection.event_count}</strong>
+                <span>Events</span>
+              </article>
+            </div>
+          </section>
           <section className="workspace-report-detail-section">
             <div className="workspace-report-section-head">
               <h2>Streams</h2>
@@ -1410,7 +2653,7 @@ export function RunWorkspace({
               >
                 All streams
               </button>
-              {workspace.streams.map((stream) => (
+              {liveStreamFilters.map((stream) => (
                 <button
                   className={`workspace-report-filter ${selectedStreamId === stream.id ? "active" : ""}`}
                   key={stream.id}
@@ -1421,27 +2664,16 @@ export function RunWorkspace({
                 </button>
               ))}
             </div>
-            <div className="workspace-report-stream-grid">
-              {visibleStreams.map((stream) => (
-                <article className="workspace-report-stream-card" key={stream.id}>
-                  <div className="workspace-report-stream-head">
-                    <strong>{stream.name}</strong>
-                    <span>{stream.status}</span>
-                    <small>{stream.query_count} queries · {stream.selected_source_count} sources · {stream.note_count} notes</small>
-                  </div>
-                  <div className="workspace-report-row-list">
-                    {stream.tasks.map((task) => (
-                      <TaskCard key={task.id} task={task} />
-                    ))}
-                    {stream.tasks.length === 0 ? (
-                      <article className="workspace-report-row">
-                        <strong>No task records</strong>
-                        <span>This stream has not emitted task records yet.</span>
-                      </article>
-                    ) : null}
-                  </div>
-                </article>
+            <div className="workspace-live-task-grid">
+              {visibleLiveTasks.map((task) => (
+                <LiveTaskCard key={task.id} task={task} />
               ))}
+              {visibleLiveTasks.length === 0 ? (
+                <article className="workspace-report-row">
+                  <strong>No live tasks yet</strong>
+                  <span>Stream and task events will appear here as soon as the backend emits them.</span>
+                </article>
+              ) : null}
             </div>
           </section>
         </div>
@@ -1454,7 +2686,10 @@ export function RunWorkspace({
           <header className="workspace-report-detail-header">
             <span>Thinking</span>
             <h1>Structured Reasoning</h1>
-            <p>Decision records, stream agents, tool events, and file context used during this run.</p>
+            <p>
+              {liveAgents.length} agents, {liveToolTraces.length} tool traces,{" "}
+              {liveFiles.length} context files and packs captured during this run.
+            </p>
           </header>
           <section className="workspace-report-detail-section">
             <div className="workspace-report-section-head">
@@ -1479,48 +2714,44 @@ export function RunWorkspace({
                   ))
                 : null}
               {thinkingSubtab === "tools"
-                ? phaseFilteredEvents
-                    .filter((event) =>
-                      [
-                        "search.performed",
-                        "source.cache.hit",
-                        "source.fetch_failed",
-                        "source.fallback_document.created",
-                        "source.fetched",
-                        "provider.retry",
-                        "tool.budget.low",
-                        "claim.repair.search_performed",
-                        "claim.repair.source_fetched",
-                      ].includes(event.event_type),
-                    )
-                    .slice()
-                    .reverse()
-                    .map((event) => (
-                      <article className="workspace-report-row" key={event.id}>
-                        <strong>{event.event_type}</strong>
-                        <span>{normalizeInlineText(JSON.stringify(event.payload))}</span>
-                        <small>{formatTime(event.created_at)}</small>
-                      </article>
-                    ))
+                ? liveToolTraces.map((trace) => (
+                    <LiveToolTraceCard key={trace.id} trace={trace} />
+                  ))
                 : null}
               {thinkingSubtab === "agents"
-                ? workspace.streams.map((stream) => (
-                    <article className="workspace-report-row" key={stream.id}>
-                      <strong>{stream.name}</strong>
-                      <span>{stream.model}</span>
-                      <small>{stream.objective}</small>
-                    </article>
+                ? liveAgents.map((agent) => (
+                    <LiveAgentCard agent={agent} key={agent.id} />
                   ))
                 : null}
               {thinkingSubtab === "files"
-                ? workspace.project_assets_available.concat(workspace.run_assets_available).map((asset) => (
-                    <article className="workspace-report-row" key={asset.id}>
-                      <strong>{asset.label}</strong>
-                      <span>{asset.usage.replaceAll("_", " ")}</span>
-                      <small>{asset.preview_excerpt ?? asset.processing_error ?? "No asset preview."}</small>
-                    </article>
+                ? liveFiles.map((file) => (
+                    <LiveFileCard file={file} key={file.id} />
                   ))
                 : null}
+              {thinkingSubtab === "decisions" && visibleDecisions.length === 0 ? (
+                <article className="workspace-report-row">
+                  <strong>No decision records yet</strong>
+                  <span>Planner and verifier decisions will appear after they are written to the workspace.</span>
+                </article>
+              ) : null}
+              {thinkingSubtab === "tools" && liveToolTraces.length === 0 ? (
+                <article className="workspace-report-row">
+                  <strong>No tool traces yet</strong>
+                  <span>Provider calls, searches, source fetches, reranks, repairs, and DeepAgents tool calls stream here.</span>
+                </article>
+              ) : null}
+              {thinkingSubtab === "agents" && liveAgents.length === 0 ? (
+                <article className="workspace-report-row">
+                  <strong>No agent activity yet</strong>
+                  <span>Planner, stream worker, verifier, writer, and DeepAgents roles will appear as the run starts.</span>
+                </article>
+              ) : null}
+              {thinkingSubtab === "files" && liveFiles.length === 0 ? (
+                <article className="workspace-report-row">
+                  <strong>No file context yet</strong>
+                  <span>Uploaded assets, context packs, and dropped fragments will appear here.</span>
+                </article>
+              ) : null}
             </div>
           </section>
         </div>
@@ -1605,57 +2836,59 @@ export function RunWorkspace({
     }
 
     if (reportPanelTab === "citations") {
+      const referencedCount = liveCitationTraces.filter((trace) => trace.kind === "referenced").length;
+      const readCount = liveCitationTraces.filter((trace) => trace.kind === "read").length;
       return (
         <div className="workspace-report-detail">
           <header className="workspace-report-detail-header">
             <span>Citations</span>
             <h1>Citation Audit</h1>
-            <p>{citationSummary.surviving} surviving citations, {citationSummary.removed} removed, {citationSummary.uncitedSources} uncited sources.</p>
+            <p>
+              {referencedCount} referenced claim traces and {readCount} read source traces, with{" "}
+              {citationSummary.removed} removed during audit.
+            </p>
           </header>
           <section className="workspace-report-detail-grid citations">
             <article className="workspace-report-detail-section">
               <div className="workspace-report-section-head">
-                <h2>By Section</h2>
+                <h2>{citationTraceFilter === "referenced" ? "Referenced" : "Read"}</h2>
+                <span>{visibleLiveCitationTraces.length}</span>
+              </div>
+              <div className="workspace-report-filter-row">
+                <button
+                  className={`workspace-report-filter ${citationTraceFilter === "referenced" ? "active" : ""}`}
+                  onClick={() => setCitationTraceFilter("referenced")}
+                  type="button"
+                >
+                  Referenced
+                </button>
+                <button
+                  className={`workspace-report-filter ${citationTraceFilter === "read" ? "active" : ""}`}
+                  onClick={() => setCitationTraceFilter("read")}
+                  type="button"
+                >
+                  Read
+                </button>
               </div>
               <div className="workspace-report-row-list">
-                {groupBySection(workspace.citations).map(([sectionTitle, sectionCitations]) => (
-                  <article className="workspace-report-citation-group" key={sectionTitle}>
-                    <div className="workspace-report-group-head">
-                      <strong>{sectionTitle}</strong>
-                      <span>{sectionCitations.length}</span>
-                    </div>
-                    {sectionCitations.map((citation) => (
-                      <CitationCard
-                        citation={citation}
-                        key={citation.id}
-                        sources={workspace.sources}
-                        selected={selectedCitation?.id === citation.id}
-                        onSelect={() => setSelectedCitationId(citation.id)}
-                        onOpenSection={() => {
-                          const target = workspace.report_sections.find(
-                            (section) => section.title === citation.section_title,
-                          );
-                          if (target) {
-                            setSelectedSectionId(target.id);
-                            setReportPanelTab("report");
-                          }
-                        }}
-                        onOpenSource={() => {
-                          const target = resolveCitationSource(citation, workspace.sources);
-                          if (target) {
-                            setSelectedSourceId(target.id);
-                            setReportPanelTab("sources");
-                          }
-                        }}
-                      />
-                    ))}
-                  </article>
+                {visibleLiveCitationTraces.map((trace) => (
+                  <LiveCitationTraceCard key={trace.id} trace={trace} />
                 ))}
+                {visibleLiveCitationTraces.length === 0 ? (
+                  <article className="workspace-report-row">
+                    <strong>No {citationTraceFilter} traces yet</strong>
+                    <span>
+                      {citationTraceFilter === "referenced"
+                        ? "Citation verification and final report references will stream here."
+                        : "Fetched, cached, skipped, and selected source records will stream here."}
+                    </span>
+                  </article>
+                ) : null}
               </div>
             </article>
             <aside className="workspace-report-detail-section sticky">
               <div className="workspace-report-section-head">
-                <h2>Citation Detail</h2>
+                <h2>Final Audit Detail</h2>
               </div>
               {selectedCitation ? (
                 <div className="workspace-report-row-list">
@@ -1696,8 +2929,8 @@ export function RunWorkspace({
       <div className="workspace-report-detail">
         <header className="workspace-report-detail-header">
           <span>Tool calls</span>
-          <h1>Raw Event Stream</h1>
-          <p>Replay and transport events captured for this run.</p>
+          <h1>Realtime Trace</h1>
+          <p>Structured provider calls, searches, source reads, grounding checks, and backend trace payloads captured for this run.</p>
         </header>
         <section className="workspace-report-detail-grid two">
           <article className="workspace-report-detail-section">
@@ -1725,14 +2958,19 @@ export function RunWorkspace({
           </article>
           <article className="workspace-report-detail-section">
             <div className="workspace-report-section-head">
-              <h2>Events</h2>
-              <span>{phaseFilteredEvents.length}</span>
+              <h2>Tool And Trace Events</h2>
+              <span>{liveToolTraces.length}</span>
             </div>
             <div className="workspace-report-event-list">
-              {phaseFilteredEvents
-                .slice()
-                .reverse()
-                .map((event) => <EventCard event={event} key={`${event.run_id}-${event.id}`} />)}
+              {liveToolTraces.map((trace) => (
+                <LiveToolTraceCard key={trace.id} trace={trace} />
+              ))}
+              {liveToolTraces.length === 0 ? (
+                <article className="workspace-report-row">
+                  <strong>No trace events yet</strong>
+                  <span>Backend tool events will appear here once execution starts.</span>
+                </article>
+              ) : null}
             </div>
           </article>
         </section>
@@ -1863,6 +3101,7 @@ export function RunWorkspace({
                     </div>
                     <div className="workspace-form">
                       <textarea
+                        aria-label="Plan approval note"
                         className="textarea-input"
                         value={approvalNote}
                         onChange={(event) => setApprovalNote(event.target.value)}
@@ -1923,6 +3162,7 @@ export function RunWorkspace({
                     </div>
                     <div className="workspace-form">
                       <textarea
+                        aria-label="Clarification response"
                         className="textarea-input"
                         value={clarificationDraft}
                         onChange={(event) => setClarificationDraft(event.target.value)}
@@ -2094,20 +3334,20 @@ export function RunWorkspace({
         <button
           className="workspace-research-edge-tab"
           onClick={() => {
-            setPrimaryView("chat");
-            setDetailsOpen(true);
+            setDetailsOpen(false);
+            setReportPanelTab(reportReady ? "report" : "tasks");
+            setPrimaryView("report");
           }}
           type="button"
         >
           Show Research
         </button>
 
-        {reportReady ? (
-          <aside
-            aria-hidden={primaryView !== "report"}
-            aria-label="Final report"
-            className="workspace-report-panel"
-          >
+        <aside
+          aria-hidden={primaryView !== "report"}
+          aria-label="Research report and activity"
+          className="workspace-report-panel"
+        >
             <div
               aria-label="Resize report panel"
               aria-orientation="vertical"
@@ -2122,9 +3362,10 @@ export function RunWorkspace({
               title="Drag to resize report"
             />
             <div className="workspace-report-panel-topbar">
-              <div className="workspace-report-panel-tabs">
+              <div className="workspace-report-panel-tabs" role="tablist" aria-label="Report views">
                 {REPORT_PANEL_TABS.map((tab) => (
                   <button
+                    aria-selected={reportPanelTab === tab.key}
                     className={`workspace-report-panel-tab ${
                       reportPanelTab === tab.key ? "active" : ""
                     }`}
@@ -2136,6 +3377,7 @@ export function RunWorkspace({
                         setDetailsTab(tab.key);
                       }
                     }}
+                    role="tab"
                     tabIndex={primaryView === "report" ? 0 : -1}
                     type="button"
                   >
@@ -2176,26 +3418,27 @@ export function RunWorkspace({
             </article>
             {reportPanelTab === "report" ? (
               <div className="workspace-report-footer-actions">
-              <button
-                className="ghost-button"
-                onClick={handleDownloadReport}
-                tabIndex={primaryView === "report" ? 0 : -1}
-                type="button"
-              >
-                Markdown
-              </button>
-              <button
-                className="ghost-button"
-                onClick={handleCopyReport}
-                tabIndex={primaryView === "report" ? 0 : -1}
-                type="button"
-              >
-                Copy Memo
-              </button>
+                <button
+                  className="ghost-button"
+                  disabled={!reportMarkdown}
+                  onClick={handleDownloadReport}
+                  tabIndex={primaryView === "report" ? 0 : -1}
+                  type="button"
+                >
+                  Markdown
+                </button>
+                <button
+                  className="ghost-button"
+                  disabled={!reportMarkdown}
+                  onClick={handleCopyReport}
+                  tabIndex={primaryView === "report" ? 0 : -1}
+                  type="button"
+                >
+                  Copy Memo
+                </button>
               </div>
             ) : null}
           </aside>
-        ) : null}
 
         {detailsOpen ? (
           <aside className="workspace-details-panel" aria-label="Research Activity">
@@ -2255,7 +3498,7 @@ export function RunWorkspace({
                 ))}
               </div>
 
-              <div className="workspace-tabs">
+              <div className="workspace-tabs" role="tablist" aria-label="Research activity views">
                 {(
                   [
                     "overview",
@@ -2268,9 +3511,11 @@ export function RunWorkspace({
                   ] as WorkspaceDetailsTab[]
                 ).map((tab) => (
                   <button
+                    aria-selected={detailsTab === tab}
                     className={`workspace-tab ${detailsTab === tab ? "active" : ""}`}
                     key={tab}
                     onClick={() => setDetailsTab(tab)}
+                    role="tab"
                     type="button"
                   >
                     {DETAIL_TAB_LABELS[tab]}
@@ -2589,9 +3834,9 @@ export function RunWorkspace({
               type="button"
             >
               <span>All streams</span>
-              <strong>{workspace.streams.length}</strong>
+              <strong>{liveTasks.length}</strong>
             </button>
-            {workspace.streams.map((stream) => (
+            {liveStreamFilters.map((stream) => (
               <button
                 className={`ops-rail-button ${selectedStreamId === stream.id ? "active" : ""}`}
                 key={stream.id}
@@ -2600,33 +3845,24 @@ export function RunWorkspace({
               >
                 <div>
                   <span>{stream.name}</span>
-                  <small>{stream.status}</small>
+                  <small>{stream.count} tasks</small>
                 </div>
-                <strong>{stream.tasks.length}</strong>
+                <strong>{stream.count}</strong>
               </button>
             ))}
           </aside>
           <section className="workspace-card">
             <div className="workspace-card-header">
-              <h3>Stream execution board</h3>
+              <h3>Live execution board</h3>
               {focusedPhase ? <span className="pill muted">{titleCase(focusedPhase)}</span> : null}
             </div>
-            <div className="workspace-stream-board">
-              {visibleStreams.map((stream) => (
-                <article className="stream-board-column" key={stream.id}>
-                  <div className="stream-board-header">
-                    <strong>{stream.name}</strong>
-                    <span>{stream.status}</span>
-                    <small>{stream.query_count} queries · {stream.selected_source_count} sources · {stream.note_count} notes</small>
-                  </div>
-                  <div className="stream-board-stack">
-                    {stream.tasks.map((task) => (
-                      <TaskCard key={task.id} task={task} />
-                    ))}
-                    {stream.tasks.length === 0 ? <span className="muted-text">No task records for this stream yet.</span> : null}
-                  </div>
-                </article>
+            <div className="workspace-live-task-grid">
+              {visibleLiveTasks.map((task) => (
+                <LiveTaskCard key={task.id} task={task} />
               ))}
+              {visibleLiveTasks.length === 0 ? (
+                <span className="muted-text">No live task records for this stream yet.</span>
+              ) : null}
             </div>
           </section>
         </div>
@@ -2658,48 +3894,30 @@ export function RunWorkspace({
               </div>
             ) : thinkingSubtab === "tools" ? (
               <div className="workspace-list">
-                {phaseFilteredEvents
-                  .filter((event) =>
-                    [
-                      "search.performed",
-                      "source.cache.hit",
-                      "source.fetch_failed",
-                      "source.fallback_document.created",
-                      "source.fetched",
-                      "provider.retry",
-                      "tool.budget.low",
-                      "claim.repair.search_performed",
-                      "claim.repair.source_fetched",
-                    ].includes(event.event_type),
-                  )
-                  .slice()
-                  .reverse()
-                  .map((event) => (
-                    <article className="workspace-inline-card" key={event.id}>
-                      <strong>{event.event_type}</strong>
-                      <span>{normalizeInlineText(JSON.stringify(event.payload))}</span>
-                    </article>
-                  ))}
+                {liveToolTraces.map((trace) => (
+                  <LiveToolTraceCard key={trace.id} trace={trace} />
+                ))}
+                {liveToolTraces.length === 0 ? (
+                  <span className="muted-text">No tool traces emitted yet.</span>
+                ) : null}
               </div>
             ) : thinkingSubtab === "agents" ? (
               <div className="workspace-list">
-                {workspace.streams.map((stream) => (
-                  <article className="workspace-inline-card" key={stream.id}>
-                    <strong>{stream.name}</strong>
-                    <span>{stream.model}</span>
-                    <small>{stream.objective}</small>
-                  </article>
+                {liveAgents.map((agent) => (
+                  <LiveAgentCard agent={agent} key={agent.id} />
                 ))}
+                {liveAgents.length === 0 ? (
+                  <span className="muted-text">No agent traces emitted yet.</span>
+                ) : null}
               </div>
             ) : (
               <div className="workspace-list">
-                {workspace.project_assets_available.concat(workspace.run_assets_available).map((asset) => (
-                  <article className="workspace-inline-card" key={asset.id}>
-                    <strong>{asset.label}</strong>
-                    <span>{asset.usage.replaceAll("_", " ")}</span>
-                    <small>{asset.preview_excerpt ?? asset.processing_error ?? "No asset preview."}</small>
-                  </article>
+                {liveFiles.map((file) => (
+                  <LiveFileCard file={file} key={file.id} />
                 ))}
+                {liveFiles.length === 0 ? (
+                  <span className="muted-text">No file context traces emitted yet.</span>
+                ) : null}
               </div>
             )}
           </section>
@@ -2966,6 +4184,192 @@ export function RunWorkspace({
         ) : null}
       </div>
     </section>
+  );
+}
+
+function LiveTaskCard({ task }: { task: LiveTaskView }) {
+  const hasDetails =
+    Boolean(task.objective) ||
+    task.latestSources.length > 0 ||
+    Boolean(task.latestNoteSummary) ||
+    Boolean(task.blockerReason) ||
+    Boolean(task.lastEventType);
+
+  return (
+    <article className={`workspace-live-task-card ${statusClassName(task.status)}`}>
+      <div className="workspace-live-card-head">
+        <div>
+          <strong>{task.streamName}</strong>
+          <span>{task.model ?? "Research worker"}</span>
+        </div>
+        <em>{task.status}</em>
+      </div>
+      <div className="workspace-live-metrics">
+        <span>{task.queryCount} queries</span>
+        <span>{task.selectedSourceCount || task.sourceCount} sources</span>
+        <span>{task.noteCount} notes</span>
+        {task.updatedAt ? <span>{formatTime(task.updatedAt)}</span> : null}
+      </div>
+      {hasDetails ? (
+        <details className="workspace-live-disclosure">
+          <summary>Details</summary>
+          {task.objective ? <p>{task.objective}</p> : null}
+          {task.latestSources.length ? (
+            <div className="workspace-live-source-strip">
+              {task.latestSources.map((source) => (
+                <span key={`${task.id}-${source}`}>{source}</span>
+              ))}
+            </div>
+          ) : null}
+          {task.latestNoteSummary ? <small>{task.latestNoteSummary}</small> : null}
+          {task.blockerReason ? <small className="danger-text">{task.blockerReason}</small> : null}
+          {task.lastEventType ? <small>Latest event: {task.lastEventType}</small> : null}
+        </details>
+      ) : null}
+    </article>
+  );
+}
+
+function LiveAgentCard({ agent }: { agent: LiveAgentTrace }) {
+  return (
+    <article className={`workspace-live-agent-card ${statusClassName(agent.status)}`}>
+      <div className="workspace-live-card-head">
+        <div>
+          <strong>{agent.name}</strong>
+          <span>{agent.role}</span>
+        </div>
+        <em>{agent.status}</em>
+      </div>
+      {agent.meta.length ? (
+        <div className="workspace-live-metrics">
+          {agent.meta.slice(0, 3).map((item) => (
+            <span key={`${agent.id}-${item}`}>{item}</span>
+          ))}
+        </div>
+      ) : null}
+      <details className="workspace-live-disclosure">
+        <summary>{agent.updatedAt ? formatTime(agent.updatedAt) : "Details"}</summary>
+        <p>{agent.summary}</p>
+        {agent.meta.length > 3 ? (
+          <div className="workspace-live-metrics">
+            {agent.meta.slice(3).map((item) => (
+              <span key={`${agent.id}-detail-${item}`}>{item}</span>
+            ))}
+          </div>
+        ) : null}
+      </details>
+    </article>
+  );
+}
+
+function LiveToolTraceCard({ trace }: { trace: LiveToolTrace }) {
+  return (
+    <article className={`workspace-live-trace-card ${statusClassName(trace.status)}`}>
+      <div className="workspace-live-card-head">
+        <div>
+          <strong>{trace.title}</strong>
+          <span>{trace.streamName ?? trace.streamId ?? "Run trace"}</span>
+        </div>
+        <em>{trace.status}</em>
+      </div>
+      {trace.meta.length ? (
+        <div className="workspace-live-metrics">
+          {trace.meta.slice(0, 3).map((item) => (
+            <span key={`${trace.id}-${item}`}>{item}</span>
+          ))}
+        </div>
+      ) : null}
+      <details className="workspace-live-disclosure">
+        <summary>{formatTime(trace.timestamp)}</summary>
+        <p>{trace.summary}</p>
+        {trace.detail ? <small className="danger-text">{trace.detail}</small> : null}
+        {trace.meta.length > 3 ? (
+          <div className="workspace-live-metrics">
+            {trace.meta.slice(3).map((item) => (
+              <span key={`${trace.id}-detail-${item}`}>{item}</span>
+            ))}
+          </div>
+        ) : null}
+        <pre>{JSON.stringify(trace.rawEvent.payload, null, 2)}</pre>
+      </details>
+    </article>
+  );
+}
+
+function LiveFileCard({ file }: { file: LiveFileTrace }) {
+  return (
+    <article className={`workspace-live-trace-card ${statusClassName(file.status)}`}>
+      <div className="workspace-live-card-head">
+        <div>
+          <strong>{file.title}</strong>
+          <span>{file.timestamp ? formatTime(file.timestamp) : "Available context"}</span>
+        </div>
+        <em>{file.status}</em>
+      </div>
+      {file.meta.length ? (
+        <div className="workspace-live-metrics">
+          {file.meta.slice(0, 3).map((item) => (
+            <span key={`${file.id}-${item}`}>{item}</span>
+          ))}
+        </div>
+      ) : null}
+      <details className="workspace-live-disclosure">
+        <summary>Details</summary>
+        <p>{file.summary}</p>
+        {file.meta.length > 3 ? (
+          <div className="workspace-live-metrics">
+            {file.meta.slice(3).map((item) => (
+              <span key={`${file.id}-detail-${item}`}>{item}</span>
+            ))}
+          </div>
+        ) : null}
+      </details>
+    </article>
+  );
+}
+
+function LiveCitationTraceCard({ trace }: { trace: LiveCitationTrace }) {
+  const host = trace.url ? formatCitationHost(trace.url) : null;
+  const hasDetails = Boolean(trace.quote) || trace.meta.length > 3;
+
+  return (
+    <article className={`workspace-live-citation-card ${statusClassName(trace.status)}`}>
+      <div className="workspace-live-card-head">
+        <div>
+          <strong>{trace.title}</strong>
+          <span>{trace.sourceLabel}</span>
+        </div>
+        <em>{trace.status}</em>
+      </div>
+      {trace.meta.length ? (
+        <div className="workspace-live-metrics">
+          {trace.meta.slice(0, 3).map((item) => (
+            <span key={`${trace.id}-${item}`}>{item}</span>
+          ))}
+        </div>
+      ) : null}
+      <div className="workspace-live-card-foot">
+        {trace.timestamp ? <span>{formatTime(trace.timestamp)}</span> : <span>Workspace snapshot</span>}
+        {trace.url ? (
+          <a href={trace.url} rel="noreferrer" target="_blank">
+            {host ?? "Open source"}
+          </a>
+        ) : null}
+      </div>
+      {hasDetails ? (
+        <details className="workspace-live-disclosure">
+          <summary>Details</summary>
+          {trace.quote ? <blockquote className="citation-quote">{normalizeInlineText(trace.quote)}</blockquote> : null}
+          {trace.meta.length > 3 ? (
+            <div className="workspace-live-metrics">
+              {trace.meta.slice(3).map((item) => (
+                <span key={`${trace.id}-detail-${item}`}>{item}</span>
+              ))}
+            </div>
+          ) : null}
+        </details>
+      ) : null}
+    </article>
   );
 }
 

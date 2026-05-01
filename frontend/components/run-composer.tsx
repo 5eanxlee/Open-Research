@@ -330,6 +330,16 @@ const assetUsageOptions: ReadonlyArray<CustomSelectOption> = [
   },
 ];
 
+function uniqueModelOptions(values: Array<string | null | undefined>): string[] {
+  return Array.from(
+    new Set(
+      values
+        .map((value) => value?.trim())
+        .filter((value): value is string => Boolean(value)),
+    ),
+  );
+}
+
 function resolveEffectiveModels(
   publicConfig: PublicRuntimeConfig | undefined,
   override: ModelConfigOverride,
@@ -366,7 +376,11 @@ function summarizeAssetWarnings(warnings: string[]): string | null {
   return warnings[0];
 }
 
-export function ProjectPanel({ publicConfig }: Pick<RunComposerProps, "publicConfig">) {
+interface ProjectPanelProps extends Pick<RunComposerProps, "publicConfig"> {
+  onProjectChange?: (projectId: string | null) => void;
+}
+
+export function ProjectPanel({ publicConfig, onProjectChange }: ProjectPanelProps) {
   const queryClient = useQueryClient();
   const apiBaseUrl = useResearchStore((state) => state.apiBaseUrl);
   const selectedProjectId = useResearchStore((state) => state.selectedProjectId);
@@ -419,6 +433,7 @@ export function ProjectPanel({ publicConfig }: Pick<RunComposerProps, "publicCon
       setNewProjectDescription("");
       setShowNewProject(false);
       setSelectedProjectId(project.id);
+      onProjectChange?.(project.id);
       await queryClient.invalidateQueries({ queryKey: ["projects", apiBaseUrl] });
     },
     onError: (err) => {
@@ -765,7 +780,10 @@ export function ProjectPanel({ publicConfig }: Pick<RunComposerProps, "publicCon
       <div className="project-list">
         <button
           className={`project-item ${!selectedProjectId ? "active" : ""}`}
-          onClick={() => setSelectedProjectId(null)}
+          onClick={() => {
+            setSelectedProjectId(null);
+            onProjectChange?.(null);
+          }}
           type="button"
         >
           <span className="project-item-name">No project</span>
@@ -774,7 +792,10 @@ export function ProjectPanel({ publicConfig }: Pick<RunComposerProps, "publicCon
           <button
             key={project.id}
             className={`project-item ${selectedProjectId === project.id ? "active" : ""}`}
-            onClick={() => setSelectedProjectId(project.id)}
+            onClick={() => {
+              setSelectedProjectId(project.id);
+              onProjectChange?.(project.id);
+            }}
             type="button"
           >
             <span className="project-item-name">{project.name}</span>
@@ -1009,7 +1030,7 @@ function CommonSettingsFields({ publicConfig, onOpenPanel }: RunComposerProps) {
           className="text-input"
           value={apiBaseUrl}
           onChange={(event) => setApiBaseUrl(event.target.value)}
-          placeholder="http://127.0.0.1:8000"
+          placeholder="http://127.0.0.1:8010"
         />
       </label>
 
@@ -1339,6 +1360,36 @@ function ModelSelectionFields({ publicConfig }: RunComposerProps) {
     (state) => state.resetModelConfigOverride,
   );
   const effectiveModels = resolveEffectiveModels(publicConfig, modelConfigOverride);
+  const textModelOptions = useMemo(
+    () =>
+      uniqueModelOptions([
+        publicConfig?.models.lead_model,
+        publicConfig?.models.planner_model,
+        publicConfig?.models.worker_model,
+        publicConfig?.models.verifier_model,
+        effectiveModels.lead_model,
+        effectiveModels.planner_model,
+        effectiveModels.worker_model,
+        effectiveModels.verifier_model,
+      ]),
+    [effectiveModels, publicConfig],
+  );
+  const embeddingModelOptions = useMemo(
+    () =>
+      uniqueModelOptions([
+        publicConfig?.models.embedding_model,
+        effectiveModels.embedding_model,
+      ]),
+    [effectiveModels.embedding_model, publicConfig?.models.embedding_model],
+  );
+  const rerankerModelOptions = useMemo(
+    () =>
+      uniqueModelOptions([
+        publicConfig?.models.reranker_model,
+        effectiveModels.reranker_model,
+      ]),
+    [effectiveModels.reranker_model, publicConfig?.models.reranker_model],
+  );
 
   const handleModelChange =
     (key: keyof ModelConfig) => (event: ChangeEvent<HTMLInputElement>) => {
@@ -1356,6 +1407,7 @@ function ModelSelectionFields({ publicConfig }: RunComposerProps) {
           <span className="field-label">Lead model</span>
           <input
             className="text-input"
+            list="text-model-options"
             value={effectiveModels.lead_model}
             onChange={handleModelChange("lead_model")}
             placeholder={publicConfig?.models.lead_model ?? "gpt-5.5"}
@@ -1366,6 +1418,7 @@ function ModelSelectionFields({ publicConfig }: RunComposerProps) {
           <span className="field-label">Planner model</span>
           <input
             className="text-input"
+            list="text-model-options"
             value={effectiveModels.planner_model}
             onChange={handleModelChange("planner_model")}
             placeholder={publicConfig?.models.planner_model ?? "gpt-5.5"}
@@ -1376,6 +1429,7 @@ function ModelSelectionFields({ publicConfig }: RunComposerProps) {
           <span className="field-label">Worker model</span>
           <input
             className="text-input"
+            list="text-model-options"
             value={effectiveModels.worker_model}
             onChange={handleModelChange("worker_model")}
             placeholder={publicConfig?.models.worker_model ?? "gpt-5.5"}
@@ -1386,6 +1440,7 @@ function ModelSelectionFields({ publicConfig }: RunComposerProps) {
           <span className="field-label">Verifier model</span>
           <input
             className="text-input"
+            list="text-model-options"
             value={effectiveModels.verifier_model}
             onChange={handleModelChange("verifier_model")}
             placeholder={publicConfig?.models.verifier_model ?? "gpt-5.5"}
@@ -1396,6 +1451,7 @@ function ModelSelectionFields({ publicConfig }: RunComposerProps) {
           <span className="field-label">Embedding model</span>
           <input
             className="text-input"
+            list="embedding-model-options"
             value={effectiveModels.embedding_model}
             onChange={handleModelChange("embedding_model")}
             placeholder={publicConfig?.models.embedding_model ?? "text-embedding-3-large"}
@@ -1407,6 +1463,7 @@ function ModelSelectionFields({ publicConfig }: RunComposerProps) {
           <span className="field-label">Reranker model</span>
           <input
             className="text-input"
+            list="reranker-model-options"
             value={effectiveModels.reranker_model}
             onChange={handleModelChange("reranker_model")}
             placeholder={publicConfig?.models.reranker_model ?? "BAAI/bge-reranker-v2-m3"}
@@ -1414,6 +1471,21 @@ function ModelSelectionFields({ publicConfig }: RunComposerProps) {
           <span className="field-hint">Reorders passages before grounding.</span>
         </label>
       </div>
+      <datalist id="text-model-options">
+        {textModelOptions.map((model) => (
+          <option key={model} value={model} />
+        ))}
+      </datalist>
+      <datalist id="embedding-model-options">
+        {embeddingModelOptions.map((model) => (
+          <option key={model} value={model} />
+        ))}
+      </datalist>
+      <datalist id="reranker-model-options">
+        {rerankerModelOptions.map((model) => (
+          <option key={model} value={model} />
+        ))}
+      </datalist>
 
       <div className="button-row">
         <button className="secondary-button" onClick={resetModelConfigOverride} type="button">

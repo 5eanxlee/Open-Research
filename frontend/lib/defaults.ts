@@ -7,7 +7,7 @@ import type {
 } from "./types";
 
 export const DEFAULT_API_BASE_URL =
-  process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
+  process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8010";
 
 export const DEFAULT_BUDGET: BudgetPolicy = {
   max_streams: 30,

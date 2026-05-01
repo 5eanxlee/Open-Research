@@ -36,6 +36,6 @@ COPY .env.example ./
 
 USER app
 
-EXPOSE 8000
+EXPOSE 8010
 
-CMD ["uvicorn", "open_research.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "open_research.main:app", "--host", "0.0.0.0", "--port", "8010"]

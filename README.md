@@ -65,10 +65,10 @@ To enable all production-oriented integrations locally:
 uv sync --extra dev --extra browser --extra postgres --extra temporal --extra grounding --extra storage
 ```
 
-Then open the API at `http://127.0.0.1:8000/docs` or start a run directly:
+Then open the API at `http://127.0.0.1:8010/docs` or start a run directly:
 
 ```bash
-curl -X POST http://127.0.0.1:8000/runs \
+curl -X POST http://127.0.0.1:8010/runs \
   -H 'content-type: application/json' \
   -d '{
     "question": "How should a research agent combine search, extraction, and citation grounding?"
@@ -78,13 +78,13 @@ curl -X POST http://127.0.0.1:8000/runs \
 Stream progress:
 
 ```bash
-curl -N http://127.0.0.1:8000/runs/<run-id>/stream
+curl -N http://127.0.0.1:8010/runs/<run-id>/stream
 ```
 
 Replay from a cursor:
 
 ```bash
-curl -N http://127.0.0.1:8000/runs/<run-id>/stream/42
+curl -N http://127.0.0.1:8010/runs/<run-id>/stream/42
 ```
 
 Start a dedicated worker process:
@@ -115,7 +115,7 @@ shell-style Textual UI, and passing a plain question directly runs that prompt i
 requiring the `ask` subcommand. The terminal surface is backed by the same API and SSE stream as
 the web dashboard, so run history, live progress, report rendering, and citation/audit inspection
 stay consistent across surfaces. Set `OPEN_RESEARCH_API_BASE_URL` only if the CLI/TUI should talk
-to an API endpoint other than `http://127.0.0.1:8000`.
+to an API endpoint other than `http://127.0.0.1:8010`.
 
 For a Helix-style install-once workflow, install the CLI into your shell path and launch it with
 one command:
@@ -169,7 +169,8 @@ npm install
 npm run dev
 ```
 
-The dashboard defaults to `http://127.0.0.1:8000`, but the API endpoint, budget controls, and
+The dashboard runs on `http://127.0.0.1:3010` and defaults to API endpoint `http://127.0.0.1:8010`,
+but the API endpoint, budget controls, and
 typed agent policy settings can all be changed client-side and are persisted locally in the
 browser.
 

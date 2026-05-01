@@ -106,6 +106,13 @@ function ensureRunStreamState(
   );
 }
 
+function migrateApiBaseUrl(value: string | undefined): string {
+  if (!value || value === "http://127.0.0.1:8000" || value === "http://localhost:8000") {
+    return DEFAULT_API_BASE_URL;
+  }
+  return value;
+}
+
 export const useResearchStore = create<ResearchStoreState>()(
   persist(
     (set, get) => ({
@@ -347,14 +354,14 @@ export const useResearchStore = create<ResearchStoreState>()(
     }),
     {
       name: "open-research-dashboard",
-      version: 3,
+      version: 4,
       migrate: (persistedState) => {
         if (!persistedState || typeof persistedState !== "object") {
           return persistedState as never;
         }
         const state = persistedState as Partial<ResearchStoreState>;
         return {
-          apiBaseUrl: state.apiBaseUrl ?? DEFAULT_API_BASE_URL,
+          apiBaseUrl: migrateApiBaseUrl(state.apiBaseUrl),
           selectedRunId: state.selectedRunId ?? null,
           selectedProjectId: state.selectedProjectId ?? null,
           profileId: state.profileId ?? "default",

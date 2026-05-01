@@ -49,7 +49,7 @@ services:
   api:
     build:
       context: .
-    command: ["uvicorn", "open_research.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    command: ["uvicorn", "open_research.main:app", "--host", "0.0.0.0", "--port", "8010"]
     depends_on:
       postgres:
         condition: service_healthy
@@ -67,14 +67,14 @@ services:
       OPEN_RESEARCH_ARTIFACT_STORE_BACKEND: local
       OPEN_RESEARCH_ARTIFACT_STORE_PATH: /app/data/artifacts
     ports:
-      - "8000:8000"
+      - "8010:8010"
     read_only: true
     tmpfs:
       - /tmp
     volumes:
       - artifacts-data:/app/data
     healthcheck:
-      test: ["CMD-SHELL", "python - <<'PY'\nimport urllib.request\nurllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=3)\nPY"]
+      test: ["CMD-SHELL", "python - <<'PY'\nimport urllib.request\nurllib.request.urlopen('http://127.0.0.1:8010/readyz', timeout=3)\nPY"]
       interval: 10s
       timeout: 5s
       retries: 12
@@ -86,9 +86,10 @@ services:
       api:
         condition: service_healthy
     environment:
-      NEXT_PUBLIC_API_BASE_URL: http://api:8000
+      NEXT_PUBLIC_API_BASE_URL: http://127.0.0.1:8010
+      PORT: 3010
     ports:
-      - "3000:3000"
+      - "3010:3010"
     read_only: true
     tmpfs:
       - /tmp
