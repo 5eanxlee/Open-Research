@@ -2,6 +2,7 @@
 
 import { useMemo } from "react";
 
+import { deriveConversationTopic } from "@/lib/report-title";
 import type { RunStatus, RunSummary } from "@/lib/types";
 
 interface RunHistoryProps {
@@ -63,6 +64,7 @@ export function RunHistory({ runs, selectedRunId, onSelect }: RunHistoryProps) {
 
         {sortedRuns.map((run) => {
           const isActive = selectedRunId === run.id;
+          const topic = run.conversation_topic || deriveConversationTopic(run.question);
           return (
             <button
               className={`history-item ${isActive ? "active" : ""}`}
@@ -81,7 +83,7 @@ export function RunHistory({ runs, selectedRunId, onSelect }: RunHistoryProps) {
                   {formatWhen(run.updated_at)}
                 </span>
               </div>
-              <strong className="history-question">{run.question}</strong>
+              <strong className="history-question">{topic}</strong>
             </button>
           );
         })}

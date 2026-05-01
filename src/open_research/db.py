@@ -2671,6 +2671,8 @@ class ResearchStore:
         return RunSummary(
             id=run.id,
             question=run.question,
+            conversation_topic=metadata.get("conversation_topic"),
+            report_title=metadata.get("report_title"),
             profile_id=run.profile_id,
             project_id=run.project_id,
             status=RunStatus(run.status),

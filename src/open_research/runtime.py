@@ -136,7 +136,7 @@ from .providers import (
     provider_hooks_scope,
 )
 from .tool_registry import build_tool_catalog, contract_tool_names
-from .utils import clean_text
+from .utils import clean_text, derive_conversation_topic
 from .workspace import build_run_workspace_snapshot
 
 
@@ -1127,6 +1127,7 @@ class RunCoordinator:
         metadata["effective_budget"] = requested_budget.model_dump(mode="json")
         metadata["execution_mode"] = execution_mode.value
         metadata["source_selection"] = source_selection
+        metadata.setdefault("conversation_topic", derive_conversation_topic(normalized_question))
         metadata["approval_status"] = (
             PlanApprovalStatus.PENDING_CLARIFICATION.value
             if requires_approval

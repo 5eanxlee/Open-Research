@@ -99,6 +99,8 @@ from .utils import (
     chunk_text,
     clean_text,
     dedupe_preserve_order,
+    derive_conversation_topic,
+    derive_report_title,
     domain_for_url,
     extract_sentences,
     normalize_url,
@@ -1647,13 +1649,17 @@ def _presentable_report_claims(
     position = 0
     for note in stream_notes:
         for raw_candidate in note.get("key_facts", []):
-            cleaned = _select_presentable_report_sentence(str(raw_candidate or ""))
+            cleaned = _sanitize_report_claim_text(
+                _select_presentable_report_sentence(str(raw_candidate or ""))
+            )
             score = _score_presentable_report_sentence(cleaned)
             if score < 2:
                 continue
             candidate_pool.append((cleaned, score, position))
             position += 1
-        summary_candidate = _select_presentable_report_sentence(str(note.get("summary", "") or ""))
+        summary_candidate = _sanitize_report_claim_text(
+            _select_presentable_report_sentence(str(note.get("summary", "") or ""))
+        )
         summary_score = _score_presentable_report_sentence(summary_candidate)
         if summary_score < 2:
             continue
@@ -1670,6 +1676,93 @@ def _presentable_report_claims(
         if len(claims) >= limit:
             break
     return claims
+
+
+def _sanitize_report_claim_text(claim: str) -> str:
+    """Remove provenance fragments that belong in citation UI, not report prose."""
+
+    cleaned = clean_text(claim)
+    cleaned = re.sub(
+        r"\b(This (?:draft|report) uses only [^.]*?retrieved (?:arxiv\s+)?records?/?excerpts?):\s*[^.]+\.",
+        "This report is based on retrieved source excerpts.",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\b(The retrieved record set contains[^.:;\n]*?)\s*:\s*[^;\n]+;",
+        r"\1;",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\b(?:at|on|from)\s+arXiv:\s*\d{4}\.\d{4,5}(?:v\d+)?",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\barXiv:\s*\d{4}\.\d{4,5}(?:v\d+)?",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\barXiv\s+records?/?excerpts?",
+        "source excerpts",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\barXiv\s+record\b",
+        "source record",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\barXiv\s+records\b",
+        "source records",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\s*\bSources?:\s*(?:https?://\S+\s*(?:[;,]\s*)?)+(?:\s*\((?:partial|full)\s+support\))?",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\s*\bSource:\s*(?:https?://\S+\s*(?:[;,]\s*)?)+(?:\s*\((?:partial|full)\s+support\))?",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\s*\bSources?:\s*(?:[;,.]\s*)+(?:\((?:partial|full)\s+support\))?",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\s*\bSource:\s*(?:[;,.]\s*)+(?:\((?:partial|full)\s+support\))?",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\s*\bSources?:\s*[^.?!]*(?:\((?:partial|full)\s+support\))?$",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\s*\bSource:\s*[^.?!]*(?:\((?:partial|full)\s+support\))?$",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"\s+([,.;:])", r"\1", cleaned)
+    cleaned = re.sub(r"([.;:]){2,}", r"\1", cleaned)
+    return cleaned.strip()
 
 
 def _parse_local_json_payload(text: str) -> dict[str, Any]:
@@ -2428,6 +2521,8 @@ class HeuristicReportWriter(ReportWriter):
                 executive_summary = f"Profile {preferred_style}: {executive_summary}"
         return GenerationResult(
             value=DraftReport(
+                title=derive_report_title(question),
+                conversation_topic=derive_conversation_topic(question),
                 executive_summary=executive_summary,
                 sections=sections,
                 open_questions=dedupe_preserve_order(open_questions)[:6],
@@ -2475,18 +2570,36 @@ class OpenAIReportWriter(ReportWriter):
             reasoning_effort=self.settings.llm_reasoning_effort,
         )
         report = report_result.value
+        report_title = report.title or derive_report_title(question)
+        conversation_topic = report.conversation_topic or derive_conversation_topic(question)
         claim_budget = max(1, self.settings.grounding_max_claims_per_run)
         bounded_sections = []
         for section in report.sections[:4]:
             if claim_budget <= 0:
                 claims = []
             else:
-                claims = dedupe_preserve_order(section.claims)[: min(3, claim_budget)]
+                claims = [
+                    claim
+                    for claim in (
+                        _sanitize_report_claim_text(raw_claim)
+                        for raw_claim in dedupe_preserve_order(section.claims)
+                    )
+                    if claim
+                ][: min(3, claim_budget)]
                 claim_budget -= len(claims)
-            bounded_sections.append(section.model_copy(update={"claims": claims}))
+            bounded_sections.append(
+                section.model_copy(
+                    update={
+                        "overview": _sanitize_report_claim_text(section.overview),
+                        "claims": claims,
+                    }
+                )
+            )
         return GenerationResult(
             value=report.model_copy(
                 update={
+                    "title": report_title,
+                    "conversation_topic": conversation_topic,
                     "sections": bounded_sections,
                     "open_questions": dedupe_preserve_order(report.open_questions)[:8],
                 }
@@ -5266,6 +5379,17 @@ class ResearchOrchestrator:
             citations=citations,
             unsupported_claims=unsupported_claims,
             confidence=round(sum(confidence_values) / max(len(confidence_values), 1), 3),
+            title=draft.title or derive_report_title(state["question"]),
+            conversation_topic=(
+                draft.conversation_topic or derive_conversation_topic(state["question"])
+            ),
+        )
+        await self.store.update_run_metadata(
+            run_id,
+            {
+                "report_title": final_report.title,
+                "conversation_topic": final_report.conversation_topic,
+            },
         )
         await self.store.replace_claims_and_citations(
             run_id,
@@ -5311,10 +5435,18 @@ class ResearchOrchestrator:
         unsupported_claims: Sequence[str],
     ) -> str:
         citation_numbers = _citation_numbers_by_record(citations)
-        markdown_lines = ["# Research Report", "", draft.executive_summary.strip(), ""]
+        report_title = clean_text(draft.title or "Research Report")
+        markdown_lines = [
+            f"# {report_title}",
+            "",
+            _sanitize_report_claim_text(draft.executive_summary),
+            "",
+        ]
         citation_index = 0
         for section in draft.sections:
-            markdown_lines.extend([f"## {section.title}", "", section.overview, ""])
+            markdown_lines.extend(
+                [f"## {section.title}", "", _sanitize_report_claim_text(section.overview), ""]
+            )
             for ordinal, claim in enumerate(section.claims, start=1):
                 if (section.title, ordinal) not in kept_keys:
                     continue
@@ -5327,7 +5459,10 @@ class ResearchOrchestrator:
                     else ""
                 )
                 citation_number = citation_numbers[id(citation)]
-                claim_text = claim.strip().rstrip(".")
+                claim_text = _sanitize_report_claim_text(claim).rstrip(".")
+                if not claim_text:
+                    citation_index += 1
+                    continue
                 markdown_lines.append(f"{claim_text}{support_suffix}. [{citation_number}]")
                 citation_index += 1
             markdown_lines.append("")
@@ -5351,21 +5486,6 @@ class ResearchOrchestrator:
                     question_text = f"{question_text}."
                 markdown_lines.append(f"- {question_text}")
             markdown_lines.append("")
-
-        if citations:
-            markdown_lines.extend(["## Citations", ""])
-            seen_numbers: set[int] = set()
-            for citation in citations:
-                citation_number = citation_numbers[id(citation)]
-                if citation_number in seen_numbers:
-                    continue
-                seen_numbers.add(citation_number)
-                markdown_lines.append(
-                    f"[{citation_number}] {citation.source_title}: {citation.source_url}"
-                )
-                if citation.quote.strip():
-                    markdown_lines.append(f"Supporting excerpt: {citation.quote.strip()}")
-                markdown_lines.append("")
 
         return "\n".join(markdown_lines).strip()
 

@@ -344,6 +344,8 @@ export interface ProjectDetail extends ProjectSummary {
 export interface RunSummary {
   id: string;
   question: string;
+  conversation_topic: string | null;
+  report_title: string | null;
   profile_id: string;
   project_id: string | null;
   status: RunStatus;
@@ -389,6 +391,8 @@ export interface FinalReport {
   citations: CitationRecord[];
   unsupported_claims: string[];
   confidence: number;
+  title: string | null;
+  conversation_topic: string | null;
 }
 
 export interface RunNoteRecord {
@@ -736,6 +740,7 @@ export interface WorkspaceCitationView {
   section_title: string;
   claim: string;
   status: string;
+  citation_number: number | null;
   source_id: string | null;
   source_title: string | null;
   source_url: string | null;
@@ -802,6 +807,8 @@ export interface WorkspacePlanView {
 export interface RunWorkspaceSnapshot {
   run_id: string;
   question: string;
+  conversation_topic: string | null;
+  report_title: string | null;
   project_id: string | null;
   status: RunStatus;
   execution_mode: ExecutionMode;

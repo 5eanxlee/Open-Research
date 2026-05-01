@@ -35,6 +35,7 @@ from .domain import (
     WorkspaceStreamView,
     WorkspaceTaskView,
 )
+from .utils import normalize_url
 
 PHASE_ORDER: list[WorkspacePhaseKey] = [
     WorkspacePhaseKey.INTAKE,
@@ -628,6 +629,18 @@ def _build_report_sections(
     parsed = _parse_report_sections(detail.final_report_markdown)
     claim_views_by_section: dict[str, dict[tuple[str, int], WorkspaceReportClaimView]] = defaultdict(dict)
     citations_by_key: dict[tuple[str, str], WorkspaceCitationView] = {}
+    citation_numbers_by_key: dict[tuple[str, str], int] = {}
+    if detail.final_report is not None:
+        next_number = 1
+        number_by_url: dict[str, int] = {}
+        for citation in detail.final_report.citations:
+            normalized_url = normalize_url(str(citation.source_url))
+            number = number_by_url.get(normalized_url)
+            if number is None:
+                number = next_number
+                number_by_url[normalized_url] = number
+                next_number += 1
+            citation_numbers_by_key[(citation.claim, normalized_url)] = number
 
     for event in events:
         if event.event_type != "citation.verified":
@@ -663,6 +676,11 @@ def _build_report_sections(
             section_title=section_title,
             claim=claim,
             status="surviving",
+            citation_number=(
+                citation_numbers_by_key.get((claim, normalize_url(resolved_source_url)))
+                if resolved_source_url
+                else None
+            ),
             source_id=resolved_source_id,
             source_title=resolved_source_title,
             source_url=resolved_source_url,
@@ -688,6 +706,13 @@ def _build_report_sections(
             section_title=audit.section_title,
             claim=audit.claim,
             status="removed",
+            citation_number=(
+                citation_numbers_by_key.get((audit.claim, normalize_url(str(audit.source_url))))
+                if audit.source_url
+                else existing.citation_number
+                if existing
+                else None
+            ),
             source_id=audit.source_id,
             source_title=existing.source_title if existing else None,
             source_url=audit.source_url,
@@ -847,6 +872,8 @@ def build_run_workspace_snapshot(
     return RunWorkspaceSnapshot(
         run_id=detail.id,
         question=detail.question,
+        conversation_topic=detail.conversation_topic,
+        report_title=detail.report_title,
         project_id=detail.project_id,
         status=detail.status,
         execution_mode=detail.execution_mode,

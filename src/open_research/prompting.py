@@ -632,6 +632,12 @@ def report_writer_system_prompt(
     )
     report_rules = (
         "Report-writing rules:\n"
+        "- Generate a specific report title that reflects the user's question; do not use "
+        "'Research Report' as the title unless the prompt explicitly asks for that title.\n"
+        "- Generate a concise 3-6 word conversation_topic based on the initial user prompt.\n"
+        "- Place citation markers as compact bracketed clusters at the end of the relevant "
+        "paragraph or section. Do not put source URLs or source titles in the report prose "
+        "unless the user explicitly asks to cite those sources directly.\n"
         "- Synthesize only from the provided notes and note metadata.\n"
         "- Prefer explicit, testable claims over broad rhetorical summaries.\n"
         "- Surface uncertainty, trade-offs, disagreements, and missing evidence.\n"

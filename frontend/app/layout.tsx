@@ -3,6 +3,7 @@ import localFont from "next/font/local";
 
 import { AppProviders } from "@/components/app-providers";
 
+import "katex/dist/katex.min.css";
 import "./globals.css";
 
 const sohne = localFont({
@@ -23,7 +24,7 @@ const sohne = localFont({
       style: "normal",
     },
   ],
-  variable: "--font-sans",
+  variable: "--font-testsohne",
 });
 
 export const metadata: Metadata = {

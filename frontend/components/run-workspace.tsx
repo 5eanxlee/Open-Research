@@ -1,9 +1,29 @@
 "use client";
 
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import {
+  cloneElement,
+  isValidElement,
+  useCallback,
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ComponentPropsWithoutRef,
+  type CSSProperties,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
+  type ReactElement,
+  type ReactNode,
+} from "react";
+import { createPortal } from "react-dom";
 import ReactMarkdown from "react-markdown";
+import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
 
+import { deriveReportTitle, isGenericReportTitle } from "@/lib/report-title";
 import type {
   RunConversationMessage,
   RunEvent,
@@ -28,6 +48,7 @@ type WorkspaceDetailsTab =
   | "trace";
 
 type WorkspacePrimaryView = "chat" | "report";
+type WorkspaceReportPanelTab = WorkspaceDetailsTab | "report";
 
 type ThinkingSubtab = "decisions" | "agents" | "tools" | "files";
 
@@ -44,12 +65,39 @@ const PHASE_TO_DETAILS_TAB: Record<WorkspacePhaseKey, WorkspaceDetailsTab> = {
 const DETAIL_TAB_LABELS: Record<WorkspaceDetailsTab, string> = {
   overview: "Pipeline",
   plan: "Plan",
-  tasks: "Agents",
+  tasks: "Tasks",
   thinking: "Thinking",
   sources: "Sources",
-  citations: "Report",
+  citations: "Citations",
   trace: "Tool calls",
 };
+
+const REPORT_PANEL_TABS: Array<{
+  key: WorkspaceReportPanelTab;
+  label: string;
+}> = [
+  { key: "overview", label: "Pipeline" },
+  { key: "plan", label: "Plan" },
+  { key: "tasks", label: "Tasks" },
+  { key: "thinking", label: "Thinking" },
+  { key: "sources", label: "Sources" },
+  { key: "citations", label: "Citations" },
+  { key: "trace", label: "Tool calls" },
+  { key: "report", label: "Report" },
+];
+
+const DEFAULT_REPORT_PANE_WIDTH = 72;
+const MIN_REPORT_PANE_WIDTH = 56;
+const MAX_REPORT_PANE_WIDTH = 82;
+const MIN_CHAT_PANE_WIDTH_PX = 220;
+const REPORT_PANE_GAP_PX = 18;
+
+function clampReportPaneWidth(value: number, max = MAX_REPORT_PANE_WIDTH): number {
+  return Math.min(
+    max,
+    Math.max(MIN_REPORT_PANE_WIDTH, Math.round(value * 10) / 10),
+  );
+}
 
 function formatTime(value: string | null | undefined): string {
   if (!value) return "n/a";
@@ -147,6 +195,16 @@ function resolveCitationSource(
     }
   }
 
+  for (const embeddedUrl of extractUrlsFromText(citation.claim)) {
+    const normalizedEmbeddedUrl = normalizeCitationUrl(embeddedUrl);
+    const embeddedMatch = sources.find(
+      (source) => normalizeCitationUrl(source.url) === normalizedEmbeddedUrl,
+    );
+    if (embeddedMatch) {
+      return embeddedMatch;
+    }
+  }
+
   const sourceTitle = normalizeLookupValue(citation.source_title);
   if (sourceTitle) {
     const titleMatch = sources.find(
@@ -175,12 +233,413 @@ function getCitationSourceLabel(
   sources: WorkspaceSourceView[],
 ): string {
   const resolvedSource = resolveCitationSource(citation, sources);
+  const embeddedUrl = extractUrlsFromText(citation.claim)[0] ?? null;
   return normalizeInlineText(
     citation.source_title ??
       resolvedSource?.title ??
       citation.source_url ??
       resolvedSource?.url ??
-      "Unknown source",
+      embeddedUrl ??
+    "Unknown source",
+  );
+}
+
+function normalizeCitationUrl(value: string | null | undefined): string {
+  return (value ?? "").trim().replace(/\/+$/, "").toLowerCase();
+}
+
+function extractUrlsFromText(value: string | null | undefined): string[] {
+  return Array.from(normalizeInlineText(value).matchAll(/https?:\/\/[^\s)\];]+/g))
+    .map((match) => match[0].replace(/[.,]+$/, ""))
+    .filter(Boolean);
+}
+
+function formatCitationHost(value: string | null): string | null {
+  if (!value) return null;
+  try {
+    return new URL(value).hostname.replace(/^www\./, "");
+  } catch {
+    return null;
+  }
+}
+
+function getMarkdownTitle(content: string, fallback: string): string {
+  const match = content.match(/^#\s+(.+?)\s*$/m);
+  return normalizeInlineText(match?.[1] ?? fallback);
+}
+
+function stripSourceProseArtifacts(value: string): string {
+  return value
+    .replace(
+      /\b(This (?:draft|report) uses only [^.]*?retrieved (?:arxiv\s+)?records?\/?excerpts?):\s*[^.]+\./gi,
+      "This report is based on retrieved source excerpts.",
+    )
+    .replace(
+      /\b(The retrieved record set contains[^.:;\n]*?)\s*:\s*[^;\n]+;/gi,
+      "$1;",
+    )
+    .replace(/\b(?:at|on|from)\s+arXiv:\s*\d{4}\.\d{4,5}(?:v\d+)?/gi, "")
+    .replace(/\barXiv:\s*\d{4}\.\d{4,5}(?:v\d+)?/gi, "")
+    .replace(/\barXiv\s+records?\/excerpts?/gi, "source excerpts")
+    .replace(/\barXiv\s+record\b/gi, "source record")
+    .replace(/\barXiv\s+records\b/gi, "source records")
+    .replace(/\s+([,.;:])/g, "$1")
+    .replace(/([.;:]){2,}/g, "$1")
+    .replace(/[ \t]{2,}/g, " ");
+}
+
+function prepareReportMarkdown(content: string, replacementTitle?: string): string {
+  let prepared = content;
+  if (replacementTitle && !isGenericReportTitle(replacementTitle)) {
+    prepared = prepared.replace(/^#\s+(.+?)\s*$/m, (match, title) =>
+      isGenericReportTitle(normalizeInlineText(title)) ? `# ${replacementTitle}` : match,
+    );
+  }
+  return stripSourceProseArtifacts(prepared)
+    .replace(/(?:^|\n)##\s+Citations\s*[\s\S]*$/i, "")
+    .replace(/\[([^\]]+)\]\(https?:\/\/[^)]+\)/g, "$1")
+    .replace(
+      /\s*\bSources?:\s*(?:https?:\/\/[^\s)\]]+\s*(?:[;,]\s*)?)+(?:\s*\((partial|full)\s+support\))?/gi,
+      (_match, support: string | undefined) => (support ? ` (${support} support)` : ""),
+    )
+    .replace(
+      /\s*\bSource:\s*(?:https?:\/\/[^\s)\]]+\s*(?:[;,]\s*)?)+(?:\s*\((partial|full)\s+support\))?/gi,
+      (_match, support: string | undefined) => (support ? ` (${support} support)` : ""),
+    )
+    .replace(/\s*https?:\/\/[^\s)\];]+[^\s)\];.,]/g, "")
+    .replace(
+      /\s*\bSources?:\s*(?:[;,.]\s*)+(?:\((partial|full)\s+support\))?/gi,
+      (_match, support: string | undefined) => (support ? ` (${support} support)` : ""),
+    )
+    .replace(
+      /\s*\bSource:\s*(?:[;,.]\s*)+(?:\((partial|full)\s+support\))?/gi,
+      (_match, support: string | undefined) => (support ? ` (${support} support)` : ""),
+    )
+    .replace(/\s*\bSources?:\s*[^.\n]*?(?=\s*(?:\[\d+\]|\[(?:\d+\]\s*){2,}|\n|$))/gi, "")
+    .replace(/\s*\bSource:\s*[^.\n]*?(?=\s*(?:\[\d+\]|\[(?:\d+\]\s*){2,}|\n|$))/gi, "")
+    .replace(/\s+([,.;:])/g, "$1")
+    .replace(/([.;:]){2,}/g, "$1")
+    .replace(/[ \t]{2,}/g, " ")
+    .trim();
+}
+
+function cleanCitationClaimText(value: string): string {
+  return normalizeInlineText(prepareReportMarkdown(value));
+}
+
+function truncateSentence(value: string, maxLength = 420): string {
+  if (value.length <= maxLength) return value;
+  const clipped = value.slice(0, maxLength);
+  const sentenceEnd = Math.max(
+    clipped.lastIndexOf(". "),
+    clipped.lastIndexOf("; "),
+    clipped.lastIndexOf(": "),
+  );
+  return `${clipped.slice(0, sentenceEnd > 180 ? sentenceEnd + 1 : maxLength).trim()}...`;
+}
+
+function getReportLead(content: string, replacementTitle?: string): string {
+  const prepared = prepareReportMarkdown(content, replacementTitle);
+  const paragraphs = prepared
+    .split(/\n{2,}/)
+    .map((paragraph) => paragraph.trim())
+    .filter(Boolean);
+  const lead =
+    paragraphs.find(
+      (paragraph) =>
+        !paragraph.startsWith("#") &&
+        !paragraph.startsWith("|") &&
+        !paragraph.startsWith("- ") &&
+        !paragraph.startsWith("* "),
+    ) ?? "";
+  return truncateSentence(lead.replace(/\s+/g, " "));
+}
+
+type CitationSource = {
+  id: string;
+  label: string;
+  url: string | null;
+  trustTier: string | null;
+};
+
+type CitationLookup = Map<number, CitationSource[]>;
+
+function buildWorkspaceCitationLookup(
+  citations: WorkspaceCitationView[],
+  sources: WorkspaceSourceView[],
+): CitationLookup {
+  const lookup: CitationLookup = new Map();
+  const numberByUrl = new Map<string, number>();
+  let nextNumber = 1;
+
+  for (const citation of citations) {
+    if (citation.status === "removed") continue;
+    const normalizedUrl = normalizeCitationUrl(citation.source_url);
+    let citationNumber = citation.citation_number;
+    if (!citationNumber && normalizedUrl) {
+      citationNumber = numberByUrl.get(normalizedUrl) ?? nextNumber;
+      if (!numberByUrl.has(normalizedUrl)) {
+        numberByUrl.set(normalizedUrl, citationNumber);
+        nextNumber += 1;
+      }
+    }
+    if (!citationNumber) continue;
+    const entries = lookup.get(citationNumber) ?? [];
+    const id = citation.id;
+    if (!entries.some((entry) => entry.id === id)) {
+      entries.push({
+        id,
+        label: getCitationSourceLabel(citation, sources),
+        url: citation.source_url,
+        trustTier: citation.trust_tier,
+      });
+    }
+    lookup.set(citationNumber, entries);
+  }
+
+  sources.forEach((source, index) => {
+    const citationNumber = index + 1;
+    if (lookup.has(citationNumber)) return;
+    const label = normalizeInlineText(source.title ?? source.url ?? `Source ${citationNumber}`);
+    if (!label && !source.url) return;
+    lookup.set(citationNumber, [
+      {
+        id: source.id || source.source_id || `source-${citationNumber}`,
+        label,
+        url: source.url,
+        trustTier: source.trust_tier,
+      },
+    ]);
+  });
+
+  return lookup;
+}
+
+function CitationCluster({
+  numbers,
+  lookup,
+}: {
+  numbers: number[];
+  lookup: CitationLookup;
+}) {
+  const clusterRef = useRef<HTMLSpanElement | null>(null);
+  const popoverRef = useRef<HTMLDivElement | null>(null);
+  const closeTimerRef = useRef<number | null>(null);
+  const [open, setOpen] = useState(false);
+  const [popoverStyle, setPopoverStyle] = useState<CSSProperties>({});
+  const sources = numbers.flatMap((number) => lookup.get(number) ?? []);
+  const label = numbers.map((number) => `[${number}]`).join("");
+  const dedupedSources = sources.filter(
+    (source, index) =>
+      sources.findIndex(
+        (candidate) =>
+          candidate.id === source.id ||
+          (candidate.url && source.url && candidate.url === source.url),
+      ) === index,
+  );
+
+  const clearCloseTimer = useCallback(() => {
+    if (closeTimerRef.current == null) return;
+    window.clearTimeout(closeTimerRef.current);
+    closeTimerRef.current = null;
+  }, []);
+
+  const updatePopoverPosition = useCallback(() => {
+    const element = clusterRef.current;
+    if (!element) return;
+    const rect = element.getBoundingClientRect();
+    const viewportWidth = window.innerWidth;
+    const viewportHeight = window.innerHeight;
+    const width = Math.min(430, Math.max(260, viewportWidth - 24));
+    const left = Math.min(Math.max(12, rect.left), viewportWidth - width - 12);
+    const estimatedHeight = Math.min(340, 92 + dedupedSources.length * 46);
+    const opensBelow = rect.bottom + 10 + estimatedHeight < viewportHeight;
+    const top = opensBelow
+      ? rect.bottom + 10
+      : Math.max(12, rect.top - estimatedHeight - 10);
+    setPopoverStyle({
+      left,
+      maxHeight: Math.min(360, viewportHeight - 24),
+      top,
+      width,
+    });
+  }, [dedupedSources.length]);
+
+  const openPopover = useCallback(() => {
+    clearCloseTimer();
+    setOpen(true);
+  }, [clearCloseTimer]);
+
+  const scheduleClose = useCallback(() => {
+    clearCloseTimer();
+    closeTimerRef.current = window.setTimeout(() => {
+      const clusterHovered = clusterRef.current?.matches(":hover");
+      const popoverHovered = popoverRef.current?.matches(":hover");
+      if (!clusterHovered && !popoverHovered) {
+        setOpen(false);
+      }
+    }, 90);
+  }, [clearCloseTimer]);
+
+  useLayoutEffect(() => {
+    if (!open) return;
+    updatePopoverPosition();
+  }, [open, updatePopoverPosition]);
+
+  useEffect(() => {
+    if (!open) return undefined;
+    window.addEventListener("resize", updatePopoverPosition);
+    window.addEventListener("scroll", updatePopoverPosition, true);
+    return () => {
+      window.removeEventListener("resize", updatePopoverPosition);
+      window.removeEventListener("scroll", updatePopoverPosition, true);
+    };
+  }, [open, updatePopoverPosition]);
+
+  useEffect(() => () => clearCloseTimer(), [clearCloseTimer]);
+
+  const popover =
+    open && dedupedSources.length
+      ? createPortal(
+          <div
+            className="citation-popover"
+            onMouseEnter={openPopover}
+            onMouseLeave={scheduleClose}
+            ref={popoverRef}
+            role="tooltip"
+            style={popoverStyle}
+          >
+            <span className="citation-popover-heading">
+              {dedupedSources.length} source{dedupedSources.length === 1 ? "" : "s"}
+            </span>
+            {dedupedSources.map((source) =>
+              source.url ? (
+                <a
+                  className="citation-popover-link"
+                  href={source.url}
+                  key={`${source.id}-${source.url}`}
+                  rel="noreferrer"
+                  target="_blank"
+                >
+                  <strong>{source.label}</strong>
+                  <small>{source.trustTier ?? formatCitationHost(source.url) ?? "Link"}</small>
+                </a>
+              ) : (
+                <span className="citation-popover-link" key={source.id}>
+                  <strong>{source.label}</strong>
+                  {source.trustTier ? <small>{source.trustTier}</small> : null}
+                </span>
+              ),
+            )}
+          </div>,
+          document.body,
+        )
+      : null;
+
+  return (
+    <span
+      className="citation-cluster"
+      onBlur={scheduleClose}
+      onClick={openPopover}
+      onFocus={openPopover}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          openPopover();
+        }
+        if (event.key === "Escape") {
+          setOpen(false);
+        }
+      }}
+      onMouseEnter={openPopover}
+      onMouseLeave={scheduleClose}
+      ref={clusterRef}
+      role="button"
+      tabIndex={0}
+    >
+      <span className="citation-cluster-label">{label}</span>
+      {popover}
+    </span>
+  );
+}
+
+function replaceCitationText(value: string, lookup: CitationLookup): ReactNode[] {
+  const nodes: ReactNode[] = [];
+  const citationPattern = /(?:\[\d+\]\s*)+/g;
+  let cursor = 0;
+  for (const match of value.matchAll(citationPattern)) {
+    const index = match.index ?? 0;
+    if (index > cursor) nodes.push(value.slice(cursor, index));
+    const numbers = Array.from(match[0].matchAll(/\[(\d+)\]/g))
+      .map((numberMatch) => Number(numberMatch[1]))
+      .filter((number) => Number.isFinite(number));
+    nodes.push(
+      <CitationCluster
+        key={`citation-${index}-${numbers.join("-")}`}
+        lookup={lookup}
+        numbers={numbers}
+      />,
+    );
+    cursor = index + match[0].length;
+  }
+  if (cursor < value.length) nodes.push(value.slice(cursor));
+  return nodes;
+}
+
+function renderCitationNodes(children: ReactNode, lookup: CitationLookup): ReactNode {
+  if (typeof children === "string") {
+    return replaceCitationText(children, lookup);
+  }
+  if (Array.isArray(children)) {
+    return children.map((child, index) => (
+      <span key={`citation-node-${index}`}>{renderCitationNodes(child, lookup)}</span>
+    ));
+  }
+  if (isValidElement<{ children?: ReactNode }>(children)) {
+    const element = children as ReactElement<{ children?: ReactNode }>;
+    if (!element.props.children) return element;
+    return cloneElement(element, {
+      children: renderCitationNodes(element.props.children, lookup),
+    });
+  }
+  return children;
+}
+
+function MermaidDiagram({ chart }: { chart: string }) {
+  const id = useId().replace(/:/g, "");
+  const [svg, setSvg] = useState<string | null>(null);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    let mounted = true;
+    setFailed(false);
+    void import("mermaid")
+      .then(({ default: mermaid }) => {
+        mermaid.initialize({ startOnLoad: false, securityLevel: "strict" });
+        return mermaid.render(`mermaid-${id}`, chart);
+      })
+      .then(({ svg: renderedSvg }) => {
+        if (mounted) setSvg(renderedSvg);
+      })
+      .catch(() => {
+        if (mounted) setFailed(true);
+      });
+    return () => {
+      mounted = false;
+    };
+  }, [chart, id]);
+
+  if (failed) {
+    return <pre className="mermaid-fallback">{chart}</pre>;
+  }
+  if (!svg) {
+    return <div className="mermaid-loading">Rendering diagram...</div>;
+  }
+  return (
+    <div
+      className="mermaid-diagram"
+      dangerouslySetInnerHTML={{ __html: svg }}
+    />
   );
 }
 
@@ -199,26 +658,70 @@ function EventCard({ event }: { event: RunEvent }) {
 function MarkdownContent({
   content,
   className,
+  citationLookup,
+  hideCitationBibliography = false,
+  replacementTitle,
 }: {
   content: string;
   className?: string;
+  citationLookup?: CitationLookup;
+  hideCitationBibliography?: boolean;
+  replacementTitle?: string;
 }) {
+  const displayContent = hideCitationBibliography
+    ? prepareReportMarkdown(content, replacementTitle)
+    : content;
+  const citations = citationLookup ?? new Map();
+  const withCitations = (children: ReactNode) => renderCitationNodes(children, citations);
+
   return (
     <div className={`markdown-body workspace-markdown${className ? ` ${className}` : ""}`}>
       <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
+        remarkPlugins={[remarkGfm, remarkMath]}
+        rehypePlugins={[rehypeKatex]}
         components={{
           a: ({ node: _node, ...props }) => (
             <a {...props} rel="noreferrer" target="_blank" />
           ),
+          p: ({ node: _node, children, ...props }) => (
+            <p {...props}>{withCitations(children)}</p>
+          ),
+          li: ({ node: _node, children, ...props }) => (
+            <li {...props}>{withCitations(children)}</li>
+          ),
+          td: ({ node: _node, children, ...props }) => (
+            <td {...props}>{withCitations(children)}</td>
+          ),
+          th: ({ node: _node, children, ...props }) => (
+            <th {...props}>{withCitations(children)}</th>
+          ),
+          code: ({
+            className: codeClassName,
+            children,
+            ...props
+          }: ComponentPropsWithoutRef<"code"> & { node?: unknown }) => {
+            const codeText = String(children ?? "").replace(/\n$/, "");
+            if (codeClassName?.includes("language-mermaid")) {
+              return <MermaidDiagram chart={codeText} />;
+            }
+            return (
+              <code className={codeClassName} {...props}>
+                {children}
+              </code>
+            );
+          },
           table: ({ node: _node, children, ...props }) => (
             <div className="markdown-table-wrap">
               <table {...props}>{children as ReactNode}</table>
             </div>
           ),
+          img: ({ node: _node, ...props }) => (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img {...props} className="markdown-visual" alt={props.alt ?? ""} />
+          ),
         }}
       >
-        {content}
+        {displayContent}
       </ReactMarkdown>
     </div>
   );
@@ -275,6 +778,7 @@ export function RunWorkspace({
 }: RunWorkspaceProps) {
   const [detailsTab, setDetailsTab] = useState<WorkspaceDetailsTab>("overview");
   const [primaryView, setPrimaryView] = useState<WorkspacePrimaryView>("chat");
+  const [reportPanelTab, setReportPanelTab] = useState<WorkspaceReportPanelTab>("report");
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [focusedPhase, setFocusedPhase] = useState<WorkspacePhaseKey | null>(null);
   const [selectedStreamId, setSelectedStreamId] = useState<string>("all");
@@ -284,8 +788,10 @@ export function RunWorkspace({
   const [selectedCitationId, setSelectedCitationId] = useState<string | null>(null);
   const [clarificationDraft, setClarificationDraft] = useState("");
   const [approvalNote, setApprovalNote] = useState("");
-  const [reportExpanded, setReportExpanded] = useState(false);
   const [reportActionNotice, setReportActionNotice] = useState<string | null>(null);
+  const detailsScrollRef = useRef<HTMLDivElement | null>(null);
+  const shellLayoutRef = useRef<HTMLDivElement | null>(null);
+  const [reportPaneWidth, setReportPaneWidth] = useState(DEFAULT_REPORT_PANE_WIDTH);
 
   useEffect(() => {
     if (!workspace) return;
@@ -312,11 +818,11 @@ export function RunWorkspace({
     if (!workspace) return;
     setDetailsTab("overview");
     setPrimaryView("chat");
+    setReportPanelTab("report");
     setDetailsOpen(false);
     setFocusedPhase(null);
     setSelectedStreamId("all");
     setThinkingSubtab("decisions");
-    setReportExpanded(false);
     setReportActionNotice(null);
   }, [workspace?.run_id]);
 
@@ -325,6 +831,91 @@ export function RunWorkspace({
     const timeout = window.setTimeout(() => setReportActionNotice(null), 2200);
     return () => window.clearTimeout(timeout);
   }, [reportActionNotice]);
+
+  useEffect(() => {
+    if (!detailsOpen) return;
+    detailsScrollRef.current?.scrollTo({ top: 0, behavior: "auto" });
+  }, [detailsOpen, detailsTab, workspace?.run_id]);
+
+  const workspaceShellStyle = useMemo(
+    () =>
+      ({
+        "--report-pane-width": `${reportPaneWidth}%`,
+      }) as CSSProperties,
+    [reportPaneWidth],
+  );
+
+  const handleReportResizePointerDown = useCallback(
+    (event: ReactPointerEvent<HTMLDivElement>) => {
+      if (primaryView !== "report") return;
+      const layout = shellLayoutRef.current;
+      if (!layout) return;
+
+      event.preventDefault();
+
+      const updateWidth = (clientX: number) => {
+        const rect = layout.getBoundingClientRect();
+        if (!rect.width) return;
+        const dynamicMax = Math.min(
+          MAX_REPORT_PANE_WIDTH,
+          ((rect.width - MIN_CHAT_PANE_WIDTH_PX - REPORT_PANE_GAP_PX) / rect.width) * 100,
+        );
+        const nextWidth = ((rect.right - clientX) / rect.width) * 100;
+        setReportPaneWidth(clampReportPaneWidth(nextWidth, dynamicMax));
+      };
+
+      updateWidth(event.clientX);
+      document.body.classList.add("is-resizing-report-pane");
+
+      const handlePointerMove = (moveEvent: PointerEvent) => {
+        moveEvent.preventDefault();
+        updateWidth(moveEvent.clientX);
+      };
+
+      const handlePointerUp = () => {
+        document.body.classList.remove("is-resizing-report-pane");
+        window.removeEventListener("pointermove", handlePointerMove);
+        window.removeEventListener("pointerup", handlePointerUp);
+        window.removeEventListener("pointercancel", handlePointerUp);
+      };
+
+      window.addEventListener("pointermove", handlePointerMove);
+      window.addEventListener("pointerup", handlePointerUp, { once: true });
+      window.addEventListener("pointercancel", handlePointerUp, { once: true });
+    },
+    [primaryView],
+  );
+
+  const handleReportResizeKeyDown = useCallback(
+    (event: ReactKeyboardEvent<HTMLDivElement>) => {
+      if (primaryView !== "report") return;
+      const layoutWidth = shellLayoutRef.current?.getBoundingClientRect().width ?? 0;
+      const dynamicMax = layoutWidth
+        ? Math.min(
+            MAX_REPORT_PANE_WIDTH,
+            ((layoutWidth - MIN_CHAT_PANE_WIDTH_PX - REPORT_PANE_GAP_PX) / layoutWidth) *
+              100,
+          )
+        : MAX_REPORT_PANE_WIDTH;
+      if (event.key === "ArrowLeft") {
+        event.preventDefault();
+        setReportPaneWidth((current) => clampReportPaneWidth(current + 2, dynamicMax));
+      }
+      if (event.key === "ArrowRight") {
+        event.preventDefault();
+        setReportPaneWidth((current) => clampReportPaneWidth(current - 2, dynamicMax));
+      }
+      if (event.key === "Home") {
+        event.preventDefault();
+        setReportPaneWidth(clampReportPaneWidth(MIN_REPORT_PANE_WIDTH, dynamicMax));
+      }
+      if (event.key === "End") {
+        event.preventDefault();
+        setReportPaneWidth(clampReportPaneWidth(MAX_REPORT_PANE_WIDTH, dynamicMax));
+      }
+    },
+    [primaryView],
+  );
 
   const phaseFilteredEvents = useMemo(() => {
     if (!workspace) return rawEvents;
@@ -503,7 +1094,15 @@ export function RunWorkspace({
     workspace.status === "clarifying" || workspace.status === "awaiting_plan_approval";
   const reportReady = Boolean(workspace.final_report_markdown);
   const reportMarkdown = workspace.final_report_markdown ?? "";
-  const reportFilename = `${slugifyFilename(workspace.question)}-report.md`;
+  const markdownReportTitle = getMarkdownTitle(reportMarkdown, "");
+  const reportTitleCandidate = workspace.report_title ?? markdownReportTitle;
+  const reportTitle = isGenericReportTitle(reportTitleCandidate)
+    ? deriveReportTitle(workspace.question)
+    : reportTitleCandidate;
+  const displayReportMarkdown = prepareReportMarkdown(reportMarkdown, reportTitle);
+  const reportLead = getReportLead(reportMarkdown, reportTitle);
+  const reportFilename = `${slugifyFilename(reportTitle || workspace.question)}-report.md`;
+  const reportCitationLookup = buildWorkspaceCitationLookup(workspace.citations, workspace.sources);
   const plannedStreams =
     workspace.plan.plan_preview?.plan.streams ?? workspace.plan.approved_plan?.streams ?? [];
   const shellSummary = [
@@ -519,7 +1118,7 @@ export function RunWorkspace({
   const handleCopyReport = async () => {
     if (!reportMarkdown) return;
     try {
-      await navigator.clipboard.writeText(reportMarkdown);
+      await navigator.clipboard.writeText(displayReportMarkdown);
       setReportActionNotice("Report copied.");
     } catch {
       setReportActionNotice("Copy failed.");
@@ -528,7 +1127,7 @@ export function RunWorkspace({
 
   const handleDownloadReport = () => {
     if (!reportMarkdown) return;
-    const blob = new Blob([reportMarkdown], { type: "text/markdown;charset=utf-8" });
+    const blob = new Blob([displayReportMarkdown], { type: "text/markdown;charset=utf-8" });
     const href = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = href;
@@ -540,11 +1139,612 @@ export function RunWorkspace({
     setReportActionNotice("Report downloaded.");
   };
 
+  const renderReportPanelContent = () => {
+    if (reportPanelTab === "report") {
+      return (
+        <MarkdownContent
+          className="workspace-report-markdown"
+          content={reportMarkdown || "_No final report available yet._"}
+          citationLookup={reportCitationLookup}
+          hideCitationBibliography
+          replacementTitle={reportTitle}
+        />
+      );
+    }
+
+    if (reportPanelTab === "overview") {
+      return (
+        <div className="workspace-report-detail">
+          <header className="workspace-report-detail-header">
+            <span>Pipeline</span>
+            <h1>Run Pipeline</h1>
+            <p>{activePhase?.blocked_reason ?? "Phase status, blockers, stream activity, and report progress for this run."}</p>
+          </header>
+          <section className="workspace-report-detail-section">
+            <div className="workspace-report-section-head">
+              <h2>Phase Summary</h2>
+              <span>{workspace.connection.event_count} events</span>
+            </div>
+            <div className="workspace-report-phase-grid">
+              {workspace.phases.map((phase) => (
+                <article className={`workspace-report-phase-card ${phase.status}`} key={phase.key}>
+                  <strong>{phase.label}</strong>
+                  <span>{phase.status.replaceAll("_", " ")}</span>
+                  <small>
+                    {phase.blocked_reason ??
+                      (phase.completed_at ? formatTime(phase.completed_at) : "No blockers")}
+                  </small>
+                  <em>{phase.event_count}</em>
+                </article>
+              ))}
+            </div>
+          </section>
+          <section className="workspace-report-detail-grid two">
+            <article className="workspace-report-detail-section">
+              <div className="workspace-report-section-head">
+                <h2>Blockers And Health</h2>
+              </div>
+              <div className="workspace-report-row-list">
+                {workspace.asset_processing_errors.map((error) => (
+                  <article className="workspace-report-row danger" key={error}>
+                    <strong>Asset processing issue</strong>
+                    <span>{error}</span>
+                  </article>
+                ))}
+                {activePhase?.blocked_reason ? (
+                  <article className="workspace-report-row warning">
+                    <strong>Current blocker</strong>
+                    <span>{activePhase.blocked_reason}</span>
+                  </article>
+                ) : null}
+                {workspace.asset_processing_errors.length === 0 && !activePhase?.blocked_reason ? (
+                  <article className="workspace-report-row">
+                    <strong>No active blockers</strong>
+                    <span>The run is flowing normally.</span>
+                  </article>
+                ) : null}
+              </div>
+            </article>
+            <article className="workspace-report-detail-section">
+              <div className="workspace-report-section-head">
+                <h2>Report Progress</h2>
+                <span>{workspace.report_sections.length} sections</span>
+              </div>
+              <div className="workspace-report-row-list">
+                {workspace.report_sections.map((section) => (
+                  <article className="workspace-report-row" key={section.id}>
+                    <strong>{section.title}</strong>
+                    <span>
+                      {section.grounded_claim_count} grounded / {section.unsupported_claim_count} open
+                    </span>
+                    <small>{section.citation_count} citations · {section.removed_citation_count} removed</small>
+                  </article>
+                ))}
+              </div>
+            </article>
+          </section>
+          <section className="workspace-report-detail-section">
+            <div className="workspace-report-section-head">
+              <h2>Recent Decisions</h2>
+              <span>{visibleDecisions.length}</span>
+            </div>
+            <div className="workspace-report-row-list">
+              {visibleDecisions.slice(0, 8).map((decision) => (
+                <DecisionCard decision={decision} key={decision.id} />
+              ))}
+              {visibleDecisions.length === 0 ? (
+                <article className="workspace-report-row">
+                  <strong>No decisions recorded yet</strong>
+                  <span>Decision records will appear as planning, execution, grounding, and audit steps run.</span>
+                </article>
+              ) : null}
+            </div>
+          </section>
+        </div>
+      );
+    }
+
+    if (reportPanelTab === "plan") {
+      const streams = workspace.plan.plan_preview?.plan.streams ?? workspace.plan.approved_plan?.streams ?? [];
+      return (
+        <div className="workspace-report-detail">
+          <header className="workspace-report-detail-header">
+            <span>Plan</span>
+            <h1>Research Plan</h1>
+            <p>{workspace.plan.plan_preview?.summary ?? workspace.plan.approved_plan?.summary ?? "No plan preview has been generated yet."}</p>
+          </header>
+          <section className="workspace-report-detail-grid two">
+            <article className="workspace-report-detail-section">
+              <div className="workspace-report-section-head">
+                <h2>Plan Preview</h2>
+              </div>
+              {workspace.plan.plan_preview ? (
+                <div className="workspace-report-row-list">
+                  <article className="workspace-report-row">
+                    <strong>{workspace.plan.plan_preview.summary}</strong>
+                    <span>{workspace.plan.plan_preview.hypothesis}</span>
+                    <small>{workspace.plan.plan_preview.budget_decision_reason}</small>
+                  </article>
+                  {workspace.plan.approved_plan ? (
+                    <article className="workspace-report-row muted">
+                      <strong>Approved plan</strong>
+                      <span>{workspace.plan.approved_plan.summary}</span>
+                      <small>{workspace.plan.approved_plan.hypothesis}</small>
+                    </article>
+                  ) : null}
+                </div>
+              ) : (
+                <p className="muted-text">Plan preview will appear here when planning starts.</p>
+              )}
+            </article>
+            <article className="workspace-report-detail-section">
+              <div className="workspace-report-section-head">
+                <h2>Budget</h2>
+              </div>
+              <div className="workspace-report-metric-grid">
+                <article>
+                  <span>Requested</span>
+                  <strong>
+                    {workspace.plan.requested_budget
+                      ? `${workspace.plan.requested_budget.max_streams} / ${workspace.plan.requested_budget.max_queries_per_stream}`
+                      : "n/a"}
+                  </strong>
+                </article>
+                <article>
+                  <span>Recommended</span>
+                  <strong>
+                    {workspace.plan.recommended_budget
+                      ? `${workspace.plan.recommended_budget.max_streams} / ${workspace.plan.recommended_budget.max_queries_per_stream}`
+                      : "n/a"}
+                  </strong>
+                </article>
+                <article>
+                  <span>Effective</span>
+                  <strong>
+                    {workspace.plan.effective_budget
+                      ? `${workspace.plan.effective_budget.max_streams} / ${workspace.plan.effective_budget.max_queries_per_stream}`
+                      : "n/a"}
+                  </strong>
+                </article>
+              </div>
+              <p className="muted-text">{workspace.plan.budget_decision_reason ?? "No explicit budget clamp reason."}</p>
+            </article>
+          </section>
+          <section className="workspace-report-detail-section">
+            <div className="workspace-report-section-head">
+              <h2>Planned Streams</h2>
+              <span>{streams.length}</span>
+            </div>
+            <div className="workspace-report-row-list">
+              {streams.map((stream) => (
+                <article className="workspace-report-row" key={`${stream.name}-${stream.objective}`}>
+                  <strong>{stream.name}</strong>
+                  <span>{stream.objective}</span>
+                  {stream.queries.length ? (
+                    <div className="workspace-token-list">
+                      {stream.queries.map((query) => (
+                        <span className="workspace-token" key={`${stream.name}-${query}`}>
+                          {query}
+                        </span>
+                      ))}
+                    </div>
+                  ) : null}
+                </article>
+              ))}
+              {streams.length === 0 ? (
+                <article className="workspace-report-row">
+                  <strong>No streams yet</strong>
+                  <span>Streams will be listed after planning.</span>
+                </article>
+              ) : null}
+            </div>
+          </section>
+          <section className="workspace-report-detail-grid two">
+            <article className="workspace-report-detail-section">
+              <div className="workspace-report-section-head">
+                <h2>Clarifications</h2>
+              </div>
+              <div className="workspace-report-row-list">
+                {workspace.plan.clarification_session?.questions.map((question) => {
+                  const answer = workspace.plan.clarification_session?.turns.find(
+                    (turn) => turn.question_id === question.id,
+                  );
+                  return (
+                    <article className="workspace-report-row" key={question.id}>
+                      <strong>{question.prompt}</strong>
+                      <span>{answer?.response ?? "Awaiting response"}</span>
+                      <small>{question.rationale}</small>
+                    </article>
+                  );
+                }) ?? (
+                  <article className="workspace-report-row">
+                    <strong>No clarification required</strong>
+                    <span>This run proceeded without a clarification round.</span>
+                  </article>
+                )}
+              </div>
+            </article>
+            <article className="workspace-report-detail-section">
+              <div className="workspace-report-section-head">
+                <h2>Approval History</h2>
+              </div>
+              <div className="workspace-report-row-list">
+                {workspace.plan.approval_history.map((decision, index) => (
+                  <article className="workspace-report-row" key={`${decision.decision}-${decision.created_at}-${index}`}>
+                    <strong>{titleCase(decision.decision)}</strong>
+                    <span>{decision.note ?? "No note provided."}</span>
+                    <small>{formatTime(decision.created_at)}</small>
+                  </article>
+                ))}
+                {workspace.plan.approval_history.length === 0 ? (
+                  <article className="workspace-report-row">
+                    <strong>No approval actions</strong>
+                    <span>Approval history will appear after plan review actions.</span>
+                  </article>
+                ) : null}
+              </div>
+            </article>
+          </section>
+        </div>
+      );
+    }
+
+    if (reportPanelTab === "tasks") {
+      return (
+        <div className="workspace-report-detail">
+          <header className="workspace-report-detail-header">
+            <span>Tasks</span>
+            <h1>Execution Board</h1>
+            <p>{workspace.streams.length} streams, {workspace.streams.reduce((total, stream) => total + stream.tasks.length, 0)} task records.</p>
+          </header>
+          <section className="workspace-report-detail-section">
+            <div className="workspace-report-section-head">
+              <h2>Streams</h2>
+              <span>{selectedStreamId === "all" ? "All streams" : "Filtered"}</span>
+            </div>
+            <div className="workspace-report-filter-row">
+              <button
+                className={`workspace-report-filter ${selectedStreamId === "all" ? "active" : ""}`}
+                onClick={() => setSelectedStreamId("all")}
+                type="button"
+              >
+                All streams
+              </button>
+              {workspace.streams.map((stream) => (
+                <button
+                  className={`workspace-report-filter ${selectedStreamId === stream.id ? "active" : ""}`}
+                  key={stream.id}
+                  onClick={() => setSelectedStreamId(stream.id)}
+                  type="button"
+                >
+                  {stream.name}
+                </button>
+              ))}
+            </div>
+            <div className="workspace-report-stream-grid">
+              {visibleStreams.map((stream) => (
+                <article className="workspace-report-stream-card" key={stream.id}>
+                  <div className="workspace-report-stream-head">
+                    <strong>{stream.name}</strong>
+                    <span>{stream.status}</span>
+                    <small>{stream.query_count} queries · {stream.selected_source_count} sources · {stream.note_count} notes</small>
+                  </div>
+                  <div className="workspace-report-row-list">
+                    {stream.tasks.map((task) => (
+                      <TaskCard key={task.id} task={task} />
+                    ))}
+                    {stream.tasks.length === 0 ? (
+                      <article className="workspace-report-row">
+                        <strong>No task records</strong>
+                        <span>This stream has not emitted task records yet.</span>
+                      </article>
+                    ) : null}
+                  </div>
+                </article>
+              ))}
+            </div>
+          </section>
+        </div>
+      );
+    }
+
+    if (reportPanelTab === "thinking") {
+      return (
+        <div className="workspace-report-detail">
+          <header className="workspace-report-detail-header">
+            <span>Thinking</span>
+            <h1>Structured Reasoning</h1>
+            <p>Decision records, stream agents, tool events, and file context used during this run.</p>
+          </header>
+          <section className="workspace-report-detail-section">
+            <div className="workspace-report-section-head">
+              <h2>{titleCase(thinkingSubtab)}</h2>
+            </div>
+            <div className="workspace-report-filter-row">
+              {(["decisions", "agents", "tools", "files"] as ThinkingSubtab[]).map((subtab) => (
+                <button
+                  className={`workspace-report-filter ${thinkingSubtab === subtab ? "active" : ""}`}
+                  key={subtab}
+                  onClick={() => setThinkingSubtab(subtab)}
+                  type="button"
+                >
+                  {titleCase(subtab)}
+                </button>
+              ))}
+            </div>
+            <div className="workspace-report-row-list">
+              {thinkingSubtab === "decisions"
+                ? visibleDecisions.map((decision) => (
+                    <DecisionCard decision={decision} key={decision.id} />
+                  ))
+                : null}
+              {thinkingSubtab === "tools"
+                ? phaseFilteredEvents
+                    .filter((event) =>
+                      [
+                        "search.performed",
+                        "source.cache.hit",
+                        "source.fetch_failed",
+                        "source.fallback_document.created",
+                        "source.fetched",
+                        "provider.retry",
+                        "tool.budget.low",
+                        "claim.repair.search_performed",
+                        "claim.repair.source_fetched",
+                      ].includes(event.event_type),
+                    )
+                    .slice()
+                    .reverse()
+                    .map((event) => (
+                      <article className="workspace-report-row" key={event.id}>
+                        <strong>{event.event_type}</strong>
+                        <span>{normalizeInlineText(JSON.stringify(event.payload))}</span>
+                        <small>{formatTime(event.created_at)}</small>
+                      </article>
+                    ))
+                : null}
+              {thinkingSubtab === "agents"
+                ? workspace.streams.map((stream) => (
+                    <article className="workspace-report-row" key={stream.id}>
+                      <strong>{stream.name}</strong>
+                      <span>{stream.model}</span>
+                      <small>{stream.objective}</small>
+                    </article>
+                  ))
+                : null}
+              {thinkingSubtab === "files"
+                ? workspace.project_assets_available.concat(workspace.run_assets_available).map((asset) => (
+                    <article className="workspace-report-row" key={asset.id}>
+                      <strong>{asset.label}</strong>
+                      <span>{asset.usage.replaceAll("_", " ")}</span>
+                      <small>{asset.preview_excerpt ?? asset.processing_error ?? "No asset preview."}</small>
+                    </article>
+                  ))
+                : null}
+            </div>
+          </section>
+        </div>
+      );
+    }
+
+    if (reportPanelTab === "sources") {
+      return (
+        <div className="workspace-report-detail">
+          <header className="workspace-report-detail-header">
+            <span>Sources</span>
+            <h1>Source Provenance</h1>
+            <p>{workspace.sources.length} total sources across project corpus, run attachments, fetched web results, and cited records.</p>
+          </header>
+          <section className="workspace-report-detail-grid two">
+            <article className="workspace-report-detail-section">
+              <div className="workspace-report-section-head">
+                <h2>Source Lanes</h2>
+              </div>
+              <div className="workspace-report-row-list">
+                {sourceLanes.map(([label, items]) => (
+                  <article className="workspace-report-row" key={label}>
+                    <strong>{label}</strong>
+                    <span>{items.length} sources</span>
+                    <div className="workspace-report-source-list">
+                      {items.slice(0, 8).map((source) => (
+                        <button
+                          className={`workspace-report-source-pill ${selectedSource?.id === source.id ? "active" : ""}`}
+                          key={source.id}
+                          onClick={() => setSelectedSourceId(source.id)}
+                          type="button"
+                        >
+                          {source.title ?? source.url}
+                        </button>
+                      ))}
+                    </div>
+                  </article>
+                ))}
+              </div>
+            </article>
+            <article className="workspace-report-detail-section">
+              <div className="workspace-report-section-head">
+                <h2>Source Detail</h2>
+              </div>
+              {selectedSource ? (
+                <div className="workspace-report-row-list">
+                  <article className="workspace-report-row">
+                    <strong>{selectedSource.title ?? selectedSource.url}</strong>
+                    <span>{selectedSource.url}</span>
+                    <small>
+                      {selectedSource.origin.replaceAll("_", " ")} · {selectedSource.state} · {selectedSource.provider ?? "unknown provider"}
+                    </small>
+                  </article>
+                  <div className="workspace-report-metric-grid">
+                    <article>
+                      <span>Trust</span>
+                      <strong>{selectedSource.trust_tier ?? "unknown"}</strong>
+                    </article>
+                    <article>
+                      <span>Passages</span>
+                      <strong>{selectedSource.passages_used}</strong>
+                    </article>
+                    <article>
+                      <span>Sections</span>
+                      <strong>{selectedSource.report_sections.length}</strong>
+                    </article>
+                  </div>
+                  {selectedSource.note_summaries.map((summary, index) => (
+                    <article className="workspace-report-row" key={`${selectedSource.id}-summary-${index}`}>
+                      <strong>Note summary</strong>
+                      <span>{summary}</span>
+                    </article>
+                  ))}
+                </div>
+              ) : (
+                <p className="muted-text">Select a source to inspect its provenance.</p>
+              )}
+            </article>
+          </section>
+        </div>
+      );
+    }
+
+    if (reportPanelTab === "citations") {
+      return (
+        <div className="workspace-report-detail">
+          <header className="workspace-report-detail-header">
+            <span>Citations</span>
+            <h1>Citation Audit</h1>
+            <p>{citationSummary.surviving} surviving citations, {citationSummary.removed} removed, {citationSummary.uncitedSources} uncited sources.</p>
+          </header>
+          <section className="workspace-report-detail-grid citations">
+            <article className="workspace-report-detail-section">
+              <div className="workspace-report-section-head">
+                <h2>By Section</h2>
+              </div>
+              <div className="workspace-report-row-list">
+                {groupBySection(workspace.citations).map(([sectionTitle, sectionCitations]) => (
+                  <article className="workspace-report-citation-group" key={sectionTitle}>
+                    <div className="workspace-report-group-head">
+                      <strong>{sectionTitle}</strong>
+                      <span>{sectionCitations.length}</span>
+                    </div>
+                    {sectionCitations.map((citation) => (
+                      <CitationCard
+                        citation={citation}
+                        key={citation.id}
+                        sources={workspace.sources}
+                        selected={selectedCitation?.id === citation.id}
+                        onSelect={() => setSelectedCitationId(citation.id)}
+                        onOpenSection={() => {
+                          const target = workspace.report_sections.find(
+                            (section) => section.title === citation.section_title,
+                          );
+                          if (target) {
+                            setSelectedSectionId(target.id);
+                            setReportPanelTab("report");
+                          }
+                        }}
+                        onOpenSource={() => {
+                          const target = resolveCitationSource(citation, workspace.sources);
+                          if (target) {
+                            setSelectedSourceId(target.id);
+                            setReportPanelTab("sources");
+                          }
+                        }}
+                      />
+                    ))}
+                  </article>
+                ))}
+              </div>
+            </article>
+            <aside className="workspace-report-detail-section sticky">
+              <div className="workspace-report-section-head">
+                <h2>Citation Detail</h2>
+              </div>
+              {selectedCitation ? (
+                <div className="workspace-report-row-list">
+                  <article className={`workspace-report-row ${selectedCitation.status === "removed" ? "danger" : ""}`}>
+                    <strong>{cleanCitationClaimText(selectedCitation.claim)}</strong>
+                    <span>{selectedCitation.section_title}</span>
+                    <small>
+                      {selectedCitation.status}
+                      {selectedCitation.trust_tier ? ` · ${selectedCitation.trust_tier}` : ""}
+                    </small>
+                  </article>
+                  <article className="workspace-report-row muted">
+                    <strong>Source</strong>
+                    <span>{getCitationSourceLabel(selectedCitation, workspace.sources)}</span>
+                  </article>
+                  {selectedCitation.quote ? (
+                    <blockquote className="citation-quote citation-quote-detail">
+                      {normalizeInlineText(selectedCitation.quote)}
+                    </blockquote>
+                  ) : null}
+                  {selectedCitation.audit_reasons.length ? (
+                    <article className="workspace-report-row danger">
+                      <strong>Audit reason</strong>
+                      <span>{selectedCitation.audit_reasons.join(", ")}</span>
+                    </article>
+                  ) : null}
+                </div>
+              ) : (
+                <p className="muted-text">Select a citation to inspect its claim, source, and audit state.</p>
+              )}
+            </aside>
+          </section>
+        </div>
+      );
+    }
+
+    return (
+      <div className="workspace-report-detail">
+        <header className="workspace-report-detail-header">
+          <span>Tool calls</span>
+          <h1>Raw Event Stream</h1>
+          <p>Replay and transport events captured for this run.</p>
+        </header>
+        <section className="workspace-report-detail-grid two">
+          <article className="workspace-report-detail-section">
+            <div className="workspace-report-section-head">
+              <h2>Transport</h2>
+            </div>
+            <div className="workspace-report-metric-grid">
+              <article>
+                <span>Status</span>
+                <strong>{displayConnectionState}</strong>
+              </article>
+              <article>
+                <span>Mode</span>
+                <strong>{connectionMode ?? workspace.connection.stream_mode ?? "n/a"}</strong>
+              </article>
+              <article>
+                <span>Last ID</span>
+                <strong>{workspace.connection.last_event_id}</strong>
+              </article>
+              <article>
+                <span>Backend</span>
+                <strong>{workspace.connection.workflow_backend ?? "local"}</strong>
+              </article>
+            </div>
+          </article>
+          <article className="workspace-report-detail-section">
+            <div className="workspace-report-section-head">
+              <h2>Events</h2>
+              <span>{phaseFilteredEvents.length}</span>
+            </div>
+            <div className="workspace-report-event-list">
+              {phaseFilteredEvents
+                .slice()
+                .reverse()
+                .map((event) => <EventCard event={event} key={`${event.run_id}-${event.id}`} />)}
+            </div>
+          </article>
+        </section>
+      </div>
+    );
+  };
+
   return (
     <section
       className={`panel workspace-panel workspace-shell-panel ${
         detailsOpen ? "activity-open" : ""
-      }`}
+      } ${primaryView === "report" ? "report-open" : ""}`}
     >
       <div className="workspace-shell-header">
         <div className="workspace-shell-title">
@@ -556,23 +1756,6 @@ export function RunWorkspace({
           </span>
         </div>
         <div className="workspace-shell-actions">
-          <div className="workspace-primary-tabs">
-            <button
-              className={`workspace-primary-tab ${primaryView === "chat" ? "active" : ""}`}
-              onClick={() => setPrimaryView("chat")}
-              type="button"
-            >
-              Chat
-            </button>
-            <button
-              className={`workspace-primary-tab ${primaryView === "report" ? "active" : ""}`}
-              onClick={() => setPrimaryView("report")}
-              type="button"
-              disabled={!reportReady}
-            >
-              Final report
-            </button>
-          </div>
           <button
             className="secondary-button"
             aria-label={detailsOpen ? "Hide research activity" : "Show research activity"}
@@ -619,7 +1802,13 @@ export function RunWorkspace({
         </div>
       </div>
 
-      <div className={`workspace-shell-layout ${detailsOpen ? "with-details" : ""}`}>
+      <div
+        ref={shellLayoutRef}
+        style={workspaceShellStyle}
+        className={`workspace-shell-layout ${detailsOpen ? "with-details" : ""} ${
+          primaryView === "report" ? "with-report" : ""
+        }`}
+      >
         <section className="workspace-primary-surface">
           {approvalBanner ? (
             <div className="workspace-banner workspace-banner-inline">
@@ -648,8 +1837,7 @@ export function RunWorkspace({
             </div>
           ) : null}
 
-          {primaryView === "chat" ? (
-            <div className="workspace-chat-shell">
+          <div className="workspace-chat-shell">
               <div className="workspace-thread conversation-thread">
                 <article className="thread-item conversation-turn user prompt-turn">
                   <strong>You</strong>
@@ -756,47 +1944,50 @@ export function RunWorkspace({
                 ) : null}
 
                 {reportReady ? (
-                  <article className="thread-item conversation-turn assistant report-turn">
+                  <article className="thread-item conversation-turn assistant report-turn report-summary-turn">
                     <div className="conversation-turn-header">
                       <strong>Assistant</strong>
-                      <div className="workspace-report-actions">
-                        <button
-                          className="ghost-button"
-                          onClick={() => setReportExpanded((current) => !current)}
-                          type="button"
-                        >
-                          {reportExpanded ? "Collapse report" : "Read full report"}
-                        </button>
-                        <button
-                          className="ghost-button"
-                          onClick={() => setPrimaryView("report")}
-                          type="button"
-                        >
-                          Open report view
-                        </button>
-                        <button
-                          className="ghost-button"
-                          onClick={handleCopyReport}
-                          type="button"
-                        >
-                          Copy
-                        </button>
-                        <button
-                          className="ghost-button"
-                          onClick={handleDownloadReport}
-                          type="button"
-                        >
-                          Download
-                        </button>
+                      <span className="report-ready-label">Report complete</span>
+                    </div>
+                    <div className="report-summary-body">
+                      <h2>{reportTitle}</h2>
+                      {reportLead ? <p>{reportLead}</p> : null}
+                      <div className="report-summary-stats" aria-label="Report summary">
+                        <span>{workspace.sources.length} sources</span>
+                        <span>{workspace.citations.length} citations</span>
+                        <span>{workspace.connection.event_count} events</span>
                       </div>
                     </div>
                     {reportActionNotice ? (
                       <span className="workspace-inline-feedback">{reportActionNotice}</span>
                     ) : null}
-                    <MarkdownContent
-                      className={reportExpanded ? "workspace-report-preview expanded" : "workspace-report-preview collapsed"}
-                      content={reportMarkdown}
-                    />
+                    <div className="workspace-report-actions report-actions-bottom">
+                      <button
+                        className="primary-button"
+                        onClick={() => {
+                          setDetailsOpen(false);
+                          setReportPanelTab("report");
+                          setPrimaryView("report");
+                        }}
+                        type="button"
+                      >
+                        View Report
+                      </button>
+                      <button
+                        className="ghost-button"
+                        onClick={handleCopyReport}
+                        type="button"
+                      >
+                        Copy
+                      </button>
+                      <button
+                        className="ghost-button"
+                        onClick={handleDownloadReport}
+                        type="button"
+                      >
+                        Markdown
+                      </button>
+                    </div>
                   </article>
                 ) : workspace.status === "failed" ||
                   workspace.status === "cancelled" ? (
@@ -897,74 +2088,114 @@ export function RunWorkspace({
                   </article>
                 ))}
               </div>
-
-            </div>
-          ) : (
-            <div className="workspace-report-shell">
-              <div className="workspace-report-header">
-                <div>
-                  <p className="eyebrow">Final report</p>
-                  <h3>{selectedSection?.title ?? "Grounded research report"}</h3>
-                </div>
-                <div className="workspace-report-actions">
-                  <button
-                    className="ghost-button"
-                    onClick={() => setPrimaryView("chat")}
-                    type="button"
-                  >
-                    Back to chat
-                  </button>
-                  <button
-                    className="ghost-button"
-                    onClick={() => {
-                      setDetailsOpen(true);
-                      setDetailsTab("citations");
-                    }}
-                    type="button"
-                  >
-                    View citations
-                  </button>
-                  <button className="ghost-button" onClick={handleCopyReport} type="button">
-                    Copy
-                  </button>
-                  <button className="ghost-button" onClick={handleDownloadReport} type="button">
-                    Download
-                  </button>
-                </div>
-              </div>
-              {reportActionNotice ? (
-                <span className="workspace-inline-feedback">{reportActionNotice}</span>
-              ) : null}
-              {workspace.report_sections.length ? (
-                <div className="workspace-report-sections">
-                  {workspace.report_sections.map((section) => (
-                    <button
-                      className={`workspace-report-section-tab ${
-                        selectedSection?.id === section.id ? "active" : ""
-                      }`}
-                      key={section.id}
-                      onClick={() => setSelectedSectionId(section.id)}
-                      type="button"
-                    >
-                      <span>{section.title}</span>
-                      <small>{section.citation_count} cites</small>
-                    </button>
-                  ))}
-                </div>
-              ) : null}
-              <article className="workspace-report-body workspace-scroll-panel">
-                <MarkdownContent
-                  className="workspace-report-markdown"
-                  content={
-                    selectedSection?.body_markdown ||
-                    workspace.final_report_markdown ||
-                    "_No final report available yet._"
-                  }
-                />
-              </article>
-            </div>
-          )}
+          </div>
         </section>
+
+        <button
+          className="workspace-research-edge-tab"
+          onClick={() => {
+            setPrimaryView("chat");
+            setDetailsOpen(true);
+          }}
+          type="button"
+        >
+          Show Research
+        </button>
+
+        {reportReady ? (
+          <aside
+            aria-hidden={primaryView !== "report"}
+            aria-label="Final report"
+            className="workspace-report-panel"
+          >
+            <div
+              aria-label="Resize report panel"
+              aria-orientation="vertical"
+              aria-valuemax={MAX_REPORT_PANE_WIDTH}
+              aria-valuemin={MIN_REPORT_PANE_WIDTH}
+              aria-valuenow={Math.round(reportPaneWidth)}
+              className="workspace-report-resize-handle"
+              onKeyDown={handleReportResizeKeyDown}
+              onPointerDown={handleReportResizePointerDown}
+              role="separator"
+              tabIndex={primaryView === "report" ? 0 : -1}
+              title="Drag to resize report"
+            />
+            <div className="workspace-report-panel-topbar">
+              <div className="workspace-report-panel-tabs">
+                {REPORT_PANEL_TABS.map((tab) => (
+                  <button
+                    className={`workspace-report-panel-tab ${
+                      reportPanelTab === tab.key ? "active" : ""
+                    }`}
+                    key={tab.key}
+                    onClick={() => {
+                      setReportPanelTab(tab.key);
+                      if (tab.key !== "report") {
+                        setDetailsOpen(false);
+                        setDetailsTab(tab.key);
+                      }
+                    }}
+                    tabIndex={primaryView === "report" ? 0 : -1}
+                    type="button"
+                  >
+                    {tab.label}
+                  </button>
+                ))}
+              </div>
+              <button
+                aria-label="Stop researching"
+                className="workspace-report-stop"
+                disabled={
+                  workspace.status === "completed" ||
+                  workspace.status === "failed" ||
+                  workspace.status === "cancelled"
+                }
+                onClick={() => onCancel?.(workspace.run_id)}
+                title="Stop researching"
+                tabIndex={primaryView === "report" ? 0 : -1}
+                type="button"
+              >
+                Stop Researching
+              </button>
+              <button
+                aria-label="Close report"
+                className="workspace-report-close"
+                onClick={() => setPrimaryView("chat")}
+                tabIndex={primaryView === "report" ? 0 : -1}
+                type="button"
+              >
+                <span aria-hidden />
+              </button>
+            </div>
+            {reportActionNotice ? (
+              <span className="workspace-inline-feedback">{reportActionNotice}</span>
+            ) : null}
+            <article className="workspace-report-canvas">
+              {renderReportPanelContent()}
+            </article>
+            {reportPanelTab === "report" ? (
+              <div className="workspace-report-footer-actions">
+              <button
+                className="ghost-button"
+                onClick={handleDownloadReport}
+                tabIndex={primaryView === "report" ? 0 : -1}
+                type="button"
+              >
+                Markdown
+              </button>
+              <button
+                className="ghost-button"
+                onClick={handleCopyReport}
+                tabIndex={primaryView === "report" ? 0 : -1}
+                type="button"
+              >
+                Copy Memo
+              </button>
+              </div>
+            ) : null}
+          </aside>
+        ) : null}
 
         {detailsOpen ? (
           <aside className="workspace-details-panel" aria-label="Research Activity">
@@ -982,71 +2213,72 @@ export function RunWorkspace({
               </button>
             </div>
 
-            <div className="workspace-details-summary">
-              {shellSummary.map((item) => (
-                <article className="workspace-context-card" key={item.label}>
-                  <span className="workspace-context-label">{item.label}</span>
-                  <strong>{item.value}</strong>
+            <div className="workspace-details-scroll" ref={detailsScrollRef}>
+              <div className="workspace-details-summary">
+                {shellSummary.map((item) => (
+                  <article className="workspace-context-card" key={item.label}>
+                    <span className="workspace-context-label">{item.label}</span>
+                    <strong>{item.value}</strong>
+                  </article>
+                ))}
+                <article className="workspace-context-card">
+                  <span className="workspace-context-label">Sources</span>
+                  <strong>
+                    {workspace.source_selection.length
+                      ? workspace.source_selection.join(", ")
+                      : "deployment default"}
+                  </strong>
                 </article>
-              ))}
-              <article className="workspace-context-card">
-                <span className="workspace-context-label">Sources</span>
-                <strong>
-                  {workspace.source_selection.length
-                    ? workspace.source_selection.join(", ")
-                    : "deployment default"}
-                </strong>
-              </article>
-              <article className="workspace-context-card">
-                <span className="workspace-context-label">Project</span>
-                <strong>{workspace.project_id ? "attached" : "none"}</strong>
-              </article>
-            </div>
+                <article className="workspace-context-card">
+                  <span className="workspace-context-label">Project</span>
+                  <strong>{workspace.project_id ? "attached" : "none"}</strong>
+                </article>
+              </div>
 
-            <div className="phase-rail phase-rail-details">
-              {workspace.phases.map((phase) => (
-                <button
-                  className={`phase-node ${phase.status} ${
-                    focusedPhase === phase.key ? "active" : ""
-                  }`}
-                  key={phase.key}
-                  onClick={() => {
-                    setFocusedPhase((current) => (current === phase.key ? null : phase.key));
-                    setDetailsTab(PHASE_TO_DETAILS_TAB[phase.key]);
-                  }}
-                  type="button"
-                >
-                  <span className="phase-node-title">{phase.label}</span>
-                  <small>{phase.status}</small>
-                  <strong>{phase.event_count}</strong>
-                </button>
-              ))}
-            </div>
+              <div className="phase-rail phase-rail-details">
+                {workspace.phases.map((phase) => (
+                  <button
+                    className={`phase-node ${phase.status} ${
+                      focusedPhase === phase.key ? "active" : ""
+                    }`}
+                    key={phase.key}
+                    onClick={() => {
+                      setFocusedPhase((current) => (current === phase.key ? null : phase.key));
+                      setDetailsTab(PHASE_TO_DETAILS_TAB[phase.key]);
+                    }}
+                    type="button"
+                  >
+                    <span className="phase-node-title">{phase.label}</span>
+                    <small>{phase.status}</small>
+                    <strong>{phase.event_count}</strong>
+                  </button>
+                ))}
+              </div>
 
-            <div className="workspace-tabs">
-              {(
-                [
-                  "overview",
-                  "plan",
-                  "tasks",
-                  "thinking",
-                  "sources",
-                  "citations",
-                  "trace",
-                ] as WorkspaceDetailsTab[]
-              ).map((tab) => (
-                <button
-                  className={`workspace-tab ${detailsTab === tab ? "active" : ""}`}
-                  key={tab}
-                  onClick={() => setDetailsTab(tab)}
-                  type="button"
-                >
-                  {DETAIL_TAB_LABELS[tab]}
-                </button>
-              ))}
-            </div>
+              <div className="workspace-tabs">
+                {(
+                  [
+                    "overview",
+                    "plan",
+                    "tasks",
+                    "thinking",
+                    "sources",
+                    "citations",
+                    "trace",
+                  ] as WorkspaceDetailsTab[]
+                ).map((tab) => (
+                  <button
+                    className={`workspace-tab ${detailsTab === tab ? "active" : ""}`}
+                    key={tab}
+                    onClick={() => setDetailsTab(tab)}
+                    type="button"
+                  >
+                    {DETAIL_TAB_LABELS[tab]}
+                  </button>
+                ))}
+              </div>
 
-            <div className="workspace-details-content">
+              <div className="workspace-details-content">
       {detailsTab === "overview" ? (
         <div className="workspace-grid overview-grid">
           <section className="workspace-card">
@@ -1582,6 +2814,7 @@ export function RunWorkspace({
                           );
                           if (target) {
                             setSelectedSectionId(target.id);
+                            setReportPanelTab("report");
                             setPrimaryView("report");
                           }
                         }}
@@ -1589,8 +2822,9 @@ export function RunWorkspace({
                           const target = resolveCitationSource(citation, workspace.sources);
                           if (target) {
                             setSelectedSourceId(target.id);
-                            setDetailsOpen(true);
-                            setDetailsTab("sources");
+                            setReportPanelTab("sources");
+                            setPrimaryView("report");
+                            setDetailsOpen(false);
                           }
                         }}
                       />
@@ -1621,7 +2855,7 @@ export function RunWorkspace({
             {selectedCitation ? (
               <div className="workspace-stack workspace-scroll-panel">
                 <article className={`workspace-inline-card ${selectedCitation.status === "removed" ? "danger" : ""}`}>
-                  <strong>{normalizeInlineText(selectedCitation.claim)}</strong>
+                  <strong>{cleanCitationClaimText(selectedCitation.claim)}</strong>
                   <span>{selectedCitation.section_title}</span>
                   <small>
                     {selectedCitation.status}
@@ -1652,6 +2886,7 @@ export function RunWorkspace({
                       );
                       if (target) {
                         setSelectedSectionId(target.id);
+                        setReportPanelTab("report");
                         setPrimaryView("report");
                       }
                     }}
@@ -1668,8 +2903,9 @@ export function RunWorkspace({
                       );
                       if (target) {
                         setSelectedSourceId(target.id);
-                        setDetailsOpen(true);
-                        setDetailsTab("sources");
+                        setReportPanelTab("sources");
+                        setPrimaryView("report");
+                        setDetailsOpen(false);
                       }
                     }}
                     type="button"
@@ -1724,6 +2960,7 @@ export function RunWorkspace({
           </section>
         </div>
       ) : null}
+            </div>
             </div>
           </aside>
         ) : null}
@@ -1803,6 +3040,7 @@ function CitationCard({
   onOpenSource: () => void;
 }) {
   const sourceLabel = getCitationSourceLabel(citation, sources);
+  const claim = cleanCitationClaimText(citation.claim);
   const quote = normalizeInlineText(citation.quote);
 
   return (
@@ -1820,7 +3058,7 @@ function CitationCard({
     >
       <div className="citation-card-header">
         <div className="citation-card-heading">
-          <strong>{normalizeInlineText(citation.claim)}</strong>
+          <strong>{claim}</strong>
           <div className="citation-card-meta">
             <span className={`pill ${citation.status === "removed" ? "status-failed" : "muted"}`}>
               {citation.status}

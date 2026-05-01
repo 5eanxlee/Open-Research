@@ -145,6 +145,85 @@ def strip_markdown_fences(text: str) -> str:
     return stripped.strip()
 
 
+_TITLE_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "based",
+    "by",
+    "compare",
+    "current",
+    "evaluate",
+    "explain",
+    "find",
+    "for",
+    "from",
+    "how",
+    "identify",
+    "in",
+    "include",
+    "into",
+    "is",
+    "map",
+    "of",
+    "on",
+    "or",
+    "recent",
+    "research",
+    "should",
+    "state",
+    "survey",
+    "the",
+    "to",
+    "what",
+    "when",
+    "with",
+}
+
+
+def derive_report_title(prompt: str, *, max_words: int = 12) -> str:
+    cleaned = clean_text(prompt)
+    cleaned = re.split(
+        r"\b(?:evidence requirements|avoid seo|separate proven|prioritize)\b",
+        cleaned,
+        maxsplit=1,
+        flags=re.I,
+    )[0]
+    cleaned = re.sub(r"^as of [A-Za-z]+ \d{1,2}, \d{4},?\s*", "", cleaned, flags=re.I)
+    cleaned = re.sub(
+        r"^(?:please\s+)?(?:research|evaluate|survey|compare|find|map|explain)\s+",
+        "",
+        cleaned,
+        flags=re.I,
+    )
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9/-]*", cleaned)
+    title_words = words[:max_words]
+    if len(title_words) < 3:
+        title_words = re.findall(r"[A-Za-z0-9][A-Za-z0-9/-]*", prompt)[:max_words]
+    title = " ".join(title_words).strip(" .,:;")
+    return title[:1].upper() + title[1:] if title else "Research Report"
+
+
+def derive_conversation_topic(prompt: str, *, min_words: int = 3, max_words: int = 6) -> str:
+    base_title = derive_report_title(prompt, max_words=14)
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9/-]*", base_title)
+    selected = [
+        word
+        for word in words
+        if word.lower() not in _TITLE_STOPWORDS and not re.fullmatch(r"\d{4}", word)
+    ]
+    if len(selected) < min_words:
+        selected = [word for word in words if not re.fullmatch(r"\d{4}", word)]
+    selected = selected[:max_words]
+    if len(selected) < min_words:
+        selected = words[:max_words]
+    topic = " ".join(selected).strip(" .,:;")
+    return topic[:1].upper() + topic[1:] if topic else "Research Topic"
+
+
 def cosine_similarity(
     left: list[float] | tuple[float, ...],
     right: list[float] | tuple[float, ...],

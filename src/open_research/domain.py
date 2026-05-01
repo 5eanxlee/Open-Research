@@ -656,6 +656,8 @@ class ReportSection(StrictModel):
 
 
 class DraftReport(StrictModel):
+    title: str | None = None
+    conversation_topic: str | None = None
     executive_summary: str
     sections: list[ReportSection]
     open_questions: list[str] = Field(default_factory=list)
@@ -700,6 +702,8 @@ class FinalReport(StrictModel):
     citations: list[CitationRecord]
     unsupported_claims: list[str] = Field(default_factory=list)
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    title: str | None = None
+    conversation_topic: str | None = None
 
 
 class CompletionGateResult(StrictModel):
@@ -983,6 +987,8 @@ class PublicRuntimeConfig(StrictModel):
 class RunSummary(StrictModel):
     id: str
     question: str
+    conversation_topic: str | None = None
+    report_title: str | None = None
     profile_id: str = "default"
     project_id: str | None = None
     status: RunStatus
@@ -1190,6 +1196,7 @@ class WorkspaceCitationView(StrictModel):
     section_title: str
     claim: str
     status: str
+    citation_number: int | None = None
     source_id: str | None = None
     source_title: str | None = None
     source_url: str | None = None
@@ -1256,6 +1263,8 @@ class WorkspacePlanView(StrictModel):
 class RunWorkspaceSnapshot(StrictModel):
     run_id: str
     question: str
+    conversation_topic: str | None = None
+    report_title: str | None = None
     project_id: str | None = None
     status: RunStatus
     execution_mode: ExecutionMode = ExecutionMode.STANDARD
