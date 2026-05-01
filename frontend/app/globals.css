@@ -8658,7 +8658,7 @@ body,
 
 .project-source-form {
   display: grid;
-  grid-template-columns: 150px minmax(120px, 0.8fr) minmax(220px, 1.2fr) auto auto;
+  grid-template-columns: minmax(150px, 220px) auto;
   gap: 8px;
   align-items: center;
   padding-bottom: 14px;

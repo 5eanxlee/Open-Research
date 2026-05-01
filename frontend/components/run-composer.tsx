@@ -7,7 +7,6 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { CustomSelect, type CustomSelectOption } from "@/components/ui/custom-select";
 import {
-  addProjectAssets,
   createProject,
   deleteProjectAsset,
   deleteStagedAsset,
@@ -23,7 +22,6 @@ import type {
   ModelConfigOverride,
   ResearchAssetRecord,
   ResearchAssetUsage,
-  ResearchInputAsset,
   PublicRuntimeConfig,
   ProjectSummary,
   StagedAssetRecord,
@@ -385,9 +383,6 @@ export function ProjectPanel({ publicConfig, onProjectChange }: ProjectPanelProp
   const apiBaseUrl = useResearchStore((state) => state.apiBaseUrl);
   const selectedProjectId = useResearchStore((state) => state.selectedProjectId);
   const setSelectedProjectId = useResearchStore((state) => state.setSelectedProjectId);
-  const runInputAssets = useResearchStore((state) => state.runInputAssets);
-  const addRunInputAsset = useResearchStore((state) => state.addRunInputAsset);
-  const removeRunInputAsset = useResearchStore((state) => state.removeRunInputAsset);
   const stagedRunAssets = useResearchStore((state) => state.stagedRunAssets);
   const addStagedRunAssets = useResearchStore((state) => state.addStagedRunAssets);
   const removeStagedRunAsset = useResearchStore((state) => state.removeStagedRunAsset);
@@ -395,14 +390,6 @@ export function ProjectPanel({ publicConfig, onProjectChange }: ProjectPanelProp
   const [showNewProject, setShowNewProject] = useState(false);
   const [newProjectName, setNewProjectName] = useState("");
   const [newProjectDescription, setNewProjectDescription] = useState("");
-  const [projectPlanningLabel, setProjectPlanningLabel] = useState("");
-  const [projectPlanningUrl, setProjectPlanningUrl] = useState("");
-  const [projectReferenceLabel, setProjectReferenceLabel] = useState("");
-  const [projectReferenceUrl, setProjectReferenceUrl] = useState("");
-  const [runPlanningLabel, setRunPlanningLabel] = useState("");
-  const [runPlanningUrl, setRunPlanningUrl] = useState("");
-  const [runReferenceLabel, setRunReferenceLabel] = useState("");
-  const [runReferenceUrl, setRunReferenceUrl] = useState("");
   const [error, setError] = useState<string | null>(null);
   const projectPlanningInputRef = useRef<HTMLInputElement>(null);
   const projectReferenceInputRef = useRef<HTMLInputElement>(null);
@@ -438,24 +425,6 @@ export function ProjectPanel({ publicConfig, onProjectChange }: ProjectPanelProp
     },
     onError: (err) => {
       setError(err instanceof Error ? err.message : "Failed to create project.");
-    },
-  });
-
-  const addProjectAssetsMutation = useMutation({
-    mutationFn: (assets: ResearchInputAsset[]) =>
-      addProjectAssets(apiBaseUrl, selectedProjectId ?? "", assets),
-    onSuccess: async () => {
-      setProjectPlanningLabel("");
-      setProjectPlanningUrl("");
-      setProjectReferenceLabel("");
-      setProjectReferenceUrl("");
-      await queryClient.invalidateQueries({
-        queryKey: ["project-detail", apiBaseUrl, selectedProjectId],
-      });
-      await queryClient.invalidateQueries({ queryKey: ["projects", apiBaseUrl] });
-    },
-    onError: (err) => {
-      setError(err instanceof Error ? err.message : "Failed to save asset.");
     },
   });
 
@@ -531,63 +500,23 @@ export function ProjectPanel({ publicConfig, onProjectChange }: ProjectPanelProp
     stageRunFilesMutation.mutate({ files, usage });
   };
 
-  const submitProjectUrl = (usage: ResearchAssetUsage) => {
-    const label = usage === "planning_context" ? projectPlanningLabel : projectReferenceLabel;
-    const value = usage === "planning_context" ? projectPlanningUrl : projectReferenceUrl;
-    if (!label.trim() || !value.trim()) {
-      setError("Both a label and URL are required.");
-      return;
-    }
-    addProjectAssetsMutation.mutate([
-      {
-        source_type: "url",
-        usage,
-        label: label.trim(),
-        url: value.trim(),
-        description: null,
-      },
-    ]);
-    setError(null);
-  };
-
-  const submitRunUrl = (usage: ResearchAssetUsage) => {
-    const label = usage === "planning_context" ? runPlanningLabel : runReferenceLabel;
-    const value = usage === "planning_context" ? runPlanningUrl : runReferenceUrl;
-    if (!label.trim() || !value.trim()) {
-      setError("Both a label and URL are required.");
-      return;
-    }
-    addRunInputAsset({
-      source_type: "url",
-      usage,
-      label: label.trim(),
-      url: value.trim(),
-      description: null,
-    });
-    if (usage === "planning_context") {
-      setRunPlanningLabel("");
-      setRunPlanningUrl("");
-    } else {
-      setRunReferenceLabel("");
-      setRunReferenceUrl("");
-    }
-    setError(null);
-  };
-
   const projects = projectsQuery.data ?? [];
   const currentProject = projectDetailQuery.data;
   const projectPlanningAssets =
-    currentProject?.assets.filter((asset) => asset.usage === "planning_context") ?? [];
+    currentProject?.assets.filter(
+      (asset) => asset.usage === "planning_context" && asset.source_type === "file",
+    ) ?? [];
   const projectReferenceAssets =
-    currentProject?.assets.filter((asset) => asset.usage === "reference_source") ?? [];
-  const runPlanningAssets = runInputAssets.filter((asset) => asset.usage === "planning_context");
-  const runReferenceAssets = runInputAssets.filter((asset) => asset.usage === "reference_source");
+    currentProject?.assets.filter(
+      (asset) => asset.usage === "reference_source" && asset.source_type === "file",
+    ) ?? [];
   const stagedPlanningAssets = stagedRunAssets.filter(
     (asset) => asset.usage === "planning_context",
   );
   const stagedReferenceAssets = stagedRunAssets.filter(
     (asset) => asset.usage === "reference_source",
   );
+  const projectAssetCount = projectPlanningAssets.length + projectReferenceAssets.length;
 
   const renderResearchAssetCard = (
     asset: ResearchAssetRecord,
@@ -601,7 +530,7 @@ export function ProjectPanel({ publicConfig, onProjectChange }: ProjectPanelProp
         </div>
         <div className="inline-pills">
           <span className="pill muted">{describeAssetUsage(asset.usage)}</span>
-          <span className="pill muted">{asset.source_type === "url" ? "URL" : "File"}</span>
+          <span className="pill muted">File</span>
           {options.projectScoped ? <span className="pill muted">Project</span> : null}
         </div>
       </div>
@@ -627,27 +556,6 @@ export function ProjectPanel({ publicConfig, onProjectChange }: ProjectPanelProp
           </button>
         </div>
       ) : null}
-    </li>
-  );
-
-  const renderRunUrlAsset = (asset: ResearchInputAsset, index: number) => (
-    <li key={`${asset.label}-${index}`} className="project-asset-card">
-      <div className="project-asset-card-head">
-        <div className="project-asset-title-group">
-          <strong>{asset.label}</strong>
-          <span className="project-asset-status">queued URL</span>
-        </div>
-        <div className="inline-pills">
-          <span className="pill muted">{describeAssetUsage(asset.usage)}</span>
-          <span className="pill muted">Run</span>
-        </div>
-      </div>
-      {asset.url ? <code className="project-asset-location">{asset.url}</code> : null}
-      <div className="project-asset-actions">
-        <button className="inline-action danger-text" onClick={() => removeRunInputAsset(index)} type="button">
-          Remove
-        </button>
-      </div>
     </li>
   );
 
@@ -685,52 +593,6 @@ export function ProjectPanel({ publicConfig, onProjectChange }: ProjectPanelProp
         </button>
       </div>
     </li>
-  );
-
-  const renderUrlComposer = (
-    usage: ResearchAssetUsage,
-    scope: "project" | "run",
-    label: string,
-    value: string,
-    setLabel: (value: string) => void,
-    setValue: (value: string) => void,
-  ) => (
-    <div className="project-inline-form">
-      <input
-        className="text-input"
-        value={label}
-        onChange={(event) => setLabel(event.target.value)}
-        placeholder="Label"
-      />
-      <input
-        className="text-input"
-        value={value}
-        onChange={(event) => setValue(event.target.value)}
-        placeholder="https://..."
-        onKeyDown={(event) => {
-          if (event.key === "Enter") {
-            if (scope === "project") {
-              submitProjectUrl(usage);
-            } else {
-              submitRunUrl(usage);
-            }
-          }
-        }}
-      />
-      <button
-        className="secondary-button"
-        onClick={() => {
-          if (scope === "project") {
-            submitProjectUrl(usage);
-          } else {
-            submitRunUrl(usage);
-          }
-        }}
-        type="button"
-      >
-        Add URL
-      </button>
-    </div>
   );
 
   return (
@@ -809,11 +671,11 @@ export function ProjectPanel({ publicConfig, onProjectChange }: ProjectPanelProp
         </span>
         {selectedProjectId ? (
           <span className="pill muted">
-            {currentProject?.assets.length ?? 0} corpus assets
+            {projectAssetCount} corpus files
           </span>
         ) : null}
         <span className="pill muted">
-          {runInputAssets.length + stagedRunAssets.length} run assets
+          {stagedRunAssets.length} run files
         </span>
         {limits ? (
           <span className="pill muted">
@@ -872,14 +734,6 @@ export function ProjectPanel({ publicConfig, onProjectChange }: ProjectPanelProp
                 </button>
               </div>
             </div>
-            {renderUrlComposer(
-              "planning_context",
-              "project",
-              projectPlanningLabel,
-              projectPlanningUrl,
-              setProjectPlanningLabel,
-              setProjectPlanningUrl,
-            )}
             {projectPlanningAssets.length > 0 ? (
               <ul className="project-asset-list detailed">
                 {projectPlanningAssets.map((asset) =>
@@ -908,20 +762,9 @@ export function ProjectPanel({ publicConfig, onProjectChange }: ProjectPanelProp
               </button>
             </div>
           </div>
-          {renderUrlComposer(
-            "planning_context",
-            "run",
-            runPlanningLabel,
-            runPlanningUrl,
-            setRunPlanningLabel,
-            setRunPlanningUrl,
-          )}
-          {runPlanningAssets.length > 0 || stagedPlanningAssets.length > 0 ? (
+          {stagedPlanningAssets.length > 0 ? (
             <ul className="project-asset-list detailed">
               {stagedPlanningAssets.map((asset) => renderStagedAssetCard(asset))}
-              {runPlanningAssets.map((asset, index) =>
-                renderRunUrlAsset(asset, runInputAssets.indexOf(asset, index)),
-              )}
             </ul>
           ) : null}
         </div>
@@ -947,14 +790,6 @@ export function ProjectPanel({ publicConfig, onProjectChange }: ProjectPanelProp
                 </button>
               </div>
             </div>
-            {renderUrlComposer(
-              "reference_source",
-              "project",
-              projectReferenceLabel,
-              projectReferenceUrl,
-              setProjectReferenceLabel,
-              setProjectReferenceUrl,
-            )}
             {projectReferenceAssets.length > 0 ? (
               <ul className="project-asset-list detailed">
                 {projectReferenceAssets.map((asset) =>
@@ -983,20 +818,9 @@ export function ProjectPanel({ publicConfig, onProjectChange }: ProjectPanelProp
               </button>
             </div>
           </div>
-          {renderUrlComposer(
-            "reference_source",
-            "run",
-            runReferenceLabel,
-            runReferenceUrl,
-            setRunReferenceLabel,
-            setRunReferenceUrl,
-          )}
-          {runReferenceAssets.length > 0 || stagedReferenceAssets.length > 0 ? (
+          {stagedReferenceAssets.length > 0 ? (
             <ul className="project-asset-list detailed">
               {stagedReferenceAssets.map((asset) => renderStagedAssetCard(asset))}
-              {runReferenceAssets.map((asset, index) =>
-                renderRunUrlAsset(asset, runInputAssets.indexOf(asset, index)),
-              )}
             </ul>
           ) : null}
         </div>

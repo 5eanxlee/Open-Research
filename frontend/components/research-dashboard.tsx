@@ -8,7 +8,6 @@ import {
   Folder,
   FolderKanban,
   FolderPlus,
-  Link2,
   Moon,
   PanelLeftClose,
   PanelLeftOpen,
@@ -27,7 +26,6 @@ import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 
 import {
-  addProjectAssets,
   answerClarification,
   approvePlan,
   cancelRun,
@@ -55,7 +53,6 @@ import type {
   ProjectSummary,
   ResearchAssetRecord,
   ResearchAssetUsage,
-  ResearchInputAsset,
   RunConversationMessage,
   RunDetail,
   RunEvent,
@@ -227,8 +224,6 @@ export function ResearchDashboard({ initialProjectId }: ResearchDashboardProps) 
   const [projectHomeTab, setProjectHomeTab] = useState<ProjectHomeTab>("chats");
   const [projectSourceUsage, setProjectSourceUsage] =
     useState<ResearchAssetUsage>("reference_source");
-  const [projectSourceLabel, setProjectSourceLabel] = useState("");
-  const [projectSourceUrl, setProjectSourceUrl] = useState("");
   const [projectSourceError, setProjectSourceError] = useState<string | null>(null);
   const centerScrollRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -425,23 +420,6 @@ export function ResearchDashboard({ initialProjectId }: ResearchDashboardProps) 
     },
     onError: (error) => {
       setSubmitError(error instanceof Error ? error.message : "Failed to create project.");
-    },
-  });
-
-  const addProjectSourceMutation = useMutation({
-    mutationFn: (asset: ResearchInputAsset) =>
-      addProjectAssets(apiBaseUrl, effectiveProjectId ?? "", [asset]),
-    onSuccess: async () => {
-      setProjectSourceLabel("");
-      setProjectSourceUrl("");
-      setProjectSourceError(null);
-      await queryClient.invalidateQueries({
-        queryKey: ["project-detail", apiBaseUrl, effectiveProjectId],
-      });
-      await queryClient.invalidateQueries({ queryKey: ["projects", apiBaseUrl] });
-    },
-    onError: (error) => {
-      setProjectSourceError(error instanceof Error ? error.message : "Failed to add source.");
     },
   });
 
@@ -663,15 +641,19 @@ export function ResearchDashboard({ initialProjectId }: ResearchDashboardProps) 
           updated_at: "",
         }
       : null);
-  const activeProjectAssets = projectDetailQuery.data?.assets ?? [];
-  const visibleRuns = useMemo(
+  const activeProjectAssets = useMemo(
     () =>
-      effectiveProjectId
-        ? (runsQuery.data ?? []).filter((run) => run.project_id === effectiveProjectId)
-        : (runsQuery.data ?? []),
-    [runsQuery.data, effectiveProjectId],
+      (projectDetailQuery.data?.assets ?? []).filter(
+        (asset) => asset.source_type === "file",
+      ),
+    [projectDetailQuery.data?.assets],
   );
-  const sortedProjectRuns = useMemo(() => sortRunsByUpdatedAt(visibleRuns), [visibleRuns]);
+  const globalRuns = runsQuery.data ?? [];
+  const projectRuns = useMemo(
+    () => globalRuns.filter((run) => run.project_id === effectiveProjectId),
+    [globalRuns, effectiveProjectId],
+  );
+  const sortedProjectRuns = useMemo(() => sortRunsByUpdatedAt(projectRuns), [projectRuns]);
   const eventFeed = useMemo<RunEvent[]>(
     () => streamState?.events ?? activeDetail?.events ?? [],
     [activeDetail?.events, streamState?.events],
@@ -767,25 +749,6 @@ export function ResearchDashboard({ initialProjectId }: ResearchDashboardProps) 
       e.preventDefault();
       handleSubmit();
     }
-  };
-
-  const handleProjectSourceSubmit = (event: React.FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    if (!effectiveProjectId) {
-      setProjectSourceError("Select a project first.");
-      return;
-    }
-    if (!projectSourceLabel.trim() || !projectSourceUrl.trim()) {
-      setProjectSourceError("Add both a source label and URL.");
-      return;
-    }
-    addProjectSourceMutation.mutate({
-      source_type: "url",
-      usage: projectSourceUsage,
-      label: projectSourceLabel.trim(),
-      url: projectSourceUrl.trim(),
-      description: null,
-    });
   };
 
   const handleProjectSourceFiles = (files: FileList | null) => {
@@ -1004,7 +967,7 @@ export function ResearchDashboard({ initialProjectId }: ResearchDashboardProps) 
               </section>
 
               <RunHistory
-                runs={visibleRuns}
+                runs={globalRuns}
                 isLoading={runsQuery.isLoading}
                 errorMessage={
                   runsQuery.error instanceof Error ? runsQuery.error.message : null
@@ -1140,7 +1103,7 @@ export function ResearchDashboard({ initialProjectId }: ResearchDashboardProps) 
                         event.currentTarget.value = "";
                       }}
                     />
-                    <form className="project-source-form" onSubmit={handleProjectSourceSubmit}>
+                    <div className="project-source-form">
                       <label className="sr-only" htmlFor="project-source-usage">
                         Source role
                       </label>
@@ -1155,34 +1118,6 @@ export function ResearchDashboard({ initialProjectId }: ResearchDashboardProps) 
                         <option value="reference_source">Reference source</option>
                         <option value="planning_context">Planning context</option>
                       </select>
-                      <label className="sr-only" htmlFor="project-source-label">
-                        Source label
-                      </label>
-                      <input
-                        className="text-input"
-                        id="project-source-label"
-                        onChange={(event) => setProjectSourceLabel(event.target.value)}
-                        placeholder="Source label"
-                        value={projectSourceLabel}
-                      />
-                      <label className="sr-only" htmlFor="project-source-url">
-                        Source URL
-                      </label>
-                      <input
-                        className="text-input"
-                        id="project-source-url"
-                        onChange={(event) => setProjectSourceUrl(event.target.value)}
-                        placeholder="https://..."
-                        value={projectSourceUrl}
-                      />
-                      <button
-                        className="secondary-button"
-                        disabled={addProjectSourceMutation.isPending}
-                        type="submit"
-                      >
-                        <Link2 aria-hidden size={14} strokeWidth={1.9} />
-                        <span>Add source</span>
-                      </button>
                       <button
                         className="secondary-button"
                         disabled={uploadProjectSourceMutation.isPending}
@@ -1190,9 +1125,11 @@ export function ResearchDashboard({ initialProjectId }: ResearchDashboardProps) 
                         type="button"
                       >
                         <Upload aria-hidden size={14} strokeWidth={1.9} />
-                        <span>Upload</span>
+                        <span>
+                          {uploadProjectSourceMutation.isPending ? "Uploading..." : "Upload files"}
+                        </span>
                       </button>
-                    </form>
+                    </div>
 
                     {projectSourceError ? (
                       <p className="error-text project-source-error" role="alert">
@@ -1214,11 +1151,10 @@ export function ResearchDashboard({ initialProjectId }: ResearchDashboardProps) 
                             <div>
                               <strong>{asset.label}</strong>
                               <span>
-                                {describeProjectAssetUsage(asset.usage)} ·{" "}
-                                {asset.source_type === "url" ? "URL" : "File"} ·{" "}
+                                {describeProjectAssetUsage(asset.usage)} · File ·{" "}
                                 {formatProjectAssetStatus(asset)}
                               </span>
-                              {asset.url ? <code>{asset.url}</code> : null}
+                              {asset.preview_excerpt ? <code>{asset.preview_excerpt}</code> : null}
                             </div>
                             <button
                               aria-label={`Remove ${asset.label}`}
@@ -1235,7 +1171,7 @@ export function ResearchDashboard({ initialProjectId }: ResearchDashboardProps) 
                     ) : (
                       <div className="project-home-empty">
                         <strong>No sources yet</strong>
-                        <span>Add files or URLs once and every run in this project can use them.</span>
+                        <span>Upload files once and every run in this project can use them.</span>
                       </div>
                     )}
                   </section>
