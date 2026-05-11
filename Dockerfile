@@ -30,9 +30,7 @@ WORKDIR /app
 COPY --from=builder /opt/venv /opt/venv
 COPY src ./src
 COPY alembic ./alembic
-COPY evals ./evals
 COPY README.md ./
-COPY .env.example ./
 
 USER app
 

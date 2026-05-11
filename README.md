@@ -1,6 +1,6 @@
 # Open Research
 
-This repository implements a production-shaped public-web research agent from the `ImplementationPlan.md` specification. The current codebase focuses on the backend runtime that matters first:
+This repository implements a production-shaped public-web research agent. The current codebase focuses on the backend runtime that matters first:
 
 - FastAPI API with asynchronous run execution
 - replayable run event log plus SSE streaming with explicit replay/live cursor semantics
@@ -19,7 +19,6 @@ This repository implements a production-shaped public-web research agent from th
 - Postgres-ready schema management with Alembic and `pgvector`/`tsvector`-shaped storage
 - deterministic mock fallbacks so the system can run locally without external API keys
 - worker/API split entrypoints plus a portable Docker Compose stack
-- replayable evaluation harness with DRB-style export
 
 ## What is implemented
 
@@ -198,29 +197,11 @@ The code defaults to SQLite for local work and tests. For Postgres deployments, 
 
 ## Configuration
 
-The repo now ships two config templates:
-
-- `.env.example` for the minimal local setup
-- `.env.advanced.example` for the full backend control surface
-
 The app accepts both provider-native env vars like `OPENAI_API_KEY` and repo-scoped env vars such
 as `OPEN_RESEARCH_DATABASE_URL`.
 
-For most users, the minimal setup is enough:
-
-```bash
-cp .env.example .env
-```
-
-That file is intentionally small and covers:
-
-- local SQLite storage
-- backend auto-selection
-- real provider credentials for one LLM/search/fetch path
-- frontend API URL
-- optional CLI/TUI API URL override
-
-Use `.env.advanced.example` only if you need to change server-side defaults such as:
+Set environment variables directly or through a local `.env` file that is not committed. Common
+server-side defaults include:
 
 - model defaults
 - stream/query budget defaults
@@ -230,11 +211,6 @@ Use `.env.advanced.example` only if you need to change server-side defaults such
 - Temporal / workflow settings
 - S3 artifact storage
 - observability and tracing
-
-Two supported maximal-path setups:
-
-- Hosted OpenAI: use `.env.example` as the base profile.
-- Local OpenAI-compatible: use `.env.local-openai-compatible.example` as the base profile.
 
 The strict deep-research path now supports both backends as long as they provide:
 
@@ -299,8 +275,6 @@ export OPEN_RESEARCH_EMBEDDING_BASE_URL=http://127.0.0.1:8001/v1
 export OPEN_RESEARCH_EMBEDDING_API_KEY=EMPTY
 ```
 
-For a fully local strict-path example using Ollama plus Exa and Firecrawl, copy `.env.local-openai-compatible.example`.
-
 ## Deployment
 
 Build the shared API/worker image:
@@ -318,31 +292,6 @@ docker compose up --build
 The Compose stack includes `api`, `worker`, `postgres`, `temporal`, `temporal-ui`, and
 `otel-collector`, plus an optional `prometheus` profile. The frontend is a separate Next.js app
 under [`frontend`](frontend) and can be run locally with `npm run dev` or containerized separately.
-
-## Evaluation Harness
-
-Run the local regression suite:
-
-```bash
-uv run python -m open_research.evals.cli --dataset evals/regression_dataset.jsonl
-```
-
-Write a DRB-style export alongside the summary:
-
-```bash
-uv run python -m open_research.evals.cli \
-  --dataset evals/regression_dataset.jsonl \
-  --output eval-summary.json \
-  --drb-output eval-drb.json
-```
-
-## Ops Runbooks
-
-- [`docs/ops/postgres-backup-restore.md`](docs/ops/postgres-backup-restore.md)
-- [`docs/ops/artifact-retention.md`](docs/ops/artifact-retention.md)
-- [`docs/ops/worker-scaling.md`](docs/ops/worker-scaling.md)
-- [`docs/ops/temporal-queues.md`](docs/ops/temporal-queues.md)
-- [`docs/ops/graceful-shutdown.md`](docs/ops/graceful-shutdown.md)
 
 ## Verification
 

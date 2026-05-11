@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "open-research"
 version = "0.1.0"
-description = "A production-shaped multi-agent deep research runtime inspired by the provided implementation plan."
+description = "A production-shaped multi-agent deep research runtime."
 readme = "README.md"
 requires-python = ">=3.12,<3.14"
 dependencies = [
