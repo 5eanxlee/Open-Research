@@ -15,17 +15,14 @@
   --color-forest-green-action: #34785c;
   --color-highlight-beige: #cdcdc9;
 
-  --font-cursorgothic: "CursorGothic", var(--font-testsohne, "TestSohne"),
-    ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
-    Roboto, sans-serif;
+  --font-cursorgothic: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+    "Segoe UI", Roboto, sans-serif;
   --font-berkeleymono: "berkeleyMono", ui-monospace, SFMono-Regular, Menlo,
     Monaco, Consolas, monospace;
-  --font-lato: "Lato", var(--font-testsohne, "TestSohne"), ui-sans-serif,
-    system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
-    sans-serif;
-  --font-eb-garamond: "EB Garamond", var(--font-testsohne, "TestSohne"),
-    ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
-    Roboto, sans-serif;
+  --font-lato: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+    "Segoe UI", Roboto, sans-serif;
+  --font-eb-garamond: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+    "Segoe UI", Roboto, sans-serif;
   --font-apple-system: -apple-system, ui-sans-serif, system-ui,
     BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
 
@@ -80,8 +77,8 @@
     rgba(0, 0, 0, 0.28) 0px 18px 36px -18px;
 
   /* Typography */
-  --font-sans: var(--font-testsohne, "TestSohne"), -apple-system, BlinkMacSystemFont,
-    "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica,
+    Arial, sans-serif;
   --font-mono: var(--font-berkeleymono);
   --font-body: var(--font-sans);
   --font-display: var(--font-sans);

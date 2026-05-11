@@ -3,8 +3,14 @@
 .env.*
 .env*.example
 .DS_Store
+.cache/
+.coverage
+.mypy_cache/
 .pytest_cache/
 .ruff_cache/
+.tox/
+.vscode/
+.idea/
 tests/
 test_*.py
 *_test.py
@@ -14,7 +20,7 @@ __pycache__/
 *.pyc
 *.pyo
 *.egg-info/
-openresearch.db
+*.db
 *.db-shm
 *.db-wal
 artifacts/
@@ -23,7 +29,7 @@ evals/
 benchmarks/
 ImplementationPlan*.md
 *Plan*.md
-scripts/*eval*.py
+scripts/
 src/open_research/evals/
 .github/workflows/*eval*.yml
 .github/workflows/*canary*.yml
@@ -31,9 +37,14 @@ src/open_research/evals/
 *.sqlite3-shm
 *.sqlite3-wal
 *.log
+*.tmp
+*.bak
 tmp_*.sqlite3
 node_modules/
 .next/
 frontend/.next/
+frontend/out/
+frontend/public/fonts/
+*.otf
 *.tsbuildinfo
 2026-04-15-201450-you-are-an-expert-frontend-ui-designer-the-curre.txt
