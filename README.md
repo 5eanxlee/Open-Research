@@ -90,6 +90,8 @@ export OPEN_RESEARCH_LEAD_MODEL=<model-name>
 export OPEN_RESEARCH_WORKER_MODEL=<model-name>
 ```
 
+Use the model names exposed by your server.
+
 SQLite is the default database for local development. For Postgres, install the `postgres` extra and set `OPEN_RESEARCH_DATABASE_URL` to a PostgreSQL URL. Optional extras are available for browser fetching, Temporal workers, local reranking, and S3 artifact storage:
 
 ```bash
@@ -135,4 +137,3 @@ The Next.js dashboard lives under `frontend`.
 uv run ruff check src
 uv run python -m compileall -q src/open_research
 ```
-

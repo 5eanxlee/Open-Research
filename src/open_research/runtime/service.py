@@ -3064,7 +3064,6 @@ class ResearchRuntime:
                 "supports_deep_approval": self.settings.deep_plan_approval_enabled,
                 "supports_async_jobs": self.settings.async_jobs_enabled,
                 "supports_source_registry": self.settings.source_registry_ui_enabled,
-                "supports_debug_console": self.settings.debug_console_enabled,
                 "supports_projects": True,
                 "supports_langgraph_runtime": True,
                 "supports_deepagents_research_runtime": True,

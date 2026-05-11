@@ -11,6 +11,12 @@
 .tox/
 .vscode/
 .idea/
+.cursor/
+.claude/
+.codex/
+.agents/
+*.local
+*.local.*
 tests/
 test_*.py
 *_test.py
@@ -41,7 +47,13 @@ src/open_research/evals/
 *.bak
 tmp_*.sqlite3
 node_modules/
+dist/
+build/
+coverage/
+htmlcov/
 .next/
+.turbo/
+.parcel-cache/
 frontend/.next/
 frontend/out/
 frontend/public/fonts/

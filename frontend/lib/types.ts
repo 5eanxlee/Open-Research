@@ -892,7 +892,6 @@ export interface RuntimeCapabilities {
   supports_deep_approval?: boolean;
   supports_async_jobs?: boolean;
   supports_source_registry?: boolean;
-  supports_debug_console?: boolean;
   supports_projects?: boolean;
   asset_upload_limits?: {
     max_file_size_bytes: number;

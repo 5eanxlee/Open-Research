@@ -181,7 +181,6 @@ class Settings(BaseSettings):
     deep_plan_approval_enabled: bool = True
     source_registry_ui_enabled: bool = True
     async_jobs_enabled: bool = True
-    debug_console_enabled: bool = True
     enforce_maximal_research_path: bool = True
 
     max_streams: int = 30

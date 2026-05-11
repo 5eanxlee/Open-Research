@@ -79,18 +79,6 @@ from open_research.storage.artifacts import ArtifactPayload
 from open_research.tools import AdvancedWebSearchTool, PaperSearchTool
 from open_research.tools import think as record_thought
 
-REFERENCE_IMPLEMENTATION_MAP: dict[str, str] = {
-    "agent_wiring": "redacted-reference/src/aiq_agent/agents/deep_researcher/agent.py",
-    "orchestrator_prompt": (
-        "redacted-reference/src/aiq_agent/agents/deep_researcher/prompts/orchestrator.j2"
-    ),
-    "planner_prompt": "redacted-reference/src/aiq_agent/agents/deep_researcher/prompts/planner.j2",
-    "researcher_prompt": "redacted-reference/src/aiq_agent/agents/deep_researcher/prompts/researcher.j2",
-    "middleware": "redacted-reference/src/aiq_agent/agents/deep_researcher/custom_middleware.py",
-    "state": "redacted-reference/src/aiq_agent/agents/deep_researcher/models/state.py",
-    "registration": "redacted-reference/src/aiq_agent/agents/deep_researcher/register.py",
-}
-
 DEEP_RESEARCH_AGENT_TOPOLOGY: tuple[str, ...] = (
     "research-orchestrator",
     "planner-agent",
@@ -212,7 +200,6 @@ async def run_custom_responses_deep_agent_research(
         "source_selection": source_selection,
         "deepagents_agent_topology": list(DEEP_RESEARCH_AGENT_TOPOLOGY),
         "deepagents_prompt_templates": status.prompt_templates,
-        "reference_implementation_map": REFERENCE_IMPLEMENTATION_MAP,
         "planner_contract_version": PLANNER_CONTRACT_VERSION,
         "grounding_contract_version": GROUNDING_CONTRACT_VERSION,
     }
@@ -312,7 +299,6 @@ async def run_deep_agent_research_for_existing_run(
             "research_runtime_backend": status.backend,
             "deepagents_agent_topology": list(DEEP_RESEARCH_AGENT_TOPOLOGY),
             "deepagents_prompt_templates": status.prompt_templates,
-            "reference_implementation_map": REFERENCE_IMPLEMENTATION_MAP,
             "planner_contract_version": PLANNER_CONTRACT_VERSION,
             "grounding_contract_version": GROUNDING_CONTRACT_VERSION,
         },
@@ -329,7 +315,6 @@ async def run_deep_agent_research_for_existing_run(
             "fetch_backend": runtime.settings.resolved_fetch_backend,
             "native_openai_web_search": status.native_openai_web_search,
             "agent_topology": list(DEEP_RESEARCH_AGENT_TOPOLOGY),
-            "reference_implementation_map": REFERENCE_IMPLEMENTATION_MAP,
             "planner_contract_version": PLANNER_CONTRACT_VERSION,
             "grounding_contract_version": GROUNDING_CONTRACT_VERSION,
         },
@@ -1634,7 +1619,6 @@ def _build_deep_agent(
     )
     context = {
         "current_datetime": datetime.now(UTC).isoformat(),
-        "reference_implementation_map": REFERENCE_IMPLEMENTATION_MAP,
         "agent_topology": list(DEEP_RESEARCH_AGENT_TOPOLOGY),
         "max_research_batches": settings.deepagents_max_research_batches,
         "require_critic_pass": settings.deepagents_require_critic_pass,
