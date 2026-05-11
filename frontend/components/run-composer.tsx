@@ -15,7 +15,14 @@ import {
   stageAssets,
   uploadProjectFiles,
 } from "@/lib/api";
+import {
+  DEFAULT_AGENT_CONFIG,
+  DEFAULT_BUDGET,
+  DEFAULT_REPORT_OUTPUT_CONFIG,
+} from "@/lib/defaults";
 import type {
+  AgentConfig,
+  BudgetPolicy,
   ClarifierConfig,
   MemoryPolicyNumericField,
   ModelConfig,
@@ -24,6 +31,7 @@ import type {
   ResearchAssetUsage,
   PublicRuntimeConfig,
   ProjectSummary,
+  ReportOutputConfig,
   StagedAssetRecord,
 } from "@/lib/types";
 import { useResearchStore } from "@/store/use-research-store";
@@ -33,6 +41,18 @@ export type FocusedDrawerKey = "workflow" | "sources" | "budget" | "models" | "p
 interface RunComposerProps {
   publicConfig: PublicRuntimeConfig | undefined;
   onOpenPanel?: (panel: FocusedDrawerKey) => void;
+}
+
+interface RunConfigPreset {
+  key: "recommended" | "quick" | "audit";
+  label: string;
+  eyebrow: string;
+  description: string;
+  budget: BudgetPolicy;
+  reportOutputConfig: ReportOutputConfig;
+  agentConfig: AgentConfig;
+  requirePlanApproval: boolean;
+  clarifierConfig: ClarifierConfig;
 }
 
 const budgetFields = [
@@ -79,6 +99,89 @@ const budgetFields = [
     max: 10,
   },
 ] as const;
+
+const runConfigPresets: ReadonlyArray<RunConfigPreset> = [
+  {
+    key: "recommended",
+    label: "Recommended",
+    eyebrow: "Default",
+    description: "Use deployment defaults with balanced evidence handling.",
+    budget: DEFAULT_BUDGET,
+    reportOutputConfig: DEFAULT_REPORT_OUTPUT_CONFIG,
+    agentConfig: DEFAULT_AGENT_CONFIG,
+    requirePlanApproval: false,
+    clarifierConfig: {
+      enabled: true,
+      max_questions: 2,
+      ambiguity_threshold: 0.45,
+      require_response_for_deep: false,
+    },
+  },
+  {
+    key: "quick",
+    label: "Quick scan",
+    eyebrow: "Fast",
+    description: "Smaller search surface for exploratory prompts.",
+    budget: {
+      max_streams: 8,
+      max_replans: 0,
+      max_queries_per_stream: 8,
+      max_results_per_query: 5,
+      max_sources_per_stream: 2,
+      per_domain_limit: 2,
+    },
+    reportOutputConfig: {
+      min_words: 500,
+      max_words: 1200,
+    },
+    agentConfig: {
+      ...DEFAULT_AGENT_CONFIG,
+      answer_style: "executive",
+      claim_granularity: "balanced",
+    },
+    requirePlanApproval: false,
+    clarifierConfig: {
+      enabled: true,
+      max_questions: 1,
+      ambiguity_threshold: 0.5,
+      require_response_for_deep: false,
+    },
+  },
+  {
+    key: "audit",
+    label: "Evidence audit",
+    eyebrow: "Deep",
+    description: "Higher coverage, stricter sourcing, and plan review.",
+    budget: {
+      max_streams: 30,
+      max_replans: 2,
+      max_queries_per_stream: 25,
+      max_results_per_query: 8,
+      max_sources_per_stream: 5,
+      per_domain_limit: 3,
+    },
+    reportOutputConfig: {
+      min_words: 1800,
+      max_words: 4200,
+    },
+    agentConfig: {
+      ...DEFAULT_AGENT_CONFIG,
+      research_profile: "official_first",
+      answer_style: "technical",
+      source_trust_floor: "high",
+      citation_discipline: "strict",
+      claim_granularity: "atomic",
+      include_counterevidence: true,
+    },
+    requirePlanApproval: true,
+    clarifierConfig: {
+      enabled: true,
+      max_questions: 3,
+      ambiguity_threshold: 0.35,
+      require_response_for_deep: true,
+    },
+  },
+];
 
 const memoryNumericFields: ReadonlyArray<{
   key: MemoryPolicyNumericField;
@@ -352,6 +455,164 @@ function resolveEffectiveModels(
     reranker_model:
       override.reranker_model || publicConfig?.models.reranker_model || "default",
   };
+}
+
+function clampPresetNumber(value: number, min: number, max: number): number {
+  return Math.min(Math.max(value, min), max);
+}
+
+function resolvePresetBudget(
+  preset: RunConfigPreset,
+  publicConfig: PublicRuntimeConfig | undefined,
+): BudgetPolicy {
+  const serverBudget =
+    preset.key === "recommended" && publicConfig?.default_budget
+      ? publicConfig.default_budget
+      : preset.budget;
+  const limits = publicConfig?.capabilities.budget_limits;
+  if (!limits) return serverBudget;
+
+  return {
+    max_streams: clampPresetNumber(
+      serverBudget.max_streams,
+      limits.max_streams?.min ?? 1,
+      limits.max_streams?.max ?? 30,
+    ),
+    max_replans: clampPresetNumber(
+      serverBudget.max_replans,
+      limits.max_replans?.min ?? 0,
+      limits.max_replans?.max ?? 5,
+    ),
+    max_queries_per_stream: clampPresetNumber(
+      serverBudget.max_queries_per_stream,
+      limits.max_queries_per_stream?.min ?? 1,
+      limits.max_queries_per_stream?.max ?? 25,
+    ),
+    max_results_per_query: clampPresetNumber(
+      serverBudget.max_results_per_query,
+      limits.max_results_per_query?.min ?? 1,
+      limits.max_results_per_query?.max ?? 20,
+    ),
+    max_sources_per_stream: clampPresetNumber(
+      serverBudget.max_sources_per_stream,
+      limits.max_sources_per_stream?.min ?? 1,
+      limits.max_sources_per_stream?.max ?? 20,
+    ),
+    per_domain_limit: clampPresetNumber(
+      serverBudget.per_domain_limit,
+      limits.per_domain_limit?.min ?? 1,
+      limits.per_domain_limit?.max ?? 10,
+    ),
+  };
+}
+
+function PresetConfigurationCards({ publicConfig }: RunComposerProps) {
+  const [appliedPreset, setAppliedPreset] = useState<string | null>(null);
+  const updateBudget = useResearchStore((state) => state.updateBudget);
+  const updateReportOutputConfig = useResearchStore(
+    (state) => state.updateReportOutputConfig,
+  );
+  const updateAgentConfig = useResearchStore((state) => state.updateAgentConfig);
+  const setRequirePlanApproval = useResearchStore((state) => state.setRequirePlanApproval);
+  const updateClarifierConfig = useResearchStore((state) => state.updateClarifierConfig);
+  const setSourceSelection = useResearchStore((state) => state.setSourceSelection);
+  const resetModelConfigOverride = useResearchStore(
+    (state) => state.resetModelConfigOverride,
+  );
+
+  const applyPreset = (preset: RunConfigPreset) => {
+    const nextBudget = resolvePresetBudget(preset, publicConfig);
+    const nextAgentConfig =
+      preset.key === "recommended" && publicConfig?.default_agent_config
+        ? publicConfig.default_agent_config
+        : preset.agentConfig;
+
+    updateBudget(nextBudget);
+    updateReportOutputConfig(preset.reportOutputConfig);
+    updateAgentConfig(nextAgentConfig);
+    setRequirePlanApproval(preset.requirePlanApproval);
+    updateClarifierConfig(preset.clarifierConfig);
+    setSourceSelection(publicConfig?.default_source_selection ?? []);
+    resetModelConfigOverride();
+    setAppliedPreset(preset.key);
+  };
+
+  return (
+    <div className="preset-card-grid" aria-label="Configuration presets">
+      {runConfigPresets.map((preset) => {
+        const previewBudget = resolvePresetBudget(preset, publicConfig);
+        const isApplied = appliedPreset === preset.key;
+        return (
+          <button
+            aria-pressed={isApplied}
+            className={`preset-card ${isApplied ? "active" : ""}`}
+            key={preset.key}
+            onClick={() => applyPreset(preset)}
+            type="button"
+          >
+            <span className="preset-card-eyebrow">{preset.eyebrow}</span>
+            <strong>{preset.label}</strong>
+            <span>{preset.description}</span>
+            <small>
+              {previewBudget.max_streams} streams ·{" "}
+              {previewBudget.max_queries_per_stream} queries ·{" "}
+              {preset.reportOutputConfig.min_words}-{preset.reportOutputConfig.max_words} words
+            </small>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function PanelShortcutGrid({ onOpenPanel }: { onOpenPanel: (panel: FocusedDrawerKey) => void }) {
+  const shortcuts: ReadonlyArray<{
+    key: FocusedDrawerKey;
+    label: string;
+    description: string;
+  }> = [
+    {
+      key: "workflow",
+      label: "Workflow",
+      description: "Approval, clarifier, async job behavior.",
+    },
+    {
+      key: "sources",
+      label: "Sources",
+      description: "Search providers, enabled tools, source defaults.",
+    },
+    {
+      key: "budget",
+      label: "Config",
+      description: "Depth, query limits, report length.",
+    },
+    {
+      key: "models",
+      label: "Models",
+      description: "Deployment defaults and temporary overrides.",
+    },
+    {
+      key: "profile",
+      label: "Profile",
+      description: "Memory, source preferences, response bias.",
+    },
+  ];
+
+  return (
+    <div className="panel-shortcut-grid" aria-label="Advanced configuration panels">
+      {shortcuts.map((shortcut) => (
+        <button
+          className="panel-shortcut-card"
+          key={shortcut.key}
+          onClick={() => onOpenPanel(shortcut.key)}
+          type="button"
+        >
+          <strong>{shortcut.label}</strong>
+          <span>{shortcut.description}</span>
+        </button>
+      ))}
+    </div>
+  );
 }
 
 function formatAssetStatus(asset: { processing_status: string; extraction_method: string; ocr_used: boolean }) {
@@ -848,26 +1109,6 @@ function CommonSettingsFields({ publicConfig, onOpenPanel }: RunComposerProps) {
 
   return (
     <>
-      <label className="field">
-        <span className="field-label">API endpoint</span>
-        <input
-          className="text-input"
-          value={apiBaseUrl}
-          onChange={(event) => setApiBaseUrl(event.target.value)}
-          placeholder="http://127.0.0.1:8010"
-        />
-      </label>
-
-      <label className="field">
-        <span className="field-label">Profile ID</span>
-        <input
-          className="text-input"
-          value={profileId}
-          onChange={(event) => setProfileId(event.target.value || "default")}
-          placeholder="default"
-        />
-      </label>
-
       <div className="config-callout settings-summary-card">
         <dl className="settings-summary-grid">
           <div className="settings-summary-row">
@@ -912,44 +1153,30 @@ function CommonSettingsFields({ publicConfig, onOpenPanel }: RunComposerProps) {
         </dl>
       </div>
 
+      <div className="settings-grid">
+        <label className="field">
+          <span className="field-label">API endpoint</span>
+          <input
+            className="text-input"
+            value={apiBaseUrl}
+            onChange={(event) => setApiBaseUrl(event.target.value)}
+            placeholder="http://127.0.0.1:8010"
+          />
+        </label>
+
+        <label className="field">
+          <span className="field-label">Profile ID</span>
+          <input
+            className="text-input"
+            value={profileId}
+            onChange={(event) => setProfileId(event.target.value || "default")}
+            placeholder="default"
+          />
+        </label>
+      </div>
+
       {onOpenPanel ? (
-        <div className="button-row composer-actions">
-          <button
-            className="secondary-button"
-            onClick={() => onOpenPanel("workflow")}
-            type="button"
-          >
-            Workflow
-          </button>
-          <button
-            className="secondary-button"
-            onClick={() => onOpenPanel("sources")}
-            type="button"
-          >
-            Sources
-          </button>
-          <button
-            className="secondary-button"
-            onClick={() => onOpenPanel("budget")}
-            type="button"
-          >
-            Budget
-          </button>
-          <button
-            className="secondary-button"
-            onClick={() => onOpenPanel("models")}
-            type="button"
-          >
-            Models
-          </button>
-          <button
-            className="secondary-button"
-            onClick={() => onOpenPanel("profile")}
-            type="button"
-          >
-            Profile
-          </button>
-        </div>
+        <PanelShortcutGrid onOpenPanel={onOpenPanel} />
       ) : null}
     </>
   );
@@ -1015,10 +1242,34 @@ function BehaviorSettingsFields() {
 export function SettingsDrawerPanel({ publicConfig, onOpenPanel }: RunComposerProps) {
   return (
     <div className="drawer-section-stack">
-      <BehaviorSettingsFields />
-      <div className="drawer-divider" />
-      <p className="drawer-section-label">Connection</p>
-      <CommonSettingsFields publicConfig={publicConfig} onOpenPanel={onOpenPanel} />
+      <section className="config-modal-section featured">
+        <div className="config-section-head">
+          <div>
+            <p className="drawer-section-label">Recommended</p>
+            <h3>Choose a starting point</h3>
+          </div>
+          <span>One click</span>
+        </div>
+        <PresetConfigurationCards publicConfig={publicConfig} />
+      </section>
+
+      <section className="config-modal-section">
+        <div className="config-section-head">
+          <div>
+            <p className="drawer-section-label">Current setup</p>
+            <h3>Active run profile</h3>
+          </div>
+        </div>
+        <CommonSettingsFields publicConfig={publicConfig} onOpenPanel={onOpenPanel} />
+      </section>
+
+      <details className="config-modal-disclosure">
+        <summary>
+          <strong>Research behavior</strong>
+          <span>Profiles, recency, answer style, and source trust.</span>
+        </summary>
+        <BehaviorSettingsFields />
+      </details>
     </div>
   );
 }
@@ -1683,10 +1934,20 @@ function ReportOutputFields({ publicConfig }: RunComposerProps) {
 export function WorkflowDrawerPanel({ publicConfig }: RunComposerProps) {
   return (
     <div className="drawer-section-stack">
-      <ExecutionWorkflowFields publicConfig={publicConfig} />
-      <div className="drawer-divider" />
-      <p className="drawer-section-label">Output policy</p>
-      <AgentPolicyFields />
+      <details className="config-modal-disclosure" open>
+        <summary>
+          <strong>Workflow</strong>
+          <span>Approval, clarifier, and async execution behavior.</span>
+        </summary>
+        <ExecutionWorkflowFields publicConfig={publicConfig} />
+      </details>
+      <details className="config-modal-disclosure">
+        <summary>
+          <strong>Output policy</strong>
+          <span>Citation discipline, claim granularity, and disagreements.</span>
+        </summary>
+        <AgentPolicyFields />
+      </details>
     </div>
   );
 }
@@ -1694,10 +1955,22 @@ export function WorkflowDrawerPanel({ publicConfig }: RunComposerProps) {
 export function SourcesDrawerPanel({ publicConfig }: RunComposerProps) {
   return (
     <div className="drawer-section-stack">
-      <SourceSelectionFields publicConfig={publicConfig} />
-      <div className="drawer-divider" />
-      <p className="drawer-section-label">Tool registry</p>
-      <ToolCatalogFields publicConfig={publicConfig} />
+      <section className="config-modal-section">
+        <div className="config-section-head">
+          <div>
+            <p className="drawer-section-label">Source defaults</p>
+            <h3>Search surfaces</h3>
+          </div>
+        </div>
+        <SourceSelectionFields publicConfig={publicConfig} />
+      </section>
+      <details className="config-modal-disclosure">
+        <summary>
+          <strong>Tool registry</strong>
+          <span>Configured source tools and per-run limits.</span>
+        </summary>
+        <ToolCatalogFields publicConfig={publicConfig} />
+      </details>
     </div>
   );
 }
@@ -1705,11 +1978,30 @@ export function SourcesDrawerPanel({ publicConfig }: RunComposerProps) {
 export function BudgetDrawerPanel({ publicConfig }: RunComposerProps) {
   return (
     <div className="drawer-section-stack">
-      <p className="drawer-section-label">Research depth</p>
-      <BudgetFields publicConfig={publicConfig} />
-      <div className="drawer-divider" />
-      <p className="drawer-section-label">Report length</p>
-      <ReportOutputFields publicConfig={publicConfig} />
+      <section className="config-modal-section featured">
+        <div className="config-section-head">
+          <div>
+            <p className="drawer-section-label">Presets</p>
+            <h3>Run depth without tuning</h3>
+          </div>
+          <span>Recommended first</span>
+        </div>
+        <PresetConfigurationCards publicConfig={publicConfig} />
+      </section>
+      <details className="config-modal-disclosure" open>
+        <summary>
+          <strong>Research depth</strong>
+          <span>Streams, replans, search results, and source caps.</span>
+        </summary>
+        <BudgetFields publicConfig={publicConfig} />
+      </details>
+      <details className="config-modal-disclosure" open>
+        <summary>
+          <strong>Report length</strong>
+          <span>Target floor and ceiling for the final report.</span>
+        </summary>
+        <ReportOutputFields publicConfig={publicConfig} />
+      </details>
     </div>
   );
 }
@@ -1717,7 +2009,15 @@ export function BudgetDrawerPanel({ publicConfig }: RunComposerProps) {
 export function ModelsDrawerPanel({ publicConfig }: RunComposerProps) {
   return (
     <div className="drawer-section-stack">
-      <ModelSelectionFields publicConfig={publicConfig} />
+      <section className="config-modal-section">
+        <div className="config-section-head">
+          <div>
+            <p className="drawer-section-label">Model routing</p>
+            <h3>Use deployment defaults unless needed</h3>
+          </div>
+        </div>
+        <ModelSelectionFields publicConfig={publicConfig} />
+      </section>
     </div>
   );
 }
@@ -1725,10 +2025,20 @@ export function ModelsDrawerPanel({ publicConfig }: RunComposerProps) {
 export function ProfileDrawerPanel({ publicConfig }: RunComposerProps) {
   return (
     <div className="drawer-section-stack">
-      <ProfilePreferenceFields />
-      <div className="drawer-divider" />
-      <p className="drawer-section-label">Memory harness</p>
-      <MemoryHarnessFields publicConfig={publicConfig} />
+      <details className="config-modal-disclosure" open>
+        <summary>
+          <strong>Preferences</strong>
+          <span>Preferred sources, avoided sources, and style bias.</span>
+        </summary>
+        <ProfilePreferenceFields />
+      </details>
+      <details className="config-modal-disclosure">
+        <summary>
+          <strong>Memory harness</strong>
+          <span>Context packing limits and where memory can influence a run.</span>
+        </summary>
+        <MemoryHarnessFields publicConfig={publicConfig} />
+      </details>
     </div>
   );
 }

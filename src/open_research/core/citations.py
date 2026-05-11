@@ -269,9 +269,7 @@ def _same_origin_and_child_path(left: str, right: str) -> bool:
         return False
     return left_parts.path.startswith(
         right_parts.path.rstrip("/") + "/"
-    ) or right_parts.path.startswith(
-        left_parts.path.rstrip("/") + "/"
-    )
+    ) or right_parts.path.startswith(left_parts.path.rstrip("/") + "/")
 
 
 def _query_subset_match(left: str, right: str) -> bool:

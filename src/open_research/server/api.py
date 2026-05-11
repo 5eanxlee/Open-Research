@@ -2,14 +2,14 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Annotated
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 
-from .config import Settings, get_settings
-from .custom_responses import build_custom_research_report
-from .domain import (
+from open_research.core.config import Settings, get_settings
+from open_research.core.domain import (
     ApprovalDecisionKind,
     ArtifactRecord,
     AsyncJob,
@@ -47,7 +47,8 @@ from .domain import (
     RunWorkspaceSnapshot,
     StagedAssetRecord,
 )
-from .runtime import ResearchRuntime
+from open_research.runtime import ResearchRuntime
+from open_research.runtime.custom_responses import build_custom_research_report
 
 
 def create_app(
@@ -158,7 +159,9 @@ def create_app(
             raise HTTPException(status_code=404, detail="Project not found")
         return detail
 
-    @app.post("/projects/{project_id}/assets", response_model=list[ResearchAssetRecord], status_code=201)
+    @app.post(
+        "/projects/{project_id}/assets", response_model=list[ResearchAssetRecord], status_code=201
+    )
     async def add_project_assets(
         project_id: str,
         payload: ResearchAssetBatchRequest,
@@ -180,16 +183,19 @@ def create_app(
     async def upload_project_assets(
         project_id: str,
         http_request: Request,
-        usage: str = Form(...),
-        description: str | None = Form(default=None),
-        files: list[UploadFile] = File(...),
+        usage: Annotated[str, Form()],
+        files: Annotated[list[UploadFile], File()],
+        description: Annotated[str | None, Form()] = None,
     ) -> list[ResearchAssetRecord]:
         runtime = _get_runtime(http_request)
         try:
             usage_enum = ResearchAssetUsage(usage)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        file_payloads = [(upload.filename or "upload", upload.content_type, await upload.read()) for upload in files]
+        file_payloads = [
+            (upload.filename or "upload", upload.content_type, await upload.read())
+            for upload in files
+        ]
         try:
             return await runtime.upload_project_files(
                 project_id=project_id,
@@ -217,16 +223,19 @@ def create_app(
     @app.post("/assets/staged", response_model=list[StagedAssetRecord], status_code=201)
     async def stage_assets(
         http_request: Request,
-        usage: str = Form(...),
-        description: str | None = Form(default=None),
-        files: list[UploadFile] = File(...),
+        usage: Annotated[str, Form()],
+        files: Annotated[list[UploadFile], File()],
+        description: Annotated[str | None, Form()] = None,
     ) -> list[StagedAssetRecord]:
         runtime = _get_runtime(http_request)
         try:
             usage_enum = ResearchAssetUsage(usage)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        file_payloads = [(upload.filename or "upload", upload.content_type, await upload.read()) for upload in files]
+        file_payloads = [
+            (upload.filename or "upload", upload.content_type, await upload.read())
+            for upload in files
+        ]
         try:
             return await runtime.stage_uploaded_files(
                 usage=usage_enum,
@@ -468,7 +477,9 @@ def create_app(
         if not project_id:
             raise HTTPException(
                 status_code=400,
-                detail="Run is not attached to a project; provide a project_id to promote the asset.",
+                detail=(
+                    "Run is not attached to a project; provide a project_id to promote the asset."
+                ),
             )
         try:
             return await runtime.promote_run_asset(

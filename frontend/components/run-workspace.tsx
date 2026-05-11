@@ -615,21 +615,27 @@ function buildLiveTasks(
   for (const event of events) {
     const streamId = eventStreamId(event);
     const streamName = eventStreamName(event);
-    const key = streamId
+    const agentRole = payloadString(event.payload, ["agent_role"]);
+    const eventTaskId = payloadString(event.payload, ["task_id"]);
+    const key = eventTaskId
+      ? eventTaskId
+      : streamId
       ? taskMap.has(`stream:${streamId}`)
         ? `stream:${streamId}`
         : Array.from(taskMap.values()).find((task) => task.streamId === streamId)?.id ??
           `stream:${streamId}`
       : streamName
         ? `stream:${streamIdByName.get(streamName) ?? streamName}`
+        : agentRole
+          ? `deepagents:${agentRole}`
         : null;
     if (!key) continue;
 
     const task = ensureTask({
       id: key,
       streamId,
-      streamName,
-      objective: payloadString(event.payload, ["objective", "query", "claim"]),
+      streamName: streamName ?? (agentRole ? titleCase(agentRole) : null),
+      objective: payloadString(event.payload, ["objective", "query", "claim", "tool"]) ?? agentRole,
       model: payloadString(event.payload, ["model"]),
       timestamp: event.created_at,
     });
@@ -644,6 +650,25 @@ function buildLiveTasks(
       task.status = "running";
       task.startedAt = task.startedAt ?? event.created_at;
       task.objective = payloadString(event.payload, ["objective"]) ?? task.objective;
+    } else if (event.event_type === "deepagents.tool.started") {
+      task.status = "running";
+      task.startedAt = task.startedAt ?? event.created_at;
+    } else if (event.event_type === "deepagents.tool.completed") {
+      task.status = task.status === "queued" ? "running" : task.status;
+    } else if (event.event_type === "deepagents.tool.failed") {
+      task.status = "failed";
+      task.blockerReason = payloadString(event.payload, ["error", "reason"]);
+    } else if (event.event_type === "deepagents.todo.synced") {
+      task.status = statusFromTaskStatus(payloadString(event.payload, ["status"]) ?? "queued");
+      task.objective = payloadString(event.payload, ["objective"]) ?? task.objective;
+    } else if (event.event_type === "deepagents.agent.started") {
+      task.status = "running";
+      task.startedAt = task.startedAt ?? event.created_at;
+    } else if (event.event_type === "deepagents.agent.completed") {
+      task.status = task.status === "queued" ? "running" : task.status;
+    } else if (event.event_type === "deepagents.agent.failed") {
+      task.status = "failed";
+      task.blockerReason = payloadString(event.payload, ["error", "reason"]);
     } else if (event.event_type === "search.performed") {
       task.status = "running";
       task.eventQueryCount += 1;
@@ -670,7 +695,7 @@ function buildLiveTasks(
           .filter((value, index, all) => all.indexOf(value) === index)
           .slice(0, 4);
       }
-    } else if (event.event_type === "note.saved") {
+    } else if (event.event_type === "note.saved" || event.event_type === "deepagents.note.saved") {
       task.status = task.status === "queued" ? "running" : task.status;
       task.eventNoteCount += 1;
       task.latestNoteSummary = payloadString(event.payload, ["summary"]) ?? task.latestNoteSummary;
@@ -1087,17 +1112,20 @@ function buildLiveAgents(
       name: titleCase(role),
       role: "DeepAgents role",
       status:
-        event.event_type === "deepagents.tool.failed"
+        event.event_type === "deepagents.agent.failed" || event.event_type === "deepagents.tool.failed"
           ? "failed"
-          : event.event_type === "deepagents.tool.started"
+          : event.event_type === "deepagents.agent.started" || event.event_type === "deepagents.tool.started"
             ? "running"
             : "completed",
-      summary: payloadString(event.payload, ["tool", "query"]) ?? "Deep agent activity",
+      summary: payloadString(event.payload, ["prompt_summary", "objective", "tool", "query"]) ?? "Deep agent activity",
       updatedAt: event.created_at,
       meta: compactMeta([
         ...(existing?.meta ?? []),
         payloadString(event.payload, ["provider"]),
         payloadString(event.payload, ["tool"]),
+        payloadNumber(event.payload, ["elapsed_ms"]) != null
+          ? `${payloadNumber(event.payload, ["elapsed_ms"])}ms`
+          : null,
       ]),
     });
   }
@@ -1165,6 +1193,21 @@ function buildLiveFiles(
         status: "skipped",
         summary: payloadString(event.payload, ["title", "reason", "dropped_reason"]) ?? "Context fragment removed.",
         meta: compactMeta([payloadString(event.payload, ["phase"])]),
+        timestamp: event.created_at,
+      });
+    }
+    if (event.event_type === "deepagents.file.saved") {
+      fileTraces.unshift({
+        id: `event:${event.id}`,
+        title: payloadString(event.payload, ["kind", "name"]) ?? "DeepAgents artifact",
+        status: "completed",
+        summary: payloadString(event.payload, ["uri"]) ?? "Intermediate research artifact saved.",
+        meta: compactMeta([
+          payloadNumber(event.payload, ["size_bytes"]) != null
+            ? `${payloadNumber(event.payload, ["size_bytes"])} bytes`
+            : null,
+          payloadString(event.payload, ["stage", "tool"]),
+        ]),
         timestamp: event.created_at,
       });
     }
@@ -1720,6 +1763,91 @@ function EventCard({ event }: { event: RunEvent }) {
   );
 }
 
+function eventSummary(event: RunEvent): string {
+  return (
+    payloadString(event.payload, [
+      "summary",
+      "objective",
+      "query",
+      "title",
+      "claim",
+      "section_title",
+      "reason",
+      "error",
+      "tool",
+      "source_id",
+    ]) ?? "Event payload"
+  );
+}
+
+function EventTimelineItem({ event }: { event: RunEvent }) {
+  const status = statusFromEventType(event.event_type);
+  const streamName = eventStreamName(event);
+  const summary = eventSummary(event);
+  const meta = compactMeta([
+    streamName,
+    payloadString(event.payload, ["provider", "search_provider", "agent_role"]),
+    payloadNumber(event.payload, ["result_count"]) != null
+      ? `${payloadNumber(event.payload, ["result_count"])} results`
+      : null,
+    payloadNumber(event.payload, ["citation_count"]) != null
+      ? `${payloadNumber(event.payload, ["citation_count"])} citations`
+      : null,
+  ]);
+
+  return (
+    <details className={`workspace-timeline-item ${statusClassName(status)}`}>
+      <summary>
+        <span className="workspace-timeline-time">{formatTime(event.created_at)}</span>
+        <span className="workspace-timeline-dot" aria-hidden />
+        <span className="workspace-timeline-main">
+          <strong>{displayEventType(event.event_type)}</strong>
+          <em>{summary}</em>
+          {meta.length ? (
+            <span className="workspace-timeline-meta">
+              {meta.slice(0, 3).join(" · ")}
+            </span>
+          ) : null}
+        </span>
+      </summary>
+      <div className="workspace-timeline-detail">
+        <pre>{JSON.stringify(event.payload, null, 2)}</pre>
+      </div>
+    </details>
+  );
+}
+
+function ToolTraceTimelineItem({ trace }: { trace: LiveToolTrace }) {
+  return (
+    <details
+      className={`workspace-timeline-item workspace-tool-timeline-item ${statusClassName(trace.status)}`}
+    >
+      <summary>
+        <span className="workspace-timeline-time">{formatTime(trace.timestamp)}</span>
+        <span className="workspace-timeline-dot" aria-hidden />
+        <span className="workspace-timeline-main">
+          <strong>{trace.title}</strong>
+          <em>{trace.summary}</em>
+          <span className="workspace-timeline-meta">
+            {compactMeta([trace.streamName ?? trace.streamId, ...trace.meta.slice(0, 3)]).join(" · ")}
+          </span>
+        </span>
+      </summary>
+      <div className="workspace-timeline-detail">
+        {trace.detail ? <p className="danger-text">{trace.detail}</p> : null}
+        {trace.meta.length > 3 ? (
+          <div className="workspace-live-metrics">
+            {trace.meta.slice(3).map((item) => (
+              <span key={`${trace.id}-timeline-${item}`}>{item}</span>
+            ))}
+          </div>
+        ) : null}
+        <pre>{JSON.stringify(trace.rawEvent.payload, null, 2)}</pre>
+      </div>
+    </details>
+  );
+}
+
 function MarkdownContent({
   content,
   className,
@@ -2005,8 +2133,27 @@ export function RunWorkspace({
               "plan.preview.rejected",
               "plan.preview.changes_requested",
               "plan.created",
+              "deepagents.runtime.started",
+              "deepagents.plan.parsed",
+              "deepagents.plan.parse_failed",
             ],
             execute: [
+              "deepagents.runtime.started",
+              "deepagents.agent.started",
+              "deepagents.agent.completed",
+              "deepagents.agent.failed",
+              "deepagents.todo.synced",
+              "deepagents.tool.started",
+              "deepagents.tool.completed",
+              "deepagents.tool.failed",
+              "deepagents.think.recorded",
+              "deepagents.source_audit.recorded",
+              "deepagents.citation.reconciled",
+              "deepagents.file.saved",
+              "deepagents.note.saved",
+              "deepagents.grounding.started",
+              "deepagents.grounding.completed",
+              "deepagents.grounding.failed",
               "stream.created",
               "task.started",
               "search.performed",
@@ -2099,6 +2246,29 @@ export function RunWorkspace({
   const liveToolTraces = useMemo(
     () => buildLiveToolTraces(phaseFilteredEvents),
     [phaseFilteredEvents],
+  );
+
+  const chronologicalEvents = useMemo(
+    () =>
+      [...phaseFilteredEvents].sort(
+        (first, second) =>
+          new Date(first.created_at).getTime() - new Date(second.created_at).getTime(),
+      ),
+    [phaseFilteredEvents],
+  );
+
+  const recentTimelineEvents = useMemo(
+    () => chronologicalEvents.slice(-18),
+    [chronologicalEvents],
+  );
+
+  const chronologicalToolTraces = useMemo(
+    () =>
+      [...liveToolTraces].sort(
+        (first, second) =>
+          new Date(first.timestamp).getTime() - new Date(second.timestamp).getTime(),
+      ),
+    [liveToolTraces],
   );
 
   const liveAgents = useMemo(
@@ -2322,32 +2492,65 @@ export function RunWorkspace({
         <div className="workspace-report-detail">
           <header className="workspace-report-detail-header">
             <span>Pipeline</span>
-            <h1>Run Pipeline</h1>
-            <p>{activePhase?.blocked_reason ?? "Phase status, blockers, stream activity, and report progress for this run."}</p>
+            <h1>Run pipeline</h1>
+            <p>
+              {activePhase?.blocked_reason ??
+                "A chronological view of what the research system has done, what is active now, and where the report stands."}
+            </p>
           </header>
+
+          <section className="workspace-report-hero-grid">
+            <article className="workspace-report-hero-card">
+              <span>Current phase</span>
+              <strong>{activePhase?.label ?? titleCase(workspace.current_phase)}</strong>
+              <small>{workspace.status.replaceAll("_", " ")}</small>
+            </article>
+            <article className="workspace-report-hero-card">
+              <span>Trace events</span>
+              <strong>{workspace.connection.event_count}</strong>
+              <small>{connectionMode ?? displayConnectionState}</small>
+            </article>
+            <article className="workspace-report-hero-card">
+              <span>Research tasks</span>
+              <strong>{liveTaskSummary.total}</strong>
+              <small>{liveTaskSummary.progress}% complete</small>
+            </article>
+            <article className="workspace-report-hero-card">
+              <span>Report sections</span>
+              <strong>{workspace.report_sections.length}</strong>
+              <small>{workspace.citations.length} citations</small>
+            </article>
+          </section>
+
           <section className="workspace-report-detail-section">
             <div className="workspace-report-section-head">
-              <h2>Phase Summary</h2>
-              <span>{workspace.connection.event_count} events</span>
+              <h2>Phase map</h2>
+              <span>{workspace.phases.length} phases</span>
             </div>
-            <div className="workspace-report-phase-grid">
+            <div className="workspace-phase-map">
               {workspace.phases.map((phase) => (
-                <article className={`workspace-report-phase-card ${phase.status}`} key={phase.key}>
-                  <strong>{phase.label}</strong>
-                  <span>{phase.status.replaceAll("_", " ")}</span>
+                <button
+                  className={`workspace-phase-map-item ${phase.status} ${
+                    focusedPhase === phase.key ? "active" : ""
+                  }`}
+                  key={phase.key}
+                  onClick={() => setFocusedPhase((current) => (current === phase.key ? null : phase.key))}
+                  type="button"
+                >
+                  <span>{phase.label}</span>
+                  <strong>{phase.status.replaceAll("_", " ")}</strong>
                   <small>
-                    {phase.blocked_reason ??
-                      (phase.completed_at ? formatTime(phase.completed_at) : "No blockers")}
+                    {phase.completed_at ? formatTime(phase.completed_at) : `${phase.event_count} events`}
                   </small>
-                  <em>{phase.event_count}</em>
-                </article>
+                </button>
               ))}
             </div>
           </section>
+
           <section className="workspace-report-detail-grid two">
             <article className="workspace-report-detail-section">
               <div className="workspace-report-section-head">
-                <h2>Blockers And Health</h2>
+                <h2>Health</h2>
               </div>
               <div className="workspace-report-row-list">
                 {workspace.asset_processing_errors.map((error) => (
@@ -2363,44 +2566,57 @@ export function RunWorkspace({
                   </article>
                 ) : null}
                 {workspace.asset_processing_errors.length === 0 && !activePhase?.blocked_reason ? (
-                  <article className="workspace-report-row">
+                  <article className="workspace-report-row success">
                     <strong>No active blockers</strong>
-                    <span>The run is flowing normally.</span>
+                    <span>The run is moving normally.</span>
                   </article>
                 ) : null}
               </div>
             </article>
             <article className="workspace-report-detail-section">
               <div className="workspace-report-section-head">
-                <h2>Report Progress</h2>
+                <h2>Report progress</h2>
                 <span>{workspace.report_sections.length} sections</span>
               </div>
               <div className="workspace-report-row-list">
-                {workspace.report_sections.map((section) => (
-                  <article className="workspace-report-row" key={section.id}>
-                    <strong>{section.title}</strong>
-                    <span>
-                      {section.grounded_claim_count} grounded / {section.unsupported_claim_count} open
-                    </span>
-                    <small>{section.citation_count} citations · {section.removed_citation_count} removed</small>
-                  </article>
+                {workspace.report_sections.slice(0, 5).map((section) => (
+                  <details className="workspace-report-row" key={section.id}>
+                    <summary>
+                      <strong>{section.title}</strong>
+                      <span>
+                        {section.grounded_claim_count} grounded /{" "}
+                        {section.unsupported_claim_count} open
+                      </span>
+                    </summary>
+                    <small>
+                      {section.citation_count} citations ·{" "}
+                      {section.removed_citation_count} removed
+                    </small>
+                  </details>
                 ))}
+                {workspace.report_sections.length === 0 ? (
+                  <article className="workspace-report-row">
+                    <strong>No report sections yet</strong>
+                    <span>Sections appear after drafting begins.</span>
+                  </article>
+                ) : null}
               </div>
             </article>
           </section>
+
           <section className="workspace-report-detail-section">
             <div className="workspace-report-section-head">
-              <h2>Recent Decisions</h2>
-              <span>{visibleDecisions.length}</span>
+              <h2>Chronological trace</h2>
+              <span>{recentTimelineEvents.length} latest</span>
             </div>
-            <div className="workspace-report-row-list">
-              {visibleDecisions.slice(0, 8).map((decision) => (
-                <DecisionCard decision={decision} key={decision.id} />
+            <div className="workspace-activity-timeline">
+              {recentTimelineEvents.map((event) => (
+                <EventTimelineItem event={event} key={event.id} />
               ))}
-              {visibleDecisions.length === 0 ? (
+              {recentTimelineEvents.length === 0 ? (
                 <article className="workspace-report-row">
-                  <strong>No decisions recorded yet</strong>
-                  <span>Decision records will appear as planning, execution, grounding, and audit steps run.</span>
+                  <strong>No trace events yet</strong>
+                  <span>Planning, search, source, grounding, and report events will appear here.</span>
                 </article>
               ) : null}
             </div>
@@ -2486,32 +2702,11 @@ export function RunWorkspace({
               <h2>Planning Trace</h2>
               <span>{planningEvents.length}</span>
             </div>
-            <div className="workspace-report-row-list">
+            <div className="workspace-activity-timeline compact">
               {planningEvents
-                .slice()
-                .reverse()
-                .slice(0, 12)
+                .slice(-12)
                 .map((event) => (
-                  <article
-                    className={`workspace-report-row ${statusClassName(statusFromEventType(event.event_type))}`}
-                    key={event.id}
-                  >
-                    <div className="workspace-live-card-head">
-                      <div>
-                        <strong>{displayEventType(event.event_type)}</strong>
-                        <span>{formatTime(event.created_at)}</span>
-                      </div>
-                      <em>{statusFromEventType(event.event_type)}</em>
-                    </div>
-                    <details className="workspace-live-disclosure">
-                      <summary>Details</summary>
-                      <p>
-                        {payloadString(event.payload, ["summary", "rationale", "query", "note"]) ??
-                          "Planning event payload"}
-                      </p>
-                      <pre>{JSON.stringify(event.payload, null, 2)}</pre>
-                    </details>
-                  </article>
+                  <EventTimelineItem event={event} key={event.id} />
                 ))}
               {planningEvents.length === 0 ? (
                 <article className="workspace-report-row">
@@ -2528,9 +2723,11 @@ export function RunWorkspace({
             </div>
             <div className="workspace-report-row-list">
               {streams.map((stream) => (
-                <article className="workspace-report-row" key={`${stream.name}-${stream.objective}`}>
-                  <strong>{stream.name}</strong>
-                  <span>{stream.objective}</span>
+                <details className="workspace-report-row" key={`${stream.name}-${stream.objective}`}>
+                  <summary>
+                    <strong>{stream.name}</strong>
+                    <span>{stream.objective}</span>
+                  </summary>
                   {stream.queries.length ? (
                     <div className="workspace-token-list">
                       {stream.queries.map((query) => (
@@ -2540,7 +2737,7 @@ export function RunWorkspace({
                       ))}
                     </div>
                   ) : null}
-                </article>
+                </details>
               ))}
               {streams.length === 0 ? (
                 <article className="workspace-report-row">
@@ -2561,11 +2758,13 @@ export function RunWorkspace({
                     (turn) => turn.question_id === question.id,
                   );
                   return (
-                    <article className="workspace-report-row" key={question.id}>
-                      <strong>{question.prompt}</strong>
-                      <span>{answer?.response ?? "Awaiting response"}</span>
+                    <details className="workspace-report-row" key={question.id}>
+                      <summary>
+                        <strong>{question.prompt}</strong>
+                        <span>{answer?.response ?? "Awaiting response"}</span>
+                      </summary>
                       <small>{question.rationale}</small>
-                    </article>
+                    </details>
                   );
                 }) ?? (
                   <article className="workspace-report-row">
@@ -2691,6 +2890,28 @@ export function RunWorkspace({
               {liveFiles.length} context files and packs captured during this run.
             </p>
           </header>
+          <section className="workspace-report-hero-grid">
+            <article className="workspace-report-hero-card">
+              <span>Decisions</span>
+              <strong>{visibleDecisions.length}</strong>
+              <small>{focusedPhase ? `${titleCase(focusedPhase)} phase` : "all phases"}</small>
+            </article>
+            <article className="workspace-report-hero-card">
+              <span>Agents</span>
+              <strong>{liveAgents.length}</strong>
+              <small>planner and workers</small>
+            </article>
+            <article className="workspace-report-hero-card">
+              <span>Tool traces</span>
+              <strong>{liveToolTraces.length}</strong>
+              <small>calls and retrievals</small>
+            </article>
+            <article className="workspace-report-hero-card">
+              <span>Files</span>
+              <strong>{liveFiles.length}</strong>
+              <small>context and artifacts</small>
+            </article>
+          </section>
           <section className="workspace-report-detail-section">
             <div className="workspace-report-section-head">
               <h2>{titleCase(thinkingSubtab)}</h2>
@@ -2759,6 +2980,17 @@ export function RunWorkspace({
     }
 
     if (reportPanelTab === "sources") {
+      const projectSourceCount = workspace.sources.filter(
+        (source) => source.origin === "project_corpus",
+      ).length;
+      const fetchedSourceCount = workspace.sources.filter(
+        (source) => source.state === "fetched",
+      ).length;
+      const citedSourceCount = workspace.sources.filter((source) => source.state === "cited").length;
+      const removedSourceCount = workspace.sources.filter(
+        (source) => source.state === "removed",
+      ).length;
+
       return (
         <div className="workspace-report-detail">
           <header className="workspace-report-detail-header">
@@ -2766,30 +2998,63 @@ export function RunWorkspace({
             <h1>Source Provenance</h1>
             <p>{workspace.sources.length} total sources across project corpus, run attachments, fetched web results, and cited records.</p>
           </header>
+          <section className="workspace-report-hero-grid">
+            <article className="workspace-report-hero-card">
+              <span>Total sources</span>
+              <strong>{workspace.sources.length}</strong>
+              <small>all lanes</small>
+            </article>
+            <article className="workspace-report-hero-card">
+              <span>Project corpus</span>
+              <strong>{projectSourceCount}</strong>
+              <small>uploaded context</small>
+            </article>
+            <article className="workspace-report-hero-card">
+              <span>Fetched</span>
+              <strong>{fetchedSourceCount}</strong>
+              <small>read into run</small>
+            </article>
+            <article className="workspace-report-hero-card">
+              <span>Cited / removed</span>
+              <strong>{citedSourceCount}</strong>
+              <small>{removedSourceCount} removed</small>
+            </article>
+          </section>
           <section className="workspace-report-detail-grid two">
             <article className="workspace-report-detail-section">
               <div className="workspace-report-section-head">
                 <h2>Source Lanes</h2>
               </div>
               <div className="workspace-report-row-list">
-                {sourceLanes.map(([label, items]) => (
-                  <article className="workspace-report-row" key={label}>
-                    <strong>{label}</strong>
-                    <span>{items.length} sources</span>
-                    <div className="workspace-report-source-list">
-                      {items.slice(0, 8).map((source) => (
-                        <button
-                          className={`workspace-report-source-pill ${selectedSource?.id === source.id ? "active" : ""}`}
-                          key={source.id}
-                          onClick={() => setSelectedSourceId(source.id)}
-                          type="button"
-                        >
-                          {source.title ?? source.url}
-                        </button>
-                      ))}
-                    </div>
-                  </article>
-                ))}
+                {sourceLanes.map(([label, items]) => {
+                  const laneHasSelectedSource = items.some((source) => source.id === selectedSource?.id);
+                  return (
+                    <details className="workspace-report-row" key={label} open={laneHasSelectedSource}>
+                      <summary>
+                        <strong>{label}</strong>
+                        <span>{items.length} sources</span>
+                      </summary>
+                      {items.length ? (
+                        <div className="workspace-report-source-list">
+                          {items.slice(0, 12).map((source) => (
+                            <button
+                              className={`workspace-report-source-pill ${
+                                selectedSource?.id === source.id ? "active" : ""
+                              }`}
+                              key={source.id}
+                              onClick={() => setSelectedSourceId(source.id)}
+                              type="button"
+                            >
+                              {source.title ?? source.url}
+                            </button>
+                          ))}
+                        </div>
+                      ) : (
+                        <small>No sources in this lane yet.</small>
+                      )}
+                    </details>
+                  );
+                })}
               </div>
             </article>
             <article className="workspace-report-detail-section">
@@ -2820,10 +3085,13 @@ export function RunWorkspace({
                     </article>
                   </div>
                   {selectedSource.note_summaries.map((summary, index) => (
-                    <article className="workspace-report-row" key={`${selectedSource.id}-summary-${index}`}>
-                      <strong>Note summary</strong>
-                      <span>{summary}</span>
-                    </article>
+                    <details className="workspace-report-row" key={`${selectedSource.id}-summary-${index}`}>
+                      <summary>
+                        <strong>Note summary {index + 1}</strong>
+                        <span>{truncateSentence(summary, 140)}</span>
+                      </summary>
+                      <small>{summary}</small>
+                    </details>
                   ))}
                 </div>
               ) : (
@@ -2848,6 +3116,28 @@ export function RunWorkspace({
               {citationSummary.removed} removed during audit.
             </p>
           </header>
+          <section className="workspace-report-hero-grid">
+            <article className="workspace-report-hero-card">
+              <span>Final citations</span>
+              <strong>{workspace.citations.length}</strong>
+              <small>{citationSummary.surviving} kept</small>
+            </article>
+            <article className="workspace-report-hero-card">
+              <span>Referenced</span>
+              <strong>{referencedCount}</strong>
+              <small>claim traces</small>
+            </article>
+            <article className="workspace-report-hero-card">
+              <span>Read</span>
+              <strong>{readCount}</strong>
+              <small>source traces</small>
+            </article>
+            <article className="workspace-report-hero-card">
+              <span>Removed</span>
+              <strong>{citationSummary.removed}</strong>
+              <small>audit removals</small>
+            </article>
+          </section>
           <section className="workspace-report-detail-grid citations">
             <article className="workspace-report-detail-section">
               <div className="workspace-report-section-head">
@@ -2905,15 +3195,24 @@ export function RunWorkspace({
                     <span>{getCitationSourceLabel(selectedCitation, workspace.sources)}</span>
                   </article>
                   {selectedCitation.quote ? (
-                    <blockquote className="citation-quote citation-quote-detail">
-                      {normalizeInlineText(selectedCitation.quote)}
-                    </blockquote>
+                    <details className="workspace-report-row">
+                      <summary>
+                        <strong>Quoted passage</strong>
+                        <span>{truncateSentence(normalizeInlineText(selectedCitation.quote), 140)}</span>
+                      </summary>
+                      <blockquote className="citation-quote citation-quote-detail">
+                        {normalizeInlineText(selectedCitation.quote)}
+                      </blockquote>
+                    </details>
                   ) : null}
                   {selectedCitation.audit_reasons.length ? (
-                    <article className="workspace-report-row danger">
-                      <strong>Audit reason</strong>
-                      <span>{selectedCitation.audit_reasons.join(", ")}</span>
-                    </article>
+                    <details className="workspace-report-row danger">
+                      <summary>
+                        <strong>Audit reason</strong>
+                        <span>{selectedCitation.audit_reasons.length} issue(s)</span>
+                      </summary>
+                      <small>{selectedCitation.audit_reasons.join(", ")}</small>
+                    </details>
                   ) : null}
                 </div>
               ) : (
@@ -2929,50 +3228,47 @@ export function RunWorkspace({
       <div className="workspace-report-detail">
         <header className="workspace-report-detail-header">
           <span>Tool calls</span>
-          <h1>Realtime Trace</h1>
-          <p>Structured provider calls, searches, source reads, grounding checks, and backend trace payloads captured for this run.</p>
+          <h1>Realtime trace</h1>
+          <p>
+            A chronological trace of provider calls, searches, source reads, grounding checks,
+            and backend payloads captured while the run executes.
+          </p>
         </header>
-        <section className="workspace-report-detail-grid two">
-          <article className="workspace-report-detail-section">
-            <div className="workspace-report-section-head">
-              <h2>Transport</h2>
-            </div>
-            <div className="workspace-report-metric-grid">
-              <article>
-                <span>Status</span>
-                <strong>{displayConnectionState}</strong>
-              </article>
-              <article>
-                <span>Mode</span>
-                <strong>{connectionMode ?? workspace.connection.stream_mode ?? "n/a"}</strong>
-              </article>
-              <article>
-                <span>Last ID</span>
-                <strong>{workspace.connection.last_event_id}</strong>
-              </article>
-              <article>
-                <span>Backend</span>
-                <strong>{workspace.connection.workflow_backend ?? "local"}</strong>
-              </article>
-            </div>
+
+        <section className="workspace-report-hero-grid trace">
+          <article className="workspace-report-hero-card">
+            <span>Status</span>
+            <strong>{displayConnectionState}</strong>
+            <small>{connectionMode ?? workspace.connection.stream_mode ?? "stream"}</small>
           </article>
-          <article className="workspace-report-detail-section">
-            <div className="workspace-report-section-head">
-              <h2>Tool And Trace Events</h2>
-              <span>{liveToolTraces.length}</span>
-            </div>
-            <div className="workspace-report-event-list">
-              {liveToolTraces.map((trace) => (
-                <LiveToolTraceCard key={trace.id} trace={trace} />
-              ))}
-              {liveToolTraces.length === 0 ? (
-                <article className="workspace-report-row">
-                  <strong>No trace events yet</strong>
-                  <span>Backend tool events will appear here once execution starts.</span>
-                </article>
-              ) : null}
-            </div>
+          <article className="workspace-report-hero-card">
+            <span>Tool events</span>
+            <strong>{liveToolTraces.length}</strong>
+            <small>{phaseFilteredEvents.length} raw events</small>
           </article>
+          <article className="workspace-report-hero-card">
+            <span>Last event id</span>
+            <strong>{workspace.connection.last_event_id}</strong>
+            <small>{workspace.connection.workflow_backend ?? "local backend"}</small>
+          </article>
+        </section>
+
+        <section className="workspace-report-detail-section">
+          <div className="workspace-report-section-head">
+            <h2>Chronological trace</h2>
+            <span>{chronologicalToolTraces.length} events</span>
+          </div>
+          <div className="workspace-activity-timeline trace">
+            {chronologicalToolTraces.map((trace) => (
+              <ToolTraceTimelineItem key={trace.id} trace={trace} />
+            ))}
+            {chronologicalToolTraces.length === 0 ? (
+              <article className="workspace-report-row">
+                <strong>No trace events yet</strong>
+                <span>Backend tool events will appear here once execution starts.</span>
+              </article>
+            ) : null}
+          </div>
         </section>
       </div>
     );
@@ -4410,11 +4706,11 @@ function TaskCard({ task }: { task: WorkspaceTaskView }) {
 
 function DecisionCard({ decision }: { decision: WorkspaceDecisionView }) {
   return (
-    <article className="decision-card">
-      <div className="decision-card-header">
+    <details className="decision-card">
+      <summary className="decision-card-header">
         <strong>{decision.title}</strong>
         <span className="pill muted">{titleCase(decision.category)}</span>
-      </div>
+      </summary>
       <span>{normalizeInlineText(decision.rationale)}</span>
       <div className="decision-card-meta">
         {decision.affected_stream_name ? <small>{decision.affected_stream_name}</small> : null}
@@ -4424,7 +4720,7 @@ function DecisionCard({ decision }: { decision: WorkspaceDecisionView }) {
         ) : null}
         <small>{formatTime(decision.timestamp)}</small>
       </div>
-    </article>
+    </details>
   );
 }
 
@@ -4472,9 +4768,14 @@ function CitationCard({
         </div>
       </div>
       <span className="citation-card-source">{sourceLabel}</span>
-      {quote ? <blockquote className="citation-quote">{quote}</blockquote> : null}
-      {citation.audit_reasons.length ? (
-        <small className="danger-text">{citation.audit_reasons.join(", ")}</small>
+      {quote || citation.audit_reasons.length ? (
+        <details className="workspace-live-disclosure">
+          <summary>Evidence</summary>
+          {quote ? <blockquote className="citation-quote">{quote}</blockquote> : null}
+          {citation.audit_reasons.length ? (
+            <small className="danger-text">{citation.audit_reasons.join(", ")}</small>
+          ) : null}
+        </details>
       ) : null}
       <div className="button-row citation-card-actions">
         <button

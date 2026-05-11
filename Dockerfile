@@ -29,11 +29,10 @@ WORKDIR /app
 
 COPY --from=builder /opt/venv /opt/venv
 COPY src ./src
-COPY alembic ./alembic
 COPY README.md ./
 
 USER app
 
 EXPOSE 8010
 
-CMD ["uvicorn", "open_research.main:app", "--host", "0.0.0.0", "--port", "8010"]
+CMD ["uvicorn", "open_research.server.main:app", "--host", "0.0.0.0", "--port", "8010"]

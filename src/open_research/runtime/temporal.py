@@ -10,8 +10,8 @@ from temporalio.client import Client
 from temporalio.common import RetryPolicy, WorkflowIDReusePolicy
 from temporalio.worker import Worker
 
-from .config import Settings
-from .domain import BudgetPolicy
+from open_research.core.config import Settings
+from open_research.core.domain import BudgetPolicy
 
 
 @dataclass(slots=True)

@@ -49,7 +49,7 @@ services:
   api:
     build:
       context: .
-    command: ["uvicorn", "open_research.main:app", "--host", "0.0.0.0", "--port", "8010"]
+    command: ["uvicorn", "open_research.server.main:app", "--host", "0.0.0.0", "--port", "8010"]
     depends_on:
       postgres:
         condition: service_healthy
@@ -62,7 +62,6 @@ services:
       OPEN_RESEARCH_DATABASE_URL: postgresql+asyncpg://open_research:open_research@postgres:5432/open_research
       OPEN_RESEARCH_WORKFLOW_BACKEND: temporal
       OPEN_RESEARCH_TEMPORAL_TARGET_URL: temporal:7233
-      OPEN_RESEARCH_DATABASE_BOOTSTRAP_MODE: alembic
       OPEN_RESEARCH_OTLP_ENDPOINT: http://otel-collector:4318/v1/traces
       OPEN_RESEARCH_ARTIFACT_STORE_BACKEND: local
       OPEN_RESEARCH_ARTIFACT_STORE_PATH: /app/data/artifacts
@@ -97,7 +96,7 @@ services:
   worker:
     build:
       context: .
-    command: ["python", "-m", "open_research.worker_main"]
+    command: ["python", "-m", "open_research.interfaces.worker"]
     depends_on:
       postgres:
         condition: service_healthy
@@ -110,7 +109,6 @@ services:
       OPEN_RESEARCH_DATABASE_URL: postgresql+asyncpg://open_research:open_research@postgres:5432/open_research
       OPEN_RESEARCH_WORKFLOW_BACKEND: temporal
       OPEN_RESEARCH_TEMPORAL_TARGET_URL: temporal:7233
-      OPEN_RESEARCH_DATABASE_BOOTSTRAP_MODE: alembic
       OPEN_RESEARCH_OTLP_ENDPOINT: http://otel-collector:4318/v1/traces
       OPEN_RESEARCH_ARTIFACT_STORE_BACKEND: local
       OPEN_RESEARCH_ARTIFACT_STORE_PATH: /app/data/artifacts

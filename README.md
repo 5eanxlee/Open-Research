@@ -44,11 +44,20 @@ The runtime uses:
 - LangGraph for the orchestrator graph
 - FastAPI for the API surface
 - SQLAlchemy for the persistence layer
-- Alembic for production bootstrap when running on Postgres
 - Temporal as an optional durable execution layer around the orchestrator
 - a claim-level citation pass that retrieves passages and verifies support before finalizing the report
 - a deterministic citation audit layer that strips unsafe, shortened, truncated, or unregistered URLs after grounding
 - a reconciler that requeues stale or orphaned runs using persisted heartbeats and workflow state
+
+## Source layout
+
+- `src/open_research/core` contains domain models, settings, citation auditing, telemetry, and shared utilities.
+- `src/open_research/storage` contains SQLAlchemy persistence and artifact stores.
+- `src/open_research/runtime` contains orchestration, planning, grounding, prompts, event streams, memory, workspace views, and Temporal integration.
+- `src/open_research/integrations` contains provider clients and uploaded asset ingestion.
+- `src/open_research/server` contains the FastAPI app entry point.
+- `src/open_research/interfaces` contains CLI, TUI, terminal client, and worker entry points.
+- `frontend` contains the Next.js dashboard.
 
 ## Local run
 
@@ -89,7 +98,7 @@ curl -N http://127.0.0.1:8010/runs/<run-id>/stream/42
 Start a dedicated worker process:
 
 ```bash
-uv run python -m open_research.worker_main
+uv run python -m open_research.interfaces.worker
 ```
 
 Run the backend and frontend together from the repo:
@@ -193,7 +202,7 @@ With credentials configured, the runtime can use:
 - an optional sentence-transformers reranker for higher-confidence grounding
 - an optional Temporal workflow engine that runs the orchestrator inside durable activities
 
-The code defaults to SQLite for local work and tests. For Postgres deployments, set `OPEN_RESEARCH_DATABASE_BOOTSTRAP_MODE=alembic` and install the `postgres` extra so the runtime boots through Alembic migrations.
+The code defaults to SQLite for local work. For Postgres deployments, install the `postgres` extra and point `OPEN_RESEARCH_DATABASE_URL` at a PostgreSQL database.
 
 ## Configuration
 
@@ -237,7 +246,7 @@ Key runtime switches:
 - `OPEN_RESEARCH_MAX_FETCH_TOOL_CALLS_PER_RUN`
 - `OPEN_RESEARCH_WORKFLOW_BACKEND=auto|local|temporal`
 - `OPEN_RESEARCH_PROCESS_ROLE=all|api|worker`
-- `OPEN_RESEARCH_DATABASE_BOOTSTRAP_MODE=auto|create_all|alembic`
+- `OPEN_RESEARCH_DATABASE_BOOTSTRAP_MODE=auto|create_all`
 - `OPEN_RESEARCH_ARTIFACT_STORE_BACKEND=auto|disabled|local|s3`
 - `OPEN_RESEARCH_EMBEDDING_BACKEND=auto|disabled|mock|openai|openai_compatible`
 - `OPEN_RESEARCH_RERANKER_BACKEND=auto|disabled|heuristic|sentence_transformers`
@@ -296,6 +305,5 @@ under [`frontend`](frontend) and can be run locally with `npm run dev` or contai
 ## Verification
 
 ```bash
-uv run ruff check src tests
-uv run pytest
+uv run ruff check src
 ```

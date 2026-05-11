@@ -10,8 +10,8 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
-from .config import Settings
-from .domain import AssetExtractionMethod, AssetProcessingStatus
+from open_research.core.config import Settings
+from open_research.core.domain import AssetExtractionMethod, AssetProcessingStatus
 
 _TEXT_EXTENSIONS = {".txt", ".md", ".markdown", ".rst", ".log"}
 _JSON_EXTENSIONS = {".json", ".jsonl"}
@@ -129,8 +129,8 @@ def _extract_pdf(
 
 def _ocr_pdf_document(document) -> str:
     try:
-        from PIL import Image  # type: ignore
         import pytesseract  # type: ignore
+        from PIL import Image  # type: ignore
     except ImportError as exc:  # pragma: no cover - dependency-dependent
         raise RuntimeError(
             "PDF OCR requires Pillow and pytesseract, and the Tesseract binary must be installed."
@@ -167,7 +167,9 @@ def _extract_docx(data: bytes) -> str:
                 "DOCX extraction requires docx2txt or python-docx to be installed."
             ) from exc
         document = Document(temp_file.name)
-        paragraphs = [paragraph.text.strip() for paragraph in document.paragraphs if paragraph.text.strip()]
+        paragraphs = [
+            paragraph.text.strip() for paragraph in document.paragraphs if paragraph.text.strip()
+        ]
         text = "\n".join(paragraphs)
         if not text.strip():
             raise RuntimeError("No readable text was found in the DOCX upload.")
@@ -176,8 +178,8 @@ def _extract_docx(data: bytes) -> str:
 
 def _extract_image_ocr(data: bytes) -> str:
     try:
-        from PIL import Image  # type: ignore
         import pytesseract  # type: ignore
+        from PIL import Image  # type: ignore
     except ImportError as exc:  # pragma: no cover - dependency-dependent
         raise RuntimeError(
             "Image OCR requires Pillow and pytesseract, and the Tesseract binary must be installed."
@@ -225,7 +227,9 @@ def extract_uploaded_file(
             ocr_used = False
             warnings = []
         elif suffix in _CSV_EXTENSIONS or content_type in {"text/csv", "text/tab-separated-values"}:
-            delimiter = "\t" if suffix == ".tsv" or content_type == "text/tab-separated-values" else ","
+            delimiter = (
+                "\t" if suffix == ".tsv" or content_type == "text/tab-separated-values" else ","
+            )
             extracted_text = _extract_csv(data, delimiter=delimiter)
             method = AssetExtractionMethod.CSV
             page_count = None

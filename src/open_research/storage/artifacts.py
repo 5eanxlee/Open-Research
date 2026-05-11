@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass
 from hashlib import sha256
 from pathlib import Path
 
-from .config import Settings
+from open_research.core.config import Settings
 
 
 @dataclass(slots=True)
@@ -63,12 +63,7 @@ class LocalArtifactStore(ArtifactStore):
         source_id: str,
         payload: ArtifactPayload,
     ) -> ArtifactReference:
-        target = (
-            self.root
-            / run_id
-            / source_id
-            / f"{payload.kind}.{payload.extension.lstrip('.')}"
-        )
+        target = self.root / run_id / source_id / f"{payload.kind}.{payload.extension.lstrip('.')}"
         digest = sha256(payload.data).hexdigest()
 
         def _write() -> None:
@@ -111,10 +106,7 @@ class S3ArtifactStore(ArtifactStore):
                 "boto3 is not installed. Install the storage extra to enable S3 artifacts."
             ) from exc
 
-        key = (
-            f"{self.prefix}/{run_id}/{source_id}/"
-            f"{payload.kind}.{payload.extension.lstrip('.')}"
-        )
+        key = f"{self.prefix}/{run_id}/{source_id}/{payload.kind}.{payload.extension.lstrip('.')}"
         digest = sha256(payload.data).hexdigest()
 
         def _upload() -> None:

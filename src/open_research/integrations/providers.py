@@ -22,9 +22,14 @@ from openai.types.responses import ParsedResponse
 from pydantic import BaseModel, ValidationError
 from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt, wait_exponential
 
-from .artifacts import ArtifactPayload
-from .domain import FetchedDocument, RetrievalMethod, RetrievedPassage, SearchResult, SourceKind
-from .utils import (
+from open_research.core.domain import (
+    FetchedDocument,
+    RetrievalMethod,
+    RetrievedPassage,
+    SearchResult,
+    SourceKind,
+)
+from open_research.core.utils import (
     clean_text,
     normalize_url,
     sanitize_source_snippet_for_url,
@@ -32,6 +37,7 @@ from .utils import (
     strip_markdown_fences,
     tokenize,
 )
+from open_research.storage.artifacts import ArtifactPayload
 
 
 @dataclass(slots=True)
@@ -1471,8 +1477,10 @@ def _extract_openai_web_search_results(
         record = sources.setdefault(normalized, {"url": normalized})
         if isinstance(title, str) and title.strip() and not record.get("title"):
             record["title"] = clean_text(title)[:200]
-        if isinstance(snippet, str) and snippet.strip() and (
-            prefer_snippet or not record.get("snippet")
+        if (
+            isinstance(snippet, str)
+            and snippet.strip()
+            and (prefer_snippet or not record.get("snippet"))
         ):
             sanitized_snippet = sanitize_source_snippet_for_url(
                 url=normalized,
@@ -1536,7 +1544,9 @@ def _extract_summary_url_contexts(summary: str) -> list[tuple[str, str]]:
         if normalized is None or normalized in seen:
             continue
         seen.add(normalized)
-        contexts.append((normalized, _summary_context_for_match(summary, match.start(), match.end())))
+        contexts.append(
+            (normalized, _summary_context_for_match(summary, match.start(), match.end()))
+        )
     return contexts
 
 
@@ -1730,9 +1740,7 @@ def _extract_usage(response: Any, *, model: str) -> UsageInfo:
         return UsageInfo()
     output_details = getattr(usage, "output_tokens_details", None)
     reasoning_tokens = int(getattr(output_details, "reasoning_tokens", 0) or 0)
-    input_tokens = int(
-        getattr(usage, "input_tokens", getattr(usage, "prompt_tokens", 0)) or 0
-    )
+    input_tokens = int(getattr(usage, "input_tokens", getattr(usage, "prompt_tokens", 0)) or 0)
     output_tokens = int(
         getattr(usage, "output_tokens", getattr(usage, "completion_tokens", 0)) or 0
     )

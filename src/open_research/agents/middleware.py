@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Awaitable, Callable, Sequence
+from time import perf_counter
 from typing import Any
 
 from langchain.agents.middleware import AgentMiddleware, ModelRequest, ModelResponse
@@ -107,6 +108,87 @@ class TodoSanitizationMiddleware(AgentMiddleware):
         return request.override(tool_call={**tool_call, "args": sanitized})
 
 
+class TodoSyncMiddleware(AgentMiddleware):
+    """Publish normalized DeepAgents todo updates after `write_todos` succeeds."""
+
+    tools: Sequence[BaseTool] = ()
+
+    def __init__(
+        self,
+        *,
+        agent_role: str,
+        on_sync: Callable[[str, list[dict[str, str]]], Awaitable[None]],
+    ) -> None:
+        super().__init__()
+        self.agent_role = agent_role
+        self.on_sync = on_sync
+
+    async def awrap_tool_call(self, request: Any, handler: Callable[[Any], Awaitable[Any]]) -> Any:
+        result = await handler(request)
+        tool_call = dict(request.tool_call)
+        if normalize_tool_name(str(tool_call.get("name") or "")) != "write_todos":
+            return result
+        args = tool_call.get("args") or {}
+        if not isinstance(args, dict):
+            args = {"todos": args}
+        await self.on_sync(self.agent_role, sanitize_todos(args.get("todos", args)))
+        return result
+
+
+class SubAgentTraceMiddleware(AgentMiddleware):
+    """Emit lifecycle events for DeepAgents `task` delegations."""
+
+    tools: Sequence[BaseTool] = ()
+
+    def __init__(
+        self,
+        *,
+        parent_role: str,
+        on_event: Callable[[str, dict[str, Any]], Awaitable[None]],
+    ) -> None:
+        super().__init__()
+        self.parent_role = parent_role
+        self.on_event = on_event
+
+    async def awrap_tool_call(self, request: Any, handler: Callable[[Any], Awaitable[Any]]) -> Any:
+        tool_call = dict(request.tool_call)
+        if normalize_tool_name(str(tool_call.get("name") or "")) != "task":
+            return await handler(request)
+
+        args = tool_call.get("args") or {}
+        if not isinstance(args, dict):
+            args = {"task": str(args)}
+        agent_role = _extract_subagent_role(args)
+        prompt_text = _extract_subagent_prompt(args)
+        call_id = str(tool_call.get("id") or "")
+        payload = {
+            "agent_role": agent_role,
+            "parent_role": self.parent_role,
+            "tool_call_id": call_id,
+            "prompt_hash": _stable_text_hash(prompt_text),
+            "prompt_summary": clean_prompt_summary(prompt_text),
+        }
+        started_at = perf_counter()
+        await self.on_event("deepagents.agent.started", payload)
+        try:
+            result = await handler(request)
+        except Exception as exc:
+            await self.on_event(
+                "deepagents.agent.failed",
+                {
+                    **payload,
+                    "elapsed_ms": int((perf_counter() - started_at) * 1000),
+                    "error": str(exc),
+                },
+            )
+            raise
+        await self.on_event(
+            "deepagents.agent.completed",
+            {**payload, "elapsed_ms": int((perf_counter() - started_at) * 1000)},
+        )
+        return result
+
+
 class SearchToolCallLimitMiddleware(ToolCallLimitMiddleware):
     """Enforce a combined run limit across all search tools."""
 
@@ -144,9 +226,7 @@ def _repair_empty_messages(messages: Sequence[Any]) -> list[Any]:
 
 def _repair_empty_message(message: Any) -> Any:
     content = (
-        message.get("content")
-        if isinstance(message, dict)
-        else getattr(message, "content", None)
+        message.get("content") if isinstance(message, dict) else getattr(message, "content", None)
     )
     if not _is_empty_content(content):
         return message
@@ -216,3 +296,35 @@ def _coerce_single_todo(item: Any) -> dict[str, str] | None:
     if normalized_status not in VALID_TODO_STATUSES:
         normalized_status = "pending"
     return {"content": content, "status": normalized_status}
+
+
+def clean_prompt_summary(text: str, *, max_chars: int = 240) -> str:
+    cleaned = " ".join(str(text or "").split())
+    if len(cleaned) <= max_chars:
+        return cleaned
+    return cleaned[: max_chars - 1].rstrip() + "..."
+
+
+def _extract_subagent_role(args: dict[str, Any]) -> str:
+    for key in ("subagent_type", "agent", "agent_name", "name", "role"):
+        value = args.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return "subagent"
+
+
+def _extract_subagent_prompt(args: dict[str, Any]) -> str:
+    for key in ("prompt", "task", "description", "input", "message"):
+        value = args.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return str(args)
+
+
+def _stable_text_hash(text: str) -> str | None:
+    cleaned = " ".join(str(text or "").split())
+    if not cleaned:
+        return None
+    import hashlib
+
+    return hashlib.sha256(cleaned.encode("utf-8")).hexdigest()

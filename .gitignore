@@ -5,6 +5,11 @@
 .DS_Store
 .pytest_cache/
 .ruff_cache/
+tests/
+test_*.py
+*_test.py
+alembic/
+alembic.ini
 __pycache__/
 *.pyc
 *.pyo

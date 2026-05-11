@@ -15,7 +15,7 @@ from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Button, DataTable, Footer, Input, RichLog, Static
 
-from .domain import (
+from open_research.core.domain import (
     AgentConfig,
     AnswerStyle,
     BehaviorAssessment,
@@ -35,6 +35,7 @@ from .domain import (
     RunSummary,
     SourceTrustTier,
 )
+
 from .terminal_client import ResearchTerminalClient, StreamEnvelope, TerminalClientError
 
 
@@ -249,7 +250,9 @@ class OpenResearchTerminalApp(App[None]):
         workflow = (
             detail.workflow_backend
             if detail and detail.workflow_backend
-            else config.backends.get("workflow", "connecting") if config else "connecting"
+            else config.backends.get("workflow", "connecting")
+            if config
+            else "connecting"
         )
         lead_model = config.models.lead_model if config else "loading"
         status = detail.status.value if detail else "idle"
@@ -453,9 +456,7 @@ class OpenResearchTerminalApp(App[None]):
             table.add_row("Trust policy", self.public_config.source_trust_policy_version)
             table.add_row(
                 "Backends",
-                ", ".join(
-                    f"{name}={value}" for name, value in self.public_config.backends.items()
-                ),
+                ", ".join(f"{name}={value}" for name, value in self.public_config.backends.items()),
             )
             table.add_row(
                 "Models",
@@ -769,9 +770,7 @@ class OpenResearchTerminalApp(App[None]):
                 f"removed={payload.get('removed_count', '?')}."
             )
         if envelope.event_type == "report.completed":
-            return (
-                f"Grounded report completed with {payload.get('citation_count', 0)} citations."
-            )
+            return f"Grounded report completed with {payload.get('citation_count', 0)} citations."
         if envelope.event_type == "run.cancellation_requested":
             return "Cancellation was requested for the active run."
         if envelope.event_type == "run.cancelled":

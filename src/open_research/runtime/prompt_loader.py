@@ -5,8 +5,8 @@ from pathlib import Path
 from string import Formatter
 from typing import Any
 
-from .config import Settings
-from .domain import PromptMode
+from open_research.core.config import Settings
+from open_research.core.domain import PromptMode
 
 
 class PromptTemplateError(RuntimeError):

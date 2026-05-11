@@ -13,15 +13,13 @@ from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel
 from typing_extensions import TypedDict
 
-from .artifacts import ArtifactPayload, ArtifactStore
-from .citations import (
+from open_research.core.citations import (
     CitationCandidate,
     audit_citation_candidates,
     build_citation_key,
 )
-from .config import Settings
-from .db import ResearchStore
-from .domain import (
+from open_research.core.config import Settings
+from open_research.core.domain import (
     AgentConfig,
     BudgetPolicy,
     BudgetRecommendationRationale,
@@ -60,42 +58,8 @@ from .domain import (
     TaskStatus,
     resolve_model_config,
 )
-from .events import RunEventService
-from .memory import (
-    BehaviorJudge,
-    ContextAssembler,
-    MemoryCompiler,
-    query_hints_from_pack,
-    render_context_pack,
-)
-from .observability import ResearchTelemetry
-from .prompting import (
-    SOURCE_TRUST_POLICY_VERSION,
-    assess_source_trust,
-    build_source_prompt_context,
-    claim_verifier_system_prompt,
-    note_writer_system_prompt,
-    planner_system_prompt,
-    report_writer_system_prompt,
-    resolve_agent_config,
-)
-from .providers import (
-    EmbeddingProvider,
-    FetchProvider,
-    GenerationResult,
-    OpenAIJsonClient,
-    PassageReranker,
-    SearchProvider,
-    UsageInfo,
-)
-from .tool_registry import (
-    FETCH_BUDGET_CATEGORIES,
-    FETCH_TOOL,
-    SEARCH_BUDGET_CATEGORIES,
-    SEARCH_TOOL,
-    assert_tool_budget_available,
-)
-from .utils import (
+from open_research.core.observability import ResearchTelemetry
+from open_research.core.utils import (
     chunk_text,
     clean_text,
     dedupe_preserve_order,
@@ -108,6 +72,42 @@ from .utils import (
     strip_markdown_fences,
     tokenize,
 )
+from open_research.integrations.providers import (
+    EmbeddingProvider,
+    FetchProvider,
+    GenerationResult,
+    OpenAIJsonClient,
+    PassageReranker,
+    SearchProvider,
+    UsageInfo,
+)
+from open_research.runtime.events import RunEventService
+from open_research.runtime.memory import (
+    BehaviorJudge,
+    ContextAssembler,
+    MemoryCompiler,
+    query_hints_from_pack,
+    render_context_pack,
+)
+from open_research.runtime.prompting import (
+    SOURCE_TRUST_POLICY_VERSION,
+    assess_source_trust,
+    build_source_prompt_context,
+    claim_verifier_system_prompt,
+    note_writer_system_prompt,
+    planner_system_prompt,
+    report_writer_system_prompt,
+    resolve_agent_config,
+)
+from open_research.runtime.tool_registry import (
+    FETCH_BUDGET_CATEGORIES,
+    FETCH_TOOL,
+    SEARCH_BUDGET_CATEGORIES,
+    SEARCH_TOOL,
+    assert_tool_budget_available,
+)
+from open_research.storage.artifacts import ArtifactPayload, ArtifactStore
+from open_research.storage.db import ResearchStore
 
 
 class Planner(ABC):
@@ -336,7 +336,9 @@ def _query_scope_relevance(
     priority_overlap = len(scope_priority_tokens & query_tokens)
     exact_bonus = 0.15 if clean_text(question).lower() in clean_text(query).lower() else 0.0
     off_topic_penalty = (
-        -0.28 if any(hint in clean_text(query).lower() for hint in _OFF_TOPIC_PENALTY_HINTS) else 0.0
+        -0.28
+        if any(hint in clean_text(query).lower() for hint in _OFF_TOPIC_PENALTY_HINTS)
+        else 0.0
     )
     return round(
         overlap + min(0.25, 0.1 * priority_overlap) + exact_bonus + off_topic_penalty,
@@ -405,7 +407,9 @@ def _compact_search_query(
     append_tokens(objective_tokens)
     append_tokens(candidate_tokens)
     if not ordered:
-        fallback = clean_text(" ".join(part for part in (text, objective or "") if part) or "research")
+        fallback = clean_text(
+            " ".join(part for part in (text, objective or "") if part) or "research"
+        )
         return fallback[:120].strip()
     return " ".join(ordered)
 
@@ -783,10 +787,7 @@ def _derive_recommended_budget(
     if len(lowered.split()) > 18:
         complexity_factors.append("broad_question")
     unresolved = [
-        item
-        for note in (prior_notes or [])
-        for item in note.get("open_questions", [])
-        if item
+        item for note in (prior_notes or []) for item in note.get("open_questions", []) if item
     ]
     if unresolved:
         complexity_factors.append("open_gaps")
@@ -804,7 +805,9 @@ def _derive_recommended_budget(
         max(3, 2 + min(len(complexity_factors), 3)),
     )
     execution_mode = (
-        ExecutionMode.DEEP if len(complexity_factors) >= 2 or recommended_streams >= 6 else ExecutionMode.STANDARD
+        ExecutionMode.DEEP
+        if len(complexity_factors) >= 2 or recommended_streams >= 6
+        else ExecutionMode.STANDARD
     )
     rationale = BudgetRecommendationRationale(
         summary=(
@@ -906,10 +909,7 @@ def _build_discovery_queries(
         ("roadmap", "changelog", "updates"),
         ("expert", "review", "consensus"),
     ]
-    queries.extend(
-        _compact_search_query(question, extra_terms=angle)
-        for angle in discovery_angles
-    )
+    queries.extend(_compact_search_query(question, extra_terms=angle) for angle in discovery_angles)
     return dedupe_preserve_order(queries)[: max(1, max_queries)]
 
 
@@ -943,19 +943,14 @@ def _build_planning_artifact(
     approved_preview_version: int | None = None,
 ) -> PlanningArtifact:
     toc = dedupe_preserve_order(
-        [stream.name for stream in plan.streams]
-        + list(plan.success_criteria)
+        [stream.name for stream in plan.streams] + list(plan.success_criteria)
     )[:8]
     constraints = dedupe_preserve_order(
         [
             "Respect runtime budget caps and source selection.",
             "Use uploaded planning context to shape stream priorities.",
             "Maintain enough source diversity for later grounding and citation audit.",
-            *(
-                plan.budget_rationale.coverage_axes
-                if plan.budget_rationale is not None
-                else []
-            ),
+            *(plan.budget_rationale.coverage_axes if plan.budget_rationale is not None else []),
         ]
     )[:10]
     deliverables = dedupe_preserve_order(
@@ -968,8 +963,7 @@ def _build_planning_artifact(
         ]
     )[:10]
     key_questions = dedupe_preserve_order(
-        [question, *plan.complexity_factors]
-        + [stream.objective for stream in plan.streams]
+        [question, *plan.complexity_factors] + [stream.objective for stream in plan.streams]
     )[:12]
     validation_checks = [
         "Each stream has a distinct objective and at least one executable query.",
@@ -1010,7 +1004,9 @@ def _bound_streams_to_budget(
     bounded_streams: list[ResearchStreamPlan] = []
     max_streams = min(budget.max_streams, stream_limit or budget.max_streams)
     for stream in streams[:max_streams]:
-        queries = dedupe_preserve_order([query.strip() for query in stream.queries if query.strip()])
+        queries = dedupe_preserve_order(
+            [query.strip() for query in stream.queries if query.strip()]
+        )
         bounded_queries = _normalize_scope_queries(
             question=question,
             objective=stream.objective,
@@ -1060,7 +1056,8 @@ def _validate_research_plan(
             issues.append(f"Stream {stream.name!r} must include at least one query.")
         if len(stream.queries) > budget.max_queries_per_stream:
             issues.append(
-                f"Stream {stream.name!r} exceeds max_queries_per_stream={budget.max_queries_per_stream}."
+                f"Stream {stream.name!r} exceeds "
+                f"max_queries_per_stream={budget.max_queries_per_stream}."
             )
     if len(plan.streams) > budget.max_streams:
         issues.append(f"Plan exceeds max_streams={budget.max_streams}.")
@@ -1134,7 +1131,9 @@ class HeuristicPlanner(Planner):
                 ),
                 queries=_default_stream_queries(
                     question=question,
-                    objective=f"Find recent developments, updates, or changed assumptions about: {core}.",
+                    objective=(
+                        f"Find recent developments, updates, or changed assumptions about: {core}."
+                    ),
                     stream_name="Recent developments",
                     max_queries=budget.max_queries_per_stream,
                 ),
@@ -1266,7 +1265,7 @@ class HeuristicPlanner(Planner):
                 complexity_factors=complexity_factors,
             ),
             usage=UsageInfo(),
-    )
+        )
 
 
 def _clip_local_prompt(value: str | None, *, limit: int) -> str:
@@ -1282,7 +1281,11 @@ _MARKDOWN_IMAGE_RE = re.compile(r"!\[[^\]]*\]\([^)]+\)")
 _MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]+\)")
 _MARKDOWN_HEADING_BREAK_RE = re.compile(r"\s+(#{1,6}\s+)")
 _INLINE_CHROME_BREAK_RE = re.compile(
-    r"\s+(Home›|Home ›|Sitemap|Open in app|Sign up|Sign in|Member-only story|Share on Twitter|Share on LinkedIn|Share on Mastodon|Read\s+\*\*|The Lead|Key Takeaways|Quick Take)",
+    r"\s+("
+    r"Home\u203a|Home \u203a|Sitemap|Open in app|Sign up|Sign in|Member-only story|"
+    r"Share on Twitter|Share on LinkedIn|Share on Mastodon|Read\s+\*\*|The Lead|"
+    r"Key Takeaways|Quick Take"
+    r")",
     re.IGNORECASE,
 )
 _FRONTMATTER_RE = re.compile(r"^---\s*\n.*?\n---\s*\n", re.DOTALL)
@@ -1295,8 +1298,8 @@ _NAVIGATION_LINE_HINTS = (
     "cookie policy",
     "copyright",
     "get started",
-    "home\") /",
-    "home›",
+    'home") /',
+    "home\u203a",
     "member-only story",
     "navigation",
     "open in app",
@@ -1359,9 +1362,8 @@ def _document_below_stream_trust_floor(
     agent_config: AgentConfig,
     stream_name: str,
 ) -> bool:
-    if (
-        document.retrieval_method == RetrievalMethod.MOCK
-        or bool(document.metadata.get("synthetic"))
+    if document.retrieval_method == RetrievalMethod.MOCK or bool(
+        document.metadata.get("synthetic")
     ):
         return False
     trust_tier_raw = str(document.metadata.get("trust_tier", "") or "").strip().lower()
@@ -1550,15 +1552,11 @@ def _extract_heuristic_facts(document: FetchedDocument) -> tuple[str, list[str]]
         if cleaned_line:
             sentences.append(cleaned_line)
     facts = dedupe_preserve_order(
-        clean_text(sentence)
-        for sentence in sentences
-        if _looks_like_fact(sentence)
+        clean_text(sentence) for sentence in sentences if _looks_like_fact(sentence)
     )[:4]
     if not facts and candidate_corpus:
         fallback_lines = dedupe_preserve_order(
-            clean_text(line)
-            for line in candidate_corpus.splitlines()
-            if _looks_like_fact(line)
+            clean_text(line) for line in candidate_corpus.splitlines() if _looks_like_fact(line)
         )
         facts = fallback_lines[:4]
     plausible_summary = next(
@@ -1571,7 +1569,11 @@ def _extract_heuristic_facts(document: FetchedDocument) -> tuple[str, list[str]]
         ),
         "",
     )
-    summary = facts[0] if facts else plausible_summary or clean_text(document.title or candidate_corpus[:220])
+    summary = (
+        facts[0]
+        if facts
+        else plausible_summary or clean_text(document.title or candidate_corpus[:220])
+    )
     return summary, facts
 
 
@@ -1613,7 +1615,10 @@ def _score_presentable_report_sentence(sentence: str) -> int:
         score += 3
     if not any(hint in lowered for hint in _REPORT_FACT_NOISE_HINTS):
         score += 2
-    if any(token in f" {lowered} " for token in (" is ", " are ", " can ", " should ", " uses ", " use ")):
+    if any(
+        token in f" {lowered} "
+        for token in (" is ", " are ", " can ", " should ", " uses ", " use ")
+    ):
         score += 1
     if ":" in cleaned or "—" in cleaned or "|" in cleaned:
         score -= 1
@@ -1683,7 +1688,10 @@ def _sanitize_report_claim_text(claim: str) -> str:
 
     cleaned = clean_text(claim)
     cleaned = re.sub(
-        r"\b(This (?:draft|report) uses only [^.]*?retrieved (?:arxiv\s+)?records?/?excerpts?):\s*[^.]+\.",
+        (
+            r"\b(This (?:draft|report) uses only [^.]*?retrieved "
+            r"(?:arxiv\s+)?records?/?excerpts?):\s*[^.]+\."
+        ),
         "This report is based on retrieved source excerpts.",
         cleaned,
         flags=re.IGNORECASE,
@@ -1921,7 +1929,10 @@ class OpenAIPlanner(Planner):
                     if providers:
                         seen_urls: set[str] = set()
                         for provider in providers:
-                            if allowed_search is not None and provider.provider_name not in allowed_search:
+                            if (
+                                allowed_search is not None
+                                and provider.provider_name not in allowed_search
+                            ):
                                 continue
                             results = await provider.search(
                                 query,
@@ -2042,9 +2053,7 @@ class OpenAIPlanner(Planner):
             min_total_sources_retrieved=retrieved_floor,
             min_total_cited_sources=cited_floor,
             approved_plan_summary=(
-                approved_plan.model_dump_json(indent=2)
-                if approved_plan is not None
-                else None
+                approved_plan.model_dump_json(indent=2) if approved_plan is not None else None
             ),
             agent_config=agent_config,
         )
@@ -2054,7 +2063,8 @@ class OpenAIPlanner(Planner):
             "Plan the minimum effective work needed to answer the question well.\n"
             "Use short stream names, direct objectives, and compact keyword-style search queries.\n"
             "Treat the budget as an upper bound, not a target.\n"
-            "Respect selected sources, uploaded documents, discovery findings, and approved-plan context.\n"
+            "Respect selected sources, uploaded documents, discovery findings, and "
+            "approved-plan context.\n"
             "Preserve uncertainty and avoid invented claims or sources."
         )
         available_documents_text = (
@@ -2084,7 +2094,8 @@ class OpenAIPlanner(Planner):
                 f"Question:\n{question}\n\n"
                 f"Budget:\n{budget.model_dump_json(indent=2)}\n\n"
                 f"Prior notes:\n{_clip_local_prompt(note_context, limit=1600)}\n\n"
-                f"Retrieved memory:\n{_clip_local_prompt(render_context_pack(context_pack), limit=1800)}\n\n"
+                "Retrieved memory:\n"
+                f"{_clip_local_prompt(render_context_pack(context_pack), limit=1800)}\n\n"
                 f"Planning stage: {planning_stage.value}\n\n"
                 f"Selected sources: {list(source_selection or [])}\n\n"
                 f"Available documents:\n{available_documents_text}\n\n"
@@ -2176,7 +2187,14 @@ class OpenAIPlanner(Planner):
             max_replans=budget.max_replans,
             max_queries_per_stream=min(
                 budget.max_queries_per_stream,
-                max((max(len(stream.queries) for stream in bounded_streams) if bounded_streams else 1), 3),
+                max(
+                    (
+                        max(len(stream.queries) for stream in bounded_streams)
+                        if bounded_streams
+                        else 1
+                    ),
+                    3,
+                ),
             ),
             max_results_per_query=budget.max_results_per_query,
             max_sources_per_stream=budget.max_sources_per_stream,
@@ -2310,9 +2328,8 @@ class OpenAINoteWriter(NoteWriter):
         model_config: ModelConfig | None = None,
         context_pack: ContextPack | None = None,
     ) -> GenerationResult[NoteDraft]:
-        effective_worker_model = (
-            stream.model
-            or (model_config.worker_model if model_config is not None else self.worker_model)
+        effective_worker_model = stream.model or (
+            model_config.worker_model if model_config is not None else self.worker_model
         )
         source_context = build_source_prompt_context(document)
         prompt_bundle = note_writer_system_prompt(
@@ -2496,12 +2513,18 @@ class HeuristicReportWriter(ReportWriter):
         if not sections:
             fallback_claims = [f"No grounded findings were extracted for: {question}."]
             open_questions.extend(
-                question for note in notes for question in note.get("open_questions", []) if question
+                question
+                for note in notes
+                for question in note.get("open_questions", [])
+                if question
             )
             sections.append(
                 ReportSection(
                     title="Findings",
-                    overview=f"The run completed, but the heuristic synthesis stage did not extract grounded findings for {question}.",
+                    overview=(
+                        "The run completed, but the heuristic synthesis stage did not "
+                        f"extract grounded findings for {question}."
+                    ),
                     claims=fallback_claims,
                 )
             )
@@ -3328,7 +3351,9 @@ class ResearchWorker:
                 "source_id": source_id,
                 "title": document.title,
                 "url": str(document.canonical_url),
-                "provider": str(document.metadata.get("provider", self.fetch_provider.provider_name)),
+                "provider": str(
+                    document.metadata.get("provider", self.fetch_provider.provider_name)
+                ),
                 "trust_tier": str(document.metadata.get("trust_tier", "")) or None,
                 "artifact_count": len(list(artifacts or [])),
                 "discovered_via": discovered_via,
@@ -3373,7 +3398,9 @@ class ResearchWorker:
     ) -> dict[str, Any] | None:
         document, artifact_payloads = self._extract_artifact_payloads(document)
         document = self._annotate_document_with_trust(document)
-        document_provider = str(document.metadata.get("provider", self.fetch_provider.provider_name))
+        document_provider = str(
+            document.metadata.get("provider", self.fetch_provider.provider_name)
+        )
         await self._record_request_cost(
             run_id=run_id,
             category="source_fetch",
@@ -3653,7 +3680,9 @@ class ResearchWorker:
             max_queries=budget.max_queries_per_stream,
         )
         query_batch = merged_queries[: budget.max_queries_per_stream]
-        minimum_queries_to_run = min(len(query_batch), max(1, min(3, budget.max_queries_per_stream)))
+        minimum_queries_to_run = min(
+            len(query_batch), max(1, min(3, budget.max_queries_per_stream))
+        )
 
         try:
             for query_index, query in enumerate(query_batch):
@@ -3784,14 +3813,15 @@ class ResearchWorker:
                     continue
                 fetch_started = perf_counter()
                 try:
-                    fetched_document, used_search_fallback = await (
-                        self._fetch_search_result_document(
-                            run_id=run_id,
-                            stream_id=stream_view.id,
-                            result=result,
-                            allowed_fetch=allowed_fetch,
-                            discovered_via="fetch",
-                        )
+                    (
+                        fetched_document,
+                        used_search_fallback,
+                    ) = await self._fetch_search_result_document(
+                        run_id=run_id,
+                        stream_id=stream_view.id,
+                        result=result,
+                        allowed_fetch=allowed_fetch,
+                        discovered_via="fetch",
                     )
                 except Exception as exc:
                     await self.events.publish(
@@ -4140,7 +4170,9 @@ class ResearchWorker:
         for result in selected_results:
             await self._ensure_run_active(run_id)
             selected_canonical_url = normalize_url(str(result.url))
-            existing_source = await self.store.get_run_source_snapshot(run_id, selected_canonical_url)
+            existing_source = await self.store.get_run_source_snapshot(
+                run_id, selected_canonical_url
+            )
             if existing_source is not None:
                 await self.events.publish(
                     run_id,
@@ -4584,7 +4616,9 @@ class ResearchOrchestrator:
             for asset in [*project_assets, *run_assets]
             if asset.processing_status.value == "ready"
         ]
-        source_selection = list((run_state.metadata.get("source_selection") or []) if run_state else [])
+        source_selection = list(
+            (run_state.metadata.get("source_selection") or []) if run_state else []
+        )
         approved_plan = None
         planning_stage = PlanningStage.EXECUTION
         if preview_raw is not None and approval_status == "approved":
@@ -4603,7 +4637,9 @@ class ResearchOrchestrator:
 
         min_total_sources_retrieved, min_total_cited_sources = _derive_source_floor_targets(
             budget=budget,
-            stream_count=len(approved_plan.streams) if approved_plan is not None else max(run_state.latest_plan_version, 1),
+            stream_count=len(approved_plan.streams)
+            if approved_plan is not None
+            else max(run_state.latest_plan_version, 1),
             minimum_retrieved=self.settings.planner_min_total_sources_retrieved,
             minimum_cited=self.settings.planner_min_total_cited_sources,
         )
@@ -4656,7 +4692,11 @@ class ResearchOrchestrator:
             raise RuntimeError(
                 "Execution planning failed validation: " + "; ".join(validation_issues)
             )
-        if preview_raw is not None and approval_status == "approved" and plan.planning_artifact is not None:
+        if (
+            preview_raw is not None
+            and approval_status == "approved"
+            and plan.planning_artifact is not None
+        ):
             preview = PlanPreview.model_validate(preview_raw)
             plan = plan.model_copy(
                 update={
@@ -4676,7 +4716,9 @@ class ResearchOrchestrator:
                 "version": version,
                 "planning_stage": planning_stage.value,
                 "approved_preview_version": (
-                    PlanPreview.model_validate(preview_raw).version if preview_raw is not None else None
+                    PlanPreview.model_validate(preview_raw).version
+                    if preview_raw is not None
+                    else None
                 ),
                 **(plan_result.metadata or {}),
             },
@@ -4879,7 +4921,9 @@ class ResearchOrchestrator:
             for asset in [*project_assets, *run_assets]
             if asset.processing_status.value == "ready"
         ]
-        source_selection = list((run_state.metadata.get("source_selection") or []) if run_state else [])
+        source_selection = list(
+            (run_state.metadata.get("source_selection") or []) if run_state else []
+        )
         prior_plan = await self.store.get_latest_plan(run_id)
         min_total_sources_retrieved, min_total_cited_sources = _derive_source_floor_targets(
             budget=budget,
@@ -5593,8 +5637,4 @@ def _render_output_contract(output_contract: Mapping[str, Any] | None) -> str:
             "- Preserve citation support and uncertainty handling over hitting the "
             "length target exactly."
         )
-    return (
-        "\n".join(lines)
-        if lines
-        else "- Use the default report length and sectioning contract."
-    )
+    return "\n".join(lines) if lines else "- Use the default report length and sectioning contract."

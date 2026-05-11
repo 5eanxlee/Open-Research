@@ -4,8 +4,8 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlparse
 
-from .config import Settings
-from .domain import (
+from open_research.core.config import Settings
+from open_research.core.domain import (
     AgentConfig,
     AnswerStyle,
     CitationDiscipline,
@@ -19,7 +19,7 @@ from .domain import (
     SourceKind,
     SourceTrustTier,
 )
-from .prompt_loader import PromptTemplateLoader
+from open_research.runtime.prompt_loader import PromptTemplateLoader
 
 PROMPT_PROFILE_VERSION = "2026-04-15.2"
 SOURCE_TRUST_POLICY_VERSION = "2026-04-12.1"
@@ -443,12 +443,14 @@ def planner_system_prompt(
     )
     planner_budget_guidance = (
         "Planner budget rules:\n"
-        f"- Use planner model `{planner_model}` to reason about plan shape and worker model `{worker_model}` "
+        f"- Use planner model `{planner_model}` to reason about plan shape and worker "
+        f"model `{worker_model}` "
         "for each research stream unless there is a strong reason not to.\n"
         f"- Treat {min_total_sources_retrieved} retrieved sources and {min_total_cited_sources} "
         "cited sources as minimum floors for a successful deep run unless runtime caps make "
         "that impossible.\n"
-        f"- Use worker model `{worker_model}` for each stream unless there is a strong reason not to.\n"
+        f"- Use worker model `{worker_model}` for each stream unless there is a strong "
+        "reason not to.\n"
         "- The budget metadata is an upper bound, not a target. Choose the number of research "
         "streams and per-stream queries that the plan materially requires, and use available "
         "budget when deeper coverage would reduce miss risk.\n"
@@ -488,16 +490,13 @@ def planner_system_prompt(
         "- The final plan must be executable without another clarification loop unless runtime "
         "explicitly requests one."
     )
-    stage_specific_guidance = (
-        "Stage-specific requirements:\n"
-        + (
-            "- Preview planning is for human approval. Keep the plan operator-readable while still "
-            "identifying the likely workstreams, coverage axes, and budget recommendation."
-            if planning_stage == PlanningStage.PREVIEW
-            else "- Execution planning happens after approval. Treat the approved preview as a "
-            "contract, validate it against discovery findings, and harden it into a final "
-            "execution plan with explicit constraints and query packages."
-        )
+    stage_specific_guidance = "Stage-specific requirements:\n" + (
+        "- Preview planning is for human approval. Keep the plan operator-readable while still "
+        "identifying the likely workstreams, coverage axes, and budget recommendation."
+        if planning_stage == PlanningStage.PREVIEW
+        else "- Execution planning happens after approval. Treat the approved preview as a "
+        "contract, validate it against discovery findings, and harden it into a final "
+        "execution plan with explicit constraints and query packages."
     )
     available_documents_text = (
         "\n".join(f"- {item}" for item in (available_documents or []))
@@ -590,7 +589,9 @@ def note_writer_system_prompt(
         settings=settings,
         role="note_writer",
         template_version=PROMPT_TEMPLATE_VERSIONS["note_writer"],
-        fallback_body=_compose_prompt(role_header, f"Source context:\n{source_text}", source_rules, note_rules),
+        fallback_body=_compose_prompt(
+            role_header, f"Source context:\n{source_text}", source_rules, note_rules
+        ),
         variables={
             "role_header": role_header,
             "source_context": source_text,
@@ -797,7 +798,8 @@ def plan_preview_system_prompt(
     )
     plan_preview_rules = (
         "Plan preview rules:\n"
-        "- Summarize the plan, effective budget, and main evidence lanes without execution detail.\n"
+        "- Summarize the plan, effective budget, and main evidence lanes without "
+        "execution detail.\n"
         "- Emphasize what will be covered, what depth is proposed, and what remains uncertain.\n"
         "- Keep the preview operator-readable and compact."
     )

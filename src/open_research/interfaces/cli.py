@@ -15,7 +15,7 @@ from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.table import Table
 
-from .domain import (
+from open_research.core.domain import (
     AgentConfig,
     AsyncJob,
     BehaviorAssessment,
@@ -30,6 +30,7 @@ from .domain import (
     RunNoteRecord,
     RunStatus,
 )
+
 from .terminal_client import (
     ResearchTerminalClient,
     StreamEnvelope,
@@ -351,13 +352,12 @@ def _run_backend_server(*, host: str, port: int, reload: bool) -> int:
 
     console.print(
         Panel.fit(
-            f"Backend API: {_origin(host, port)}\n"
-            f"Reload: {'on' if reload else 'off'}",
+            f"Backend API: {_origin(host, port)}\nReload: {'on' if reload else 'off'}",
             title="Open Research Backend",
         )
     )
     uvicorn.run(
-        "open_research.main:app",
+        "open_research.server.main:app",
         host=host,
         port=port,
         reload=reload,
@@ -483,9 +483,7 @@ async def _run_config(client: ResearchTerminalClient, *, as_json: bool) -> int:
     )
     table.add_row(
         "Models",
-        ", ".join(
-            f"{key}={value}" for key, value in config.models.model_dump(mode="json").items()
-        ),
+        ", ".join(f"{key}={value}" for key, value in config.models.model_dump(mode="json").items()),
     )
     table.add_row(
         "Default agent config",

@@ -3,8 +3,8 @@ from __future__ import annotations
 import asyncio
 import signal
 
-from .config import get_settings
-from .runtime import ResearchRuntime
+from open_research.core.config import get_settings
+from open_research.runtime import ResearchRuntime
 
 
 async def _run() -> None:

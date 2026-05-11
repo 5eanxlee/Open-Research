@@ -5,8 +5,8 @@ from collections import Counter, defaultdict
 from collections.abc import Iterable, Sequence
 from typing import Any
 
-from .config import Settings
-from .domain import (
+from open_research.core.config import Settings
+from open_research.core.domain import (
     CompletionGateResult,
     CreateRunRequest,
     ResearchOptions,
@@ -16,8 +16,8 @@ from .domain import (
     RunStatus,
     SourceRegistryEntry,
 )
-from .tool_registry import contract_tool_names
-from .utils import normalize_url
+from open_research.core.utils import normalize_url
+from open_research.runtime.tool_registry import contract_tool_names
 
 FORBIDDEN_COMPLETION_PHRASES = (
     "please confirm",

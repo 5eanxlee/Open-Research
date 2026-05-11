@@ -2,14 +2,17 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
 
-from .config import Settings
-from .domain import ToolCatalogEntry
+from open_research.core.config import Settings
+from open_research.core.domain import ToolCatalogEntry
 
 SEARCH_TOOL = "advanced_web_search_tool"
 PAPER_SEARCH_TOOL = "paper_search_tool"
 FETCH_TOOL = "fetch_page"
 THINK_TOOL = "think"
 WRITE_TODOS_TOOL = "write_todos"
+SAVE_RESEARCH_ARTIFACT_TOOL = "save_research_artifact"
+SOURCE_AUDIT_TOOL = "source_audit_tool"
+CITATION_RECONCILIATION_TOOL = "citation_reconciliation_tool"
 
 SEARCH_BUDGET_CATEGORIES = ("search_query", "claim_repair_search")
 FETCH_BUDGET_CATEGORIES = ("source_fetch", "claim_repair_fetch")
@@ -90,6 +93,49 @@ def build_tool_catalog(settings: Settings) -> list[ToolCatalogEntry]:
             risk="low",
             requires_auth=False,
             failure_mode="surface_error",
+        ),
+        ToolCatalogEntry(
+            name=SAVE_RESEARCH_ARTIFACT_TOOL,
+            display_name="Save Research Artifact",
+            category="workspace",
+            owner="orchestrator",
+            description=(
+                "Persists DeepAgents intermediate plans, notes, audits, drafts, and final reports."
+            ),
+            enabled=settings.resolved_artifact_store_backend != "disabled",
+            budget_categories=[],
+            per_run_limit=None,
+            risk="filesystem",
+            requires_auth=False,
+            failure_mode="artifact_storage_disabled_or_surface_error",
+        ),
+        ToolCatalogEntry(
+            name=SOURCE_AUDIT_TOOL,
+            display_name="Source Audit",
+            category="verification",
+            owner="source-auditor-agent",
+            description="Records source quality, provenance, conflict, and diversity observations.",
+            enabled=True,
+            budget_categories=[],
+            per_run_limit=None,
+            risk="low",
+            requires_auth=False,
+            failure_mode="no_op",
+        ),
+        ToolCatalogEntry(
+            name=CITATION_RECONCILIATION_TOOL,
+            display_name="Citation Reconciliation",
+            category="verification",
+            owner="citation-agent",
+            description=(
+                "Checks final draft citations against URLs observed during DeepAgents tool use."
+            ),
+            enabled=True,
+            budget_categories=[],
+            per_run_limit=None,
+            risk="low",
+            requires_auth=False,
+            failure_mode="surface_warning",
         ),
         *[
             ToolCatalogEntry(

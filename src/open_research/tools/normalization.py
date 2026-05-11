@@ -22,6 +22,16 @@ SEARCH_TOOL_NAMES = {"advanced_web_search_tool", "paper_search_tool"}
 
 def normalize_tool_name(name: str) -> str:
     cleaned = name.strip()
+    if "<|channel|>" in cleaned:
+        cleaned = cleaned.split("<|channel|>", maxsplit=1)[0]
+    if "." in cleaned:
+        base = cleaned.split(".", maxsplit=1)[0]
+        if base:
+            cleaned = base
+    if "-" in cleaned:
+        candidate = cleaned.replace("-", "_")
+        if candidate in TOOL_NAME_ALIASES.values() or candidate in SEARCH_TOOL_NAMES:
+            cleaned = candidate
     return TOOL_NAME_ALIASES.get(cleaned, TOOL_NAME_ALIASES.get(cleaned.lower(), cleaned))
 
 

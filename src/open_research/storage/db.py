@@ -35,7 +35,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.pool import StaticPool
 from sqlalchemy.types import TypeDecorator
 
-from .domain import (
+from open_research.core.domain import (
     AgentConfig,
     AnswerStyle,
     ApprovalDecision,
@@ -90,7 +90,7 @@ from .domain import (
     StreamStatus,
     TaskStatus,
 )
-from .utils import clean_text, cosine_similarity, tokenize
+from open_research.core.utils import clean_text, cosine_similarity, tokenize
 
 try:
     from pgvector.sqlalchemy import Vector
@@ -238,7 +238,9 @@ class JobORM(Base):
     submitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    last_heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_heartbeat_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
 
 class ProjectORM(Base):
@@ -309,7 +311,9 @@ class RunConversationMessageORM(Base):
     model: Mapped[str | None] = mapped_column(String(255), nullable=True)
     references_json: Mapped[list[str]] = mapped_column(JSON, default=list)
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, index=True
+    )
 
 
 class PlanSnapshotORM(Base):
@@ -640,11 +644,6 @@ class ResearchStore:
         self.session_factory = session_factory
 
     async def init_db(self, *, bootstrap_mode: str = "create_all") -> None:
-        if bootstrap_mode == "alembic":
-            from .migrations import upgrade_database
-
-            await upgrade_database(self.engine)
-            return
         async with self.engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
             await connection.run_sync(self._apply_schema_patches)
@@ -885,7 +884,9 @@ class ResearchStore:
 
     async def list_projects(self) -> list[ProjectSummary]:
         async with self.session_factory() as session:
-            stmt = select(ProjectORM).order_by(ProjectORM.updated_at.desc(), ProjectORM.created_at.desc())
+            stmt = select(ProjectORM).order_by(
+                ProjectORM.updated_at.desc(), ProjectORM.created_at.desc()
+            )
             rows = (await session.execute(stmt)).scalars().all()
             return [self._project_to_summary(row) for row in rows]
 
@@ -1077,7 +1078,9 @@ class ResearchStore:
             await session.flush()
             return self._research_asset_to_record(promoted)
 
-    async def get_project_detail(self, project_id: str, *, run_limit: int = 100) -> ProjectDetail | None:
+    async def get_project_detail(
+        self, project_id: str, *, run_limit: int = 100
+    ) -> ProjectDetail | None:
         async with self.session_factory() as session:
             project = await session.get(ProjectORM, project_id)
             if project is None:
@@ -1341,14 +1344,18 @@ class ResearchStore:
                     profile_id=run.profile_id,
                     project_id=run.project_id,
                     budget=BudgetPolicy.model_validate(run.budget_json),
-                    requested_budget=_extract_budget(dict(run.metadata_json or {}), "requested_budget"),
+                    requested_budget=_extract_budget(
+                        dict(run.metadata_json or {}), "requested_budget"
+                    ),
                     recommended_budget=_extract_recommended_budget(dict(run.metadata_json or {})),
                     effective_budget=BudgetPolicy.model_validate(run.budget_json),
                     agent_config=_extract_agent_config(dict(run.metadata_json or {})),
                     metadata=dict(run.metadata_json or {}),
                     status=RunStatus(run.status),
                     execution_mode=ExecutionMode(
-                        dict(run.metadata_json or {}).get("execution_mode", ExecutionMode.STANDARD.value)
+                        dict(run.metadata_json or {}).get(
+                            "execution_mode", ExecutionMode.STANDARD.value
+                        )
                     ),
                     approval_status=PlanApprovalStatus(
                         dict(run.metadata_json or {}).get(
@@ -1825,6 +1832,123 @@ class ResearchStore:
             task.status = status.value
             if output_json is not None:
                 task.output_json = output_json
+
+    async def get_or_create_deep_agent_stream(
+        self,
+        run_id: str,
+        *,
+        model: str,
+    ) -> ResearchStreamView:
+        async with self.session_factory() as session, session.begin():
+            stream = await self._get_or_create_deep_agent_stream_orm(
+                session,
+                run_id=run_id,
+                model=model,
+            )
+            await session.flush()
+            return self._stream_to_view(stream)
+
+    async def upsert_deep_agent_task(
+        self,
+        run_id: str,
+        *,
+        stable_key: str,
+        objective: str,
+        status: TaskStatus,
+        agent_role: str,
+        model: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        async with self.session_factory() as session, session.begin():
+            stream = await self._get_or_create_deep_agent_stream_orm(
+                session,
+                run_id=run_id,
+                model=model,
+            )
+            stmt = select(TaskORM).where(
+                TaskORM.run_id == run_id,
+                TaskORM.kind == "deepagents_todo",
+            )
+            tasks = (await session.execute(stmt)).scalars().all()
+            input_json = {
+                "deepagents_todo_key": stable_key,
+                "agent_role": agent_role,
+                **(metadata or {}),
+            }
+            for task in tasks:
+                raw_input = dict(task.input_json or {})
+                if raw_input.get("deepagents_todo_key") != stable_key:
+                    continue
+                task.objective = objective
+                task.status = status.value
+                task.input_json = {**raw_input, **input_json}
+                return task.id
+
+            task_id = str(uuid4())
+            session.add(
+                TaskORM(
+                    id=task_id,
+                    run_id=run_id,
+                    stream_id=stream.id,
+                    kind="deepagents_todo",
+                    objective=objective,
+                    status=status.value,
+                    input_json=input_json,
+                )
+            )
+            return task_id
+
+    async def _get_or_create_deep_agent_stream_orm(
+        self,
+        session: AsyncSession,
+        *,
+        run_id: str,
+        model: str,
+    ) -> ResearchStreamORM:
+        stmt = (
+            select(ResearchStreamORM)
+            .where(
+                ResearchStreamORM.run_id == run_id,
+                ResearchStreamORM.name == "DeepAgents Runtime",
+            )
+            .limit(1)
+        )
+        stream = (await session.execute(stmt)).scalar_one_or_none()
+        if stream is not None:
+            return stream
+
+        snapshot = PlanSnapshotORM(
+            id=str(uuid4()),
+            run_id=run_id,
+            version=0,
+            plan_json={
+                "summary": "DeepAgents runtime working stream.",
+                "hypothesis": "DeepAgents orchestration state is persisted as tasks and notes.",
+                "streams": [
+                    {
+                        "name": "DeepAgents Runtime",
+                        "objective": (
+                            "Persist DeepAgents todos, subagent traces, notes, and artifacts."
+                        ),
+                        "queries": [],
+                        "model": model,
+                    }
+                ],
+                "success_criteria": ["DeepAgents activity is visible in durable workspace state."],
+            },
+        )
+        stream = ResearchStreamORM(
+            id=str(uuid4()),
+            run_id=run_id,
+            plan_snapshot_id=snapshot.id,
+            name="DeepAgents Runtime",
+            objective="Persist DeepAgents todos, subagent traces, notes, and artifacts.",
+            model=model,
+            status=StreamStatus.RUNNING.value,
+        )
+        session.add(snapshot)
+        session.add(stream)
+        return stream
 
     async def create_task_attempt(self, task_id: str, provider: str) -> str:
         attempt_id = str(uuid4())
@@ -2528,9 +2652,7 @@ class ResearchStore:
                     .where(RunConversationMessageORM.run_id == run_id)
                     .order_by(RunConversationMessageORM.created_at.asc())
                 )
-                conversation_messages = (
-                    await session.execute(conversation_stmt)
-                ).scalars().all()
+                conversation_messages = (await session.execute(conversation_stmt)).scalars().all()
                 artifacts_stmt = (
                     select(ArtifactORM)
                     .where(ArtifactORM.run_id == run_id)
@@ -2578,7 +2700,9 @@ class ResearchStore:
                 job_stmt = select(JobORM).where(JobORM.run_id == run_id).limit(1)
                 job = (await session.execute(job_stmt)).scalar_one_or_none()
                 metadata = dict(run.metadata_json or {})
-                run_asset_records = [self._research_asset_to_record(asset) for asset in input_assets]
+                run_asset_records = [
+                    self._research_asset_to_record(asset) for asset in input_assets
+                ]
                 project_asset_records = [
                     self._research_asset_to_record(asset) for asset in project_assets
                 ]
@@ -2591,7 +2715,8 @@ class ResearchStore:
                 asset_processing_errors = [
                     f"{asset.label}: {asset.processing_error}"
                     for asset in effective_assets
-                    if asset.processing_status == AssetProcessingStatus.FAILED and asset.processing_error
+                    if asset.processing_status == AssetProcessingStatus.FAILED
+                    and asset.processing_error
                 ]
 
                 return RunDetail(

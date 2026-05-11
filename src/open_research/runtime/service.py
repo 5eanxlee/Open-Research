@@ -15,22 +15,8 @@ from uuid import uuid4
 
 from sqlalchemy.exc import OperationalError
 
-from .artifacts import build_artifact_store
-from .asset_ingestion import extract_uploaded_file
-from .config import Settings, get_settings
-from .custom_responses import (
-    FORBIDDEN_COMPLETION_PHRASES,
-    build_custom_research_report,
-    create_run_request_from_research_options,
-    evaluate_completion_gate,
-    wait_for_terminal_detail,
-)
-from .db import ResearchStore, create_engine_and_sessionmaker
-from .deep_agents_runtime import (
-    inspect_custom_responses_deep_agent,
-    run_custom_responses_deep_agent_research,
-)
-from .domain import (
+from open_research.core.config import Settings, get_settings
+from open_research.core.domain import (
     AgentConfig,
     ApprovalDecision,
     ApprovalDecisionKind,
@@ -77,36 +63,10 @@ from .domain import (
     is_terminal_run_status,
     resolve_model_config,
 )
-from .events import EventBroker, EventStreamService, RunEventService
-from .memory import (
-    BehaviorJudge,
-    ContextAssembler,
-    MemoryCompiler,
-    merge_feedback_into_preferences,
-)
-from .observability import ResearchTelemetry
-from .pipeline import (
-    HeuristicClaimVerifier,
-    HeuristicGapAnalyzer,
-    HeuristicNoteWriter,
-    HeuristicPlanner,
-    HeuristicReportWriter,
-    OpenAIClaimVerifier,
-    OpenAINoteWriter,
-    OpenAIPlanner,
-    OpenAIReportWriter,
-    ResearchOrchestrator,
-    ResearchWorker,
-    RunCancelledError,
-)
-from .prompting import (
-    PROMPT_PROFILE_VERSION,
-    SOURCE_TRUST_POLICY_VERSION,
-    conversation_system_prompt,
-    prompt_profile_metadata,
-    resolve_agent_config,
-)
-from .providers import (
+from open_research.core.observability import ResearchTelemetry
+from open_research.core.utils import clean_text, derive_conversation_topic
+from open_research.integrations.asset_ingestion import extract_uploaded_file
+from open_research.integrations.providers import (
     BraveSearchProvider,
     BrowserbaseFetchProvider,
     BrowserbaseSessionFetchProvider,
@@ -135,9 +95,51 @@ from .providers import (
     TavilySearchProvider,
     provider_hooks_scope,
 )
-from .tool_registry import build_tool_catalog, contract_tool_names
-from .utils import clean_text, derive_conversation_topic
-from .workspace import build_run_workspace_snapshot
+from open_research.runtime.custom_responses import (
+    FORBIDDEN_COMPLETION_PHRASES,
+    build_custom_research_report,
+    create_run_request_from_research_options,
+    evaluate_completion_gate,
+    wait_for_terminal_detail,
+)
+from open_research.runtime.deep_agents import (
+    inspect_custom_responses_deep_agent,
+    inspect_research_deep_agent,
+    run_custom_responses_deep_agent_research,
+    run_deep_agent_research_for_existing_run,
+)
+from open_research.runtime.events import EventBroker, EventStreamService, RunEventService
+from open_research.runtime.memory import (
+    BehaviorJudge,
+    ContextAssembler,
+    MemoryCompiler,
+    merge_feedback_into_preferences,
+)
+from open_research.runtime.pipeline import (
+    HeuristicClaimVerifier,
+    HeuristicGapAnalyzer,
+    HeuristicNoteWriter,
+    HeuristicPlanner,
+    HeuristicReportWriter,
+    OpenAIClaimVerifier,
+    OpenAINoteWriter,
+    OpenAIPlanner,
+    OpenAIReportWriter,
+    ResearchOrchestrator,
+    ResearchWorker,
+    RunCancelledError,
+)
+from open_research.runtime.prompting import (
+    PROMPT_PROFILE_VERSION,
+    SOURCE_TRUST_POLICY_VERSION,
+    conversation_system_prompt,
+    prompt_profile_metadata,
+    resolve_agent_config,
+)
+from open_research.runtime.tool_registry import build_tool_catalog, contract_tool_names
+from open_research.runtime.workspace import build_run_workspace_snapshot
+from open_research.storage.artifacts import build_artifact_store
+from open_research.storage.db import ResearchStore, create_engine_and_sessionmaker
 
 
 class WorkflowEngine(Protocol):
@@ -237,10 +239,11 @@ def _validate_maximal_research_path(settings: Settings) -> None:
         errors.append("Search backend must be explicitly configured with a real provider.")
     if settings.fetch_backend in {"auto", "mock"} or settings.resolved_fetch_backend == "mock":
         errors.append("Fetch backend must be explicitly configured with a real provider.")
-    if (
-        settings.embedding_backend in {"auto", "disabled", "mock"}
-        or settings.resolved_embedding_backend not in {"openai", "openai_compatible"}
-    ):
+    if settings.embedding_backend in {
+        "auto",
+        "disabled",
+        "mock",
+    } or settings.resolved_embedding_backend not in {"openai", "openai_compatible"}:
         errors.append("Embedding backend must be explicitly configured with a real provider.")
     if settings.resolved_reranker_backend != "sentence_transformers":
         errors.append("Reranker backend must be sentence_transformers.")
@@ -381,7 +384,9 @@ def _normalize_user_question(question: str) -> str:
     return cleaned
 
 
-def _render_asset_block(title: str, assets: list[ResearchAssetRecord], *, include_content: bool) -> str:
+def _render_asset_block(
+    title: str, assets: list[ResearchAssetRecord], *, include_content: bool
+) -> str:
     if not assets:
         return ""
     lines = [title]
@@ -519,7 +524,8 @@ def _heuristic_follow_up_reply(
         sections.append(summary)
     else:
         sections.append(
-            "I do not have a clean summary paragraph for this completed run, so I am answering from the grounded passages that were retrieved."
+            "I do not have a clean summary paragraph for this completed run, so I am "
+            "answering from the grounded passages that were retrieved."
         )
 
     if highlights:
@@ -1051,7 +1057,11 @@ def _expand_report_locally(markdown: str, citations: list[CitationRecord]) -> st
             f"{source_reference}".strip()
         ),
     ]
-    if sources and "## Sources" not in sanitized_markdown and "## Citations" not in sanitized_markdown:
+    if (
+        sources
+        and "## Sources" not in sanitized_markdown
+        and "## Citations" not in sanitized_markdown
+    ):
         expansion.extend(["", "## Sources", "", *sources])
     rendered = "\n".join(part for part in expansion if part is not None).strip()
     while len(rendered) < 2200:
@@ -1091,7 +1101,9 @@ class RunCoordinator:
             staged_assets = await self.runtime.store.list_staged_assets(request.staged_asset_ids)
             if len(staged_assets) != len(request.staged_asset_ids):
                 found_ids = {asset.id for asset in staged_assets}
-                missing = [asset_id for asset_id in request.staged_asset_ids if asset_id not in found_ids]
+                missing = [
+                    asset_id for asset_id in request.staged_asset_ids if asset_id not in found_ids
+                ]
                 raise ValueError(
                     "Some staged assets could not be found: " + ", ".join(sorted(missing))
                 )
@@ -1133,8 +1145,8 @@ class RunCoordinator:
             if requires_approval
             else PlanApprovalStatus.NOT_REQUIRED.value
         )
-        metadata["clarifier_config"] = (
-            (request.clarifier_config or ClarifierConfig()).model_dump(mode="json")
+        metadata["clarifier_config"] = (request.clarifier_config or ClarifierConfig()).model_dump(
+            mode="json"
         )
         metadata["model_config"] = model_config.model_dump(mode="json")
         if normalized_question != clean_text(request.question):
@@ -1163,9 +1175,7 @@ class RunCoordinator:
         )
         input_assets: list[ResearchAssetRecord] = []
         for asset in request.input_assets:
-            input_assets.append(
-                await self.runtime.store.save_research_asset(asset, run_id=run.id)
-            )
+            input_assets.append(await self.runtime.store.save_research_asset(asset, run_id=run.id))
         if request.staged_asset_ids:
             input_assets.extend(
                 await self.runtime.store.materialize_staged_assets_to_run(
@@ -1178,7 +1188,9 @@ class RunCoordinator:
             project_id=request.project_id,
         )
         ready_assets = [
-            asset for asset in effective_assets if asset.processing_status == AssetProcessingStatus.READY
+            asset
+            for asset in effective_assets
+            if asset.processing_status == AssetProcessingStatus.READY
         ]
         effective_question = _augment_question_with_assets(
             normalized_question,
@@ -1193,10 +1205,14 @@ class RunCoordinator:
                 "staged_asset_ids": list(request.staged_asset_ids),
                 "effective_question": effective_question,
                 "planning_context_asset_count": sum(
-                    1 for asset in ready_assets if asset.usage == ResearchAssetUsage.PLANNING_CONTEXT
+                    1
+                    for asset in ready_assets
+                    if asset.usage == ResearchAssetUsage.PLANNING_CONTEXT
                 ),
                 "reference_asset_count": sum(
-                    1 for asset in ready_assets if asset.usage == ResearchAssetUsage.REFERENCE_SOURCE
+                    1
+                    for asset in ready_assets
+                    if asset.usage == ResearchAssetUsage.REFERENCE_SOURCE
                 ),
                 "asset_processing_errors": _asset_error_messages(effective_assets),
             },
@@ -1557,11 +1573,32 @@ class WorkerExecutor:
                         question=question,
                         assets=ready_reference_assets,
                     )
-                await self.runtime.orchestrator.execute(
-                    run_id=run_id,
-                    question=question,
-                    budget=budget,
-                )
+                deep_agent_status = inspect_research_deep_agent(self.runtime.settings)
+                if deep_agent_status.available:
+                    await run_deep_agent_research_for_existing_run(
+                        runtime=self.runtime,
+                        run_id=run_id,
+                        question=question,
+                        budget=budget,
+                    )
+                else:
+                    if self.runtime.settings.resolved_research_runtime_backend == "deepagents":
+                        await self.runtime.events.publish(
+                            run_id,
+                            "deepagents.runtime.unavailable",
+                            {
+                                "backend": deep_agent_status.backend,
+                                "missing_dependencies": list(
+                                    deep_agent_status.missing_dependencies
+                                ),
+                                "llm_backend": self.runtime.settings.resolved_llm_backend,
+                            },
+                        )
+                    await self.runtime.orchestrator.execute(
+                        run_id=run_id,
+                        question=question,
+                        budget=budget,
+                    )
         except RunCancelledError as exc:
             await self.finalize_cancelled_run(run_id, reason=str(exc))
         except asyncio.CancelledError:
@@ -1980,7 +2017,7 @@ class ResearchRuntime:
             if settings.temporal_target_url is None:
                 raise ValueError("TEMPORAL_TARGET_URL must be configured for Temporal mode.")
             try:
-                from .temporal_backend import TemporalWorkflowBackend
+                from open_research.runtime.temporal import TemporalWorkflowBackend
             except ImportError as exc:
                 raise ValueError(
                     "Temporal dependencies are not installed. Install the temporal extra to "
@@ -2054,10 +2091,7 @@ class ResearchRuntime:
             detail,
             events=await self.list_events(run_id),
             tasks=await self.store.list_tasks(run_id),
-            notes=[
-                RunNoteRecord.model_validate(note)
-                for note in await self.list_notes(run_id)
-            ],
+            notes=[RunNoteRecord.model_validate(note) for note in await self.list_notes(run_id)],
             passages=await self.list_passages(run_id),
         )
 
@@ -2076,7 +2110,9 @@ class ResearchRuntime:
         if detail is None:
             raise KeyError(f"Run {run_id} not found")
         if detail.final_report is None or not detail.final_report.markdown.strip():
-            raise ValueError("Conversation is only available after the research run has a final report.")
+            raise ValueError(
+                "Conversation is only available after the research run has a final report."
+            )
 
         user_message = await self.store.save_conversation_message(
             run_id=run_id,
@@ -2280,8 +2316,14 @@ class ResearchRuntime:
         passages = await self.store.search_passages(detail.id, user_message.content, limit=6)
         notes = await self.store.list_notes(detail.id)
         local_ollama_mode = _use_local_ollama_conversation_mode(self.settings)
-        recent_messages = detail.conversation_messages[-4:] if local_ollama_mode else detail.conversation_messages[-8:]
-        plan_summary = detail.latest_plan.summary if detail.latest_plan is not None else "No saved plan."
+        recent_messages = (
+            detail.conversation_messages[-4:]
+            if local_ollama_mode
+            else detail.conversation_messages[-8:]
+        )
+        plan_summary = (
+            detail.latest_plan.summary if detail.latest_plan is not None else "No saved plan."
+        )
         source_lines = [
             f"- {passage['source_title']}: {str(passage['text'])[:500]}"
             for passage in passages[: (3 if local_ollama_mode else 6)]
@@ -2314,16 +2356,23 @@ class ResearchRuntime:
             settings=self.settings,
             agent_config=agent_config,
         )
-        conversation_history = "\n".join(
-            f"{message.role.value}: {message.content}" for message in recent_messages
-        ) or "No prior follow-up conversation."
+        conversation_history = (
+            "\n".join(f"{message.role.value}: {message.content}" for message in recent_messages)
+            or "No prior follow-up conversation."
+        )
         report_limit = 2500 if local_ollama_mode else 8000
         note_block = chr(10).join(note_lines) or "- none"
         source_block = chr(10).join(source_lines) or "- none"
+        final_report_text = (
+            _clip_text(detail.final_report.markdown, limit=report_limit)
+            if detail.final_report
+            else ""
+        )
         user_prompt = (
             f"Original research question:\n{detail.question}\n\n"
             f"Approved / latest plan summary:\n{plan_summary}\n\n"
-            f"Final report:\n{_clip_text(detail.final_report.markdown, limit=report_limit) if detail.final_report else ''}\n\n"
+            "Final report:\n"
+            f"{final_report_text}\n\n"
             f"Recent follow-up conversation:\n{conversation_history}\n\n"
             f"Relevant note summaries:\n{note_block}\n\n"
             f"Retrieved passages for this follow-up:\n{source_block}\n\n"
@@ -2444,7 +2493,9 @@ class ResearchRuntime:
             if description:
                 asset = asset.model_copy(update={"description": description})
             records.append(
-                await self.store.save_research_asset(asset, project_id=project_id, metadata=metadata)
+                await self.store.save_research_asset(
+                    asset, project_id=project_id, metadata=metadata
+                )
             )
         return records
 
@@ -2507,9 +2558,7 @@ class ResearchRuntime:
             else []
         )
         run_assets = (
-            await self.store.list_research_assets(run_id=run_id)
-            if run_id is not None
-            else []
+            await self.store.list_research_assets(run_id=run_id) if run_id is not None else []
         )
         return [*project_assets, *run_assets]
 
@@ -2610,11 +2659,7 @@ class ResearchRuntime:
         unknown = [entry_id for entry_id in selected if entry_id not in available]
         if unknown:
             raise ValueError(f"Unknown source selection entries: {', '.join(sorted(unknown))}")
-        unavailable = [
-            entry_id
-            for entry_id in selected
-            if not available[entry_id].configured
-        ]
+        unavailable = [entry_id for entry_id in selected if not available[entry_id].configured]
         if unavailable:
             raise ValueError(
                 "Selected sources are not configured for this deployment: "
@@ -2646,11 +2691,12 @@ class ResearchRuntime:
             return True
         if execution_mode != ExecutionMode.STANDARD:
             return False
-        source_selection_is_custom = (
-            user_supplied_sources
-            and sorted(source_selection) != sorted(self.default_source_selection())
+        source_selection_is_custom = user_supplied_sources and sorted(source_selection) != sorted(
+            self.default_source_selection()
         )
-        if not any((user_supplied_budget, source_selection_is_custom, user_supplied_model_override)):
+        if not any(
+            (user_supplied_budget, source_selection_is_custom, user_supplied_model_override)
+        ):
             return False
         return (
             requested_budget.max_streams >= 8
@@ -2699,7 +2745,9 @@ class ResearchRuntime:
                             "What outcome, must-cover angles, or hard constraints should the "
                             "deep plan optimize for?"
                         ),
-                        rationale="Clarification changes plan shape, stream count, and search depth.",
+                        rationale=(
+                            "Clarification changes plan shape, stream count, and search depth."
+                        ),
                         required=True,
                     )
                 ],
@@ -2724,7 +2772,9 @@ class ResearchRuntime:
                 },
             )
             return await self.get_run_detail(run_id)
-        await self._generate_plan_preview(run_id=run_id, question=question, requested_budget=requested_budget)
+        await self._generate_plan_preview(
+            run_id=run_id, question=question, requested_budget=requested_budget
+        )
         return await self.get_run_detail(run_id)
 
     async def _generate_plan_preview(
@@ -2749,7 +2799,9 @@ class ResearchRuntime:
             project_id=detail.project_id,
         )
         ready_assets = [
-            asset for asset in effective_assets if asset.processing_status == AssetProcessingStatus.READY
+            asset
+            for asset in effective_assets
+            if asset.processing_status == AssetProcessingStatus.READY
         ]
         plan_result = await self.orchestrator.planner.create_plan(
             clarified_question,
@@ -2990,6 +3042,7 @@ class ResearchRuntime:
                 "search": self.settings.resolved_search_backend,
                 "fetch": self.settings.resolved_fetch_backend,
                 "workflow": self.workflow_backend_name,
+                "research_runtime": self.settings.resolved_research_runtime_backend,
                 "embedding": self.settings.resolved_embedding_backend,
                 "reranker": self.settings.resolved_reranker_backend,
             },
@@ -3014,7 +3067,9 @@ class ResearchRuntime:
                 "supports_debug_console": self.settings.debug_console_enabled,
                 "supports_projects": True,
                 "supports_langgraph_runtime": True,
+                "supports_deepagents_research_runtime": True,
                 "langgraph_topology": _langgraph_topology(),
+                "deepagents_research_runtime": asdict(inspect_research_deep_agent(self.settings)),
                 "supports_custom_responses_runtime": True,
                 "custom_responses_deepagents_runtime": (
                     asdict(inspect_custom_responses_deep_agent(self.settings))
@@ -3024,7 +3079,9 @@ class ResearchRuntime:
                     "tool_names": [
                         *contract_tool_names(self.settings),
                     ],
-                    "enabled_tool_names": [entry.name for entry in available_tools if entry.enabled],
+                    "enabled_tool_names": [
+                        entry.name for entry in available_tools if entry.enabled
+                    ],
                     "completion_gate": {
                         "min_chars": self.settings.completion_gate_min_chars,
                         "min_headings": self.settings.completion_gate_min_headings,

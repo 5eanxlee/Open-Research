@@ -95,37 +95,37 @@ const DRAWER_META: Record<
   project: {
     eyebrow: "Context",
     title: "Project context",
-    description: "Projects and run inputs.",
+    description: "Choose a project and attach files that should guide a run.",
   },
   settings: {
     eyebrow: "Settings",
     title: "Agent behavior",
-    description: "Behavior and connection.",
+    description: "Start from a preset, then adjust behavior only when needed.",
   },
   workflow: {
     eyebrow: "Workflow",
     title: "Execution and policy",
-    description: "Execution mode and approval.",
+    description: "Clarification, approval, and output policy controls.",
   },
   sources: {
     eyebrow: "Sources",
     title: "Source registry",
-    description: "Search, fetch, and tools.",
+    description: "Select search surfaces and inspect available research tools.",
   },
   budget: {
     eyebrow: "Configuration",
     title: "Run configuration",
-    description: "Depth, query, source, and report targets.",
+    description: "Use a preset or tune depth, source caps, and report length.",
   },
   models: {
     eyebrow: "Models",
     title: "Model selection",
-    description: "Model overrides.",
+    description: "Keep deployment defaults or temporarily override model routing.",
   },
   profile: {
     eyebrow: "Profile",
     title: "Profile and memory",
-    description: "Memory and preferences.",
+    description: "Preferences and memory influence for future research.",
   },
 };
 
@@ -832,7 +832,7 @@ export function ResearchDashboard({ initialProjectId }: ResearchDashboardProps) 
         <nav className="hero-actions" aria-label="Run configuration">
           {HEADER_DRAWERS.map(({ key, label, icon: Icon }) => (
             <button
-              aria-label={`Open ${label.toLowerCase()} drawer`}
+              aria-label={`Open ${label.toLowerCase()} panel`}
               aria-pressed={activeDrawer === key}
               className={`config-action ${activeDrawer === key ? "active" : ""}`}
               key={key}
@@ -1215,59 +1215,73 @@ export function ResearchDashboard({ initialProjectId }: ResearchDashboardProps) 
       >
         {activeDrawer ? (
           <Dialog.Portal>
-          <Dialog.Overlay className="drawer-backdrop" />
-          <Dialog.Content className="drawer">
-            <div className="drawer-header">
-              <div>
-                <p className="eyebrow">{DRAWER_META[activeDrawer].eyebrow}</p>
-                <Dialog.Title className="panel-title">
-                  {DRAWER_META[activeDrawer].title}
-                </Dialog.Title>
-                <Dialog.Description className="drawer-lead">
-                  {DRAWER_META[activeDrawer].description}
-                </Dialog.Description>
+            <Dialog.Overlay className="drawer-backdrop" />
+            <Dialog.Content className="drawer config-modal">
+              <div className="drawer-header">
+                <div>
+                  <p className="eyebrow">{DRAWER_META[activeDrawer].eyebrow}</p>
+                  <Dialog.Title className="panel-title">
+                    {DRAWER_META[activeDrawer].title}
+                  </Dialog.Title>
+                  <Dialog.Description className="drawer-lead">
+                    {DRAWER_META[activeDrawer].description}
+                  </Dialog.Description>
+                </div>
+                <Dialog.Close asChild>
+                  <button
+                    className="drawer-close"
+                    type="button"
+                    aria-label="Close configuration panel"
+                  >
+                    <X aria-hidden size={14} strokeWidth={2} />
+                  </button>
+                </Dialog.Close>
               </div>
-              <Dialog.Close asChild>
-                <button
-                  className="drawer-close"
-                  type="button"
-                  aria-label="Close drawer"
-                >
-                  <X aria-hidden size={14} strokeWidth={2} />
-                  <span>Close</span>
-                </button>
-              </Dialog.Close>
-            </div>
-            <div className="drawer-body">
-              {activeDrawer === "project" ? (
-                <ProjectPanel
-                  publicConfig={publicConfigQuery.data}
-                  onProjectChange={handleSelectProject}
-                />
-              ) : null}
-              {activeDrawer === "settings" ? (
-                <SettingsDrawerPanel
-                  publicConfig={publicConfigQuery.data}
-                  onOpenPanel={(panel) => setActiveDrawer(panel)}
-                />
-              ) : null}
-              {activeDrawer === "workflow" ? (
-                <WorkflowDrawerPanel publicConfig={publicConfigQuery.data} />
-              ) : null}
-              {activeDrawer === "sources" ? (
-                <SourcesDrawerPanel publicConfig={publicConfigQuery.data} />
-              ) : null}
-              {activeDrawer === "budget" ? (
-                <BudgetDrawerPanel publicConfig={publicConfigQuery.data} />
-              ) : null}
-              {activeDrawer === "models" ? (
-                <ModelsDrawerPanel publicConfig={publicConfigQuery.data} />
-              ) : null}
-              {activeDrawer === "profile" ? (
-                <ProfileDrawerPanel publicConfig={publicConfigQuery.data} />
-              ) : null}
-            </div>
-          </Dialog.Content>
+              <div className="drawer-modal-switcher" role="tablist" aria-label="Configuration panels">
+                {HEADER_DRAWERS.map(({ key, label, icon: Icon }) => (
+                  <button
+                    aria-selected={activeDrawer === key}
+                    className={`drawer-modal-tab ${activeDrawer === key ? "active" : ""}`}
+                    key={key}
+                    onClick={() => setActiveDrawer(key)}
+                    role="tab"
+                    type="button"
+                  >
+                    <Icon aria-hidden size={14} strokeWidth={1.9} />
+                    <span>{label}</span>
+                  </button>
+                ))}
+              </div>
+              <div className="drawer-body">
+                {activeDrawer === "project" ? (
+                  <ProjectPanel
+                    publicConfig={publicConfigQuery.data}
+                    onProjectChange={handleSelectProject}
+                  />
+                ) : null}
+                {activeDrawer === "settings" ? (
+                  <SettingsDrawerPanel
+                    publicConfig={publicConfigQuery.data}
+                    onOpenPanel={(panel) => setActiveDrawer(panel)}
+                  />
+                ) : null}
+                {activeDrawer === "workflow" ? (
+                  <WorkflowDrawerPanel publicConfig={publicConfigQuery.data} />
+                ) : null}
+                {activeDrawer === "sources" ? (
+                  <SourcesDrawerPanel publicConfig={publicConfigQuery.data} />
+                ) : null}
+                {activeDrawer === "budget" ? (
+                  <BudgetDrawerPanel publicConfig={publicConfigQuery.data} />
+                ) : null}
+                {activeDrawer === "models" ? (
+                  <ModelsDrawerPanel publicConfig={publicConfigQuery.data} />
+                ) : null}
+                {activeDrawer === "profile" ? (
+                  <ProfileDrawerPanel publicConfig={publicConfigQuery.data} />
+                ) : null}
+              </div>
+            </Dialog.Content>
           </Dialog.Portal>
         ) : null}
       </Dialog.Root>

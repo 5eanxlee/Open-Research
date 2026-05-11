@@ -3,8 +3,8 @@ from __future__ import annotations
 from collections.abc import Sequence
 from html import escape
 
-from open_research.domain import SearchResult
-from open_research.providers import ProviderError, SearchProvider
+from open_research.core.domain import SearchResult
+from open_research.integrations.providers import ProviderError, SearchProvider
 
 from .normalization import truncate_search_query
 

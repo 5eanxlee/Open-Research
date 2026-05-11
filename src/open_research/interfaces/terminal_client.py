@@ -8,7 +8,7 @@ from typing import Any
 
 import httpx
 
-from .domain import (
+from open_research.core.domain import (
     AgentConfig,
     ArtifactRecord,
     AsyncJob,

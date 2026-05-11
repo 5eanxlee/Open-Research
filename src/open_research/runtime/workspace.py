@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from .domain import (
+from open_research.core.domain import (
     ApprovalDecision,
     CitationAuditDecision,
     CitationSupportLabel,
@@ -35,7 +35,7 @@ from .domain import (
     WorkspaceStreamView,
     WorkspaceTaskView,
 )
-from .utils import normalize_url
+from open_research.core.utils import normalize_url
 
 PHASE_ORDER: list[WorkspacePhaseKey] = [
     WorkspacePhaseKey.INTAKE,
@@ -269,14 +269,19 @@ def _build_phases(detail: RunDetail, events: list[RunEvent]) -> list[WorkspacePh
                 completed_at=last_by_phase.get(phase)
                 if status in {WorkspacePhaseStatus.COMPLETE, WorkspacePhaseStatus.FAILED}
                 else None,
-                blocked_reason=blocked_reason if phase == current and status in {WorkspacePhaseStatus.BLOCKED, WorkspacePhaseStatus.FAILED} else None,
+                blocked_reason=blocked_reason
+                if phase == current
+                and status in {WorkspacePhaseStatus.BLOCKED, WorkspacePhaseStatus.FAILED}
+                else None,
                 event_count=counts.get(phase, 0),
             )
         )
     return phase_states
 
 
-def _build_approval_history(events: list[RunEvent], latest: ApprovalDecision | None) -> list[ApprovalDecision]:
+def _build_approval_history(
+    events: list[RunEvent], latest: ApprovalDecision | None
+) -> list[ApprovalDecision]:
     history: list[ApprovalDecision] = []
     for event in events:
         decision = None
@@ -345,7 +350,11 @@ def _build_tasks(
         latest_source_titles = [
             str(event.payload.get("title") or "Untitled source") for event in source_events[-3:]
         ]
-        latest_tool_call = source_events[-1].event_type if source_events else (search_events[-1].event_type if search_events else None)
+        latest_tool_call = (
+            source_events[-1].event_type
+            if source_events
+            else (search_events[-1].event_type if search_events else None)
+        )
         latest_note = (notes_by_stream.get(stream_id) or [None])[-1]
         last_decision = None
         for event in reversed(stream_events):
@@ -369,16 +378,29 @@ def _build_tasks(
             task_type=task["kind"],
             objective=task["objective"],
             status=status,
-            query_count=len((task.get("input_json") or {}).get("queries") or []) or len(search_events),
+            query_count=len((task.get("input_json") or {}).get("queries") or [])
+            or len(search_events),
             selected_source_count=len(source_events),
             notes_produced=len(notes_by_stream.get(stream_id) or []),
             elapsed_ms=(
-                max(int((streams_by_id.get(stream_id).elapsed_ms if stream_id in streams_by_id else 0) or 0), 0)
+                max(
+                    int(
+                        (
+                            streams_by_id.get(stream_id).elapsed_ms
+                            if stream_id in streams_by_id
+                            else 0
+                        )
+                        or 0
+                    ),
+                    0,
+                )
                 if stream_id in streams_by_id
                 else None
             ),
             started_at=task.get("created_at"),
-            completed_at=task.get("updated_at") if status in {TaskStatus.COMPLETED.value, TaskStatus.FAILED.value} else None,
+            completed_at=task.get("updated_at")
+            if status in {TaskStatus.COMPLETED.value, TaskStatus.FAILED.value}
+            else None,
             next_action=(
                 "Awaiting more sources"
                 if status == TaskStatus.RUNNING.value and not source_events
@@ -411,8 +433,10 @@ def _build_tasks(
         latest_source_titles = [
             str(event.payload.get("title") or "Untitled source") for event in source_events[-3:]
         ]
-        latest_tool_call = source_events[-1].event_type if source_events else (
-            search_events[-1].event_type if search_events else None
+        latest_tool_call = (
+            source_events[-1].event_type
+            if source_events
+            else (search_events[-1].event_type if search_events else None)
         )
         latest_note = (notes_by_stream.get(stream_id) or [None])[-1]
         last_decision = None
@@ -484,7 +508,9 @@ def _build_streams(
         if not isinstance(stream_id, str):
             continue
         if event.event_type == "source.fetched":
-            source_titles_by_stream[stream_id].append(str(event.payload.get("title") or "Untitled source"))
+            source_titles_by_stream[stream_id].append(
+                str(event.payload.get("title") or "Untitled source")
+            )
         elif event.event_type == "search.performed":
             query_count_by_stream[stream_id] += 1
 
@@ -517,7 +543,9 @@ def _build_streams(
     return streams
 
 
-def _build_decisions(events: list[RunEvent], streams_by_id: dict[str, Any]) -> list[WorkspaceDecisionView]:
+def _build_decisions(
+    events: list[RunEvent], streams_by_id: dict[str, Any]
+) -> list[WorkspaceDecisionView]:
     decisions: list[WorkspaceDecisionView] = []
     for event in events:
         category: WorkspaceDecisionCategory | None = None
@@ -538,15 +566,94 @@ def _build_decisions(events: list[RunEvent], streams_by_id: dict[str, Any]) -> l
         elif event.event_type == "stream.created":
             category = WorkspaceDecisionCategory.STREAM_LAUNCH
             title = "Research stream launched"
-            rationale = str(event.payload.get("objective") or "A stream was added to execute the plan.")
+            rationale = str(
+                event.payload.get("objective") or "A stream was added to execute the plan."
+            )
         elif event.event_type == "replan.started":
             category = WorkspaceDecisionCategory.REPLAN
             title = "Replan triggered"
             rationale = str(event.payload.get("rationale") or "Coverage gaps triggered a replan.")
+        elif event.event_type == "deepagents.runtime.started":
+            category = WorkspaceDecisionCategory.PLANNING
+            title = "DeepAgents research loop started"
+            topology = event.payload.get("agent_topology") or []
+            rationale = (
+                "DeepAgents orchestrator selected with " + f"{len(topology)} configured roles."
+            )
+        elif event.event_type == "deepagents.plan.parsed":
+            category = WorkspaceDecisionCategory.PLANNING
+            title = "DeepAgents plan persisted"
+            rationale = (
+                f"Parsed {int(event.payload.get('stream_count') or 0)} streams "
+                f"and {int(event.payload.get('query_count') or 0)} queries."
+            )
+        elif event.event_type == "deepagents.plan.parse_failed":
+            category = WorkspaceDecisionCategory.REPLAN
+            title = "DeepAgents planner artifact kept raw"
+            rationale = str(event.payload.get("error") or "Planner JSON could not be parsed.")
+        elif event.event_type == "deepagents.todo.synced":
+            category = WorkspaceDecisionCategory.STREAM_LAUNCH
+            title = "DeepAgents todo synced"
+            rationale = str(event.payload.get("objective") or "A todo was persisted as a task.")
+        elif event.event_type == "deepagents.agent.started":
+            category = WorkspaceDecisionCategory.PLANNING
+            title = "DeepAgents subagent started"
+            rationale = str(
+                event.payload.get("prompt_summary")
+                or event.payload.get("agent_role")
+                or "A subagent delegation started."
+            )
+        elif event.event_type == "deepagents.agent.completed":
+            category = WorkspaceDecisionCategory.VERIFICATION
+            title = "DeepAgents subagent completed"
+            rationale = str(event.payload.get("agent_role") or "A subagent delegation completed.")
+        elif event.event_type == "deepagents.agent.failed":
+            category = WorkspaceDecisionCategory.REPLAN
+            title = "DeepAgents subagent failed"
+            rationale = str(event.payload.get("error") or "A subagent delegation failed.")
+        elif event.event_type == "deepagents.think.recorded":
+            category = WorkspaceDecisionCategory.VERIFICATION
+            title = "DeepAgents thinking checkpoint"
+            rationale = str(event.payload.get("thought") or "A reasoning checkpoint was recorded.")
+        elif event.event_type == "deepagents.source_audit.recorded":
+            category = WorkspaceDecisionCategory.SOURCE_SELECTION
+            title = "Source audit recorded"
+            rationale = str(event.payload.get("observation") or "Source quality was reviewed.")
+        elif event.event_type == "deepagents.citation.reconciled":
+            category = WorkspaceDecisionCategory.AUDIT
+            title = "Citation reconciliation completed"
+            warning_count = int(event.payload.get("warning_count") or 0)
+            rationale = (
+                "Citation reconciliation passed."
+                if warning_count == 0
+                else f"Citation reconciliation found {warning_count} warning(s)."
+            )
+        elif event.event_type == "deepagents.grounding.started":
+            category = WorkspaceDecisionCategory.VERIFICATION
+            title = "DeepAgents grounding started"
+            rationale = (
+                "The final DeepAgents draft entered deterministic claim and citation grounding."
+            )
+        elif event.event_type == "deepagents.grounding.completed":
+            category = WorkspaceDecisionCategory.AUDIT
+            title = "DeepAgents grounding completed"
+            rationale = (
+                f"Grounded {int(event.payload.get('citation_count') or 0)} citations "
+                f"with {int(event.payload.get('unsupported_claim_count') or 0)} unsupported claims."
+            )
+        elif event.event_type == "deepagents.grounding.failed":
+            category = WorkspaceDecisionCategory.REPLAN
+            title = "DeepAgents grounding fell back"
+            rationale = str(
+                event.payload.get("error") or "Grounding failed and fallback audit continued."
+            )
         elif event.event_type == "citation.verified":
             category = WorkspaceDecisionCategory.VERIFICATION
             title = "Claim verified"
-            rationale = str(event.payload.get("reason") or "Claim support was verified against retrieved evidence.")
+            rationale = str(
+                event.payload.get("reason")
+                or "Claim support was verified against retrieved evidence."
+            )
         elif event.event_type == "claim.repair.completed":
             category = WorkspaceDecisionCategory.CLAIM_REPAIR
             title = "Claim repair completed"
@@ -555,7 +662,9 @@ def _build_decisions(events: list[RunEvent], streams_by_id: dict[str, Any]) -> l
             category = WorkspaceDecisionCategory.AUDIT
             title = "Citation removed"
             reasons = event.payload.get("reasons") or []
-            rationale = ", ".join(str(reason) for reason in reasons) or "Citation audit removed a citation."
+            rationale = (
+                ", ".join(str(reason) for reason in reasons) or "Citation audit removed a citation."
+            )
         if category is None or title is None or rationale is None:
             continue
         stream_id = event.payload.get("stream_id")
@@ -580,13 +689,17 @@ def _build_decisions(events: list[RunEvent], streams_by_id: dict[str, Any]) -> l
                     if event.payload.get("section_title")
                     else None
                 ),
-                affected_claim=str(event.payload.get("claim")) if event.payload.get("claim") else None,
+                affected_claim=str(event.payload.get("claim"))
+                if event.payload.get("claim")
+                else None,
                 confidence=(
                     float(event.payload["confidence"])
                     if isinstance(event.payload.get("confidence"), (int, float))
                     else None
                 ),
-                uncertainty=None if support_label != CitationSupportLabel.UNSUPPORTED else "Unsupported claim",
+                uncertainty=None
+                if support_label != CitationSupportLabel.UNSUPPORTED
+                else "Unsupported claim",
                 supporting_evidence_count=int(event.payload.get("supporting_evidence_count") or 0),
                 timestamp=event.created_at,
                 metadata=event.payload,
@@ -627,7 +740,9 @@ def _build_report_sections(
     events: list[RunEvent],
 ) -> tuple[list[WorkspaceReportSectionView], list[WorkspaceCitationView]]:
     parsed = _parse_report_sections(detail.final_report_markdown)
-    claim_views_by_section: dict[str, dict[tuple[str, int], WorkspaceReportClaimView]] = defaultdict(dict)
+    claim_views_by_section: dict[str, dict[tuple[str, int], WorkspaceReportClaimView]] = (
+        defaultdict(dict)
+    )
     citations_by_key: dict[tuple[str, str], WorkspaceCitationView] = {}
     citation_numbers_by_key: dict[tuple[str, str], int] = {}
     if detail.final_report is not None:
@@ -647,16 +762,26 @@ def _build_report_sections(
             continue
         section_title = str(event.payload.get("section_title") or "Overview")
         claim = str(event.payload.get("claim") or "")
-        ordinal = int(event.payload.get("ordinal") or len(claim_views_by_section[section_title]) + 1)
+        ordinal = int(
+            event.payload.get("ordinal") or len(claim_views_by_section[section_title]) + 1
+        )
         support_label = _extract_support_label(
             str(event.payload.get("support_label")) if event.payload.get("support_label") else None
         )
-        resolved_source_id, resolved_source_title, resolved_source_url = _resolve_workspace_citation_source(
-            claim=claim,
-            source_id=str(event.payload.get("source_id")) if event.payload.get("source_id") else None,
-            source_title=str(event.payload.get("source_title")) if event.payload.get("source_title") else None,
-            source_url=str(event.payload.get("source_url")) if event.payload.get("source_url") else None,
-            source_entries=detail.source_registry_entries,
+        resolved_source_id, resolved_source_title, resolved_source_url = (
+            _resolve_workspace_citation_source(
+                claim=claim,
+                source_id=str(event.payload.get("source_id"))
+                if event.payload.get("source_id")
+                else None,
+                source_title=str(event.payload.get("source_title"))
+                if event.payload.get("source_title")
+                else None,
+                source_url=str(event.payload.get("source_url"))
+                if event.payload.get("source_url")
+                else None,
+                source_entries=detail.source_registry_entries,
+            )
         )
         claim_views_by_section[section_title][(claim, ordinal)] = WorkspaceReportClaimView(
             section_title=section_title,
@@ -684,7 +809,9 @@ def _build_report_sections(
             source_id=resolved_source_id,
             source_title=resolved_source_title,
             source_url=resolved_source_url,
-            citation_key=str(event.payload.get("citation_key")) if event.payload.get("citation_key") else None,
+            citation_key=str(event.payload.get("citation_key"))
+            if event.payload.get("citation_key")
+            else None,
             support_label=support_label,
             quote=str(event.payload.get("quote")) if event.payload.get("quote") else None,
             confidence=(
@@ -726,7 +853,14 @@ def _build_report_sections(
             metadata=audit.metadata,
         )
         section_claims = claim_views_by_section[audit.section_title]
-        existing_claim = next((claim_view for claim_view in section_claims.values() if claim_view.claim == audit.claim), None)
+        existing_claim = next(
+            (
+                claim_view
+                for claim_view in section_claims.values()
+                if claim_view.claim == audit.claim
+            ),
+            None,
+        )
         if existing_claim is not None:
             existing_claim.removed_citation_count += 1
         else:
@@ -753,17 +887,25 @@ def _build_report_sections(
             section_map[section_title] = section
         ordered_claims = sorted(claims.values(), key=lambda claim: claim.ordinal)
         section.claims = ordered_claims
-        section.grounded_claim_count = sum(1 for claim in ordered_claims if claim.support_label not in {None, CitationSupportLabel.UNSUPPORTED})
+        section.grounded_claim_count = sum(
+            1
+            for claim in ordered_claims
+            if claim.support_label not in {None, CitationSupportLabel.UNSUPPORTED}
+        )
         section.unsupported_claim_count = sum(
             1
             for claim in ordered_claims
             if claim.support_label in {None, CitationSupportLabel.UNSUPPORTED}
         )
         section.citation_count = sum(claim.citation_count for claim in ordered_claims)
-        section.removed_citation_count = sum(claim.removed_citation_count for claim in ordered_claims)
+        section.removed_citation_count = sum(
+            claim.removed_citation_count for claim in ordered_claims
+        )
         section.claim_repair_count = sum(1 for claim in ordered_claims if claim.claim_repair_ran)
 
-    return parsed.sections, sorted(citations_by_key.values(), key=lambda item: (item.section_title, item.claim, item.status))
+    return parsed.sections, sorted(
+        citations_by_key.values(), key=lambda item: (item.section_title, item.claim, item.status)
+    )
 
 
 def _build_sources(
@@ -811,7 +953,11 @@ def _build_sources(
                 provider=entry.provider,
                 trust_tier=_extract_trust_tier(metadata.get("trust_tier")),
                 stream_ids=stream_ids,
-                stream_names=[stream_name_by_id[stream_id] for stream_id in stream_ids if stream_id in stream_name_by_id],
+                stream_names=[
+                    stream_name_by_id[stream_id]
+                    for stream_id in stream_ids
+                    if stream_id in stream_name_by_id
+                ],
                 report_sections=sorted(citation_sections_by_source.get(source_id or "", set())),
                 citation_status=citation_status_by_source.get(source_id or ""),
                 survived_final_citation=entry.survived_final_citation,

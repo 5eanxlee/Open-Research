@@ -44,7 +44,7 @@ class Settings(BaseSettings):
         "playwright",
     ] = "auto"
     workflow_backend: Literal["auto", "local", "temporal"] = "auto"
-    database_bootstrap_mode: Literal["auto", "create_all", "alembic"] = "auto"
+    database_bootstrap_mode: Literal["auto", "create_all"] = "auto"
     artifact_store_backend: Literal["auto", "disabled", "local", "s3"] = "auto"
     embedding_backend: Literal["auto", "disabled", "mock", "openai", "openai_compatible"] = "auto"
     reranker_backend: Literal["auto", "disabled", "heuristic", "sentence_transformers"] = "auto"
@@ -177,6 +177,7 @@ class Settings(BaseSettings):
     prompt_reload_in_dev: bool = True
     prompt_externalization_enabled: bool = True
     custom_responses_runtime_backend: Literal["auto", "pipeline", "deepagents"] = "auto"
+    research_runtime_backend: Literal["auto", "langgraph", "deepagents", "hybrid"] = "auto"
     deep_plan_approval_enabled: bool = True
     source_registry_ui_enabled: bool = True
     async_jobs_enabled: bool = True
@@ -196,6 +197,12 @@ class Settings(BaseSettings):
     planner_validation_enabled: bool = True
     planner_max_validation_retries: int = 2
     planner_discovery_concurrency: int = 3
+    deepagents_max_research_batches: int = 6
+    deepagents_require_critic_pass: bool = True
+    deepagents_require_source_audit_pass: bool = True
+    deepagents_require_citation_pass: bool = True
+    deepagents_grounding_enabled: bool = True
+    deepagents_grounding_strict: bool = False
     completion_gate_min_chars: int = 2000
     completion_gate_min_headings: int = 2
     completion_gate_max_attempts: int = 5
@@ -336,6 +343,19 @@ class Settings(BaseSettings):
         return "pipeline"
 
     @property
+    def resolved_research_runtime_backend(self) -> Literal["langgraph", "deepagents", "hybrid"]:
+        if self.research_runtime_backend != "auto":
+            return self.research_runtime_backend
+        if (
+            self.resolved_llm_backend == "openai"
+            and _looks_like_openai_key(self.openai_api_key)
+            and importlib.util.find_spec("deepagents") is not None
+            and importlib.util.find_spec("langchain_openai") is not None
+        ):
+            return "hybrid"
+        return "langgraph"
+
+    @property
     def resolved_search_backend(self) -> Literal["mock", "openai", "brave", "exa", "tavily"]:
         if self.search_backend != "auto":
             return self.search_backend
@@ -368,10 +388,10 @@ class Settings(BaseSettings):
         return "temporal" if self.temporal_target_url else "local"
 
     @property
-    def resolved_database_bootstrap_mode(self) -> Literal["create_all", "alembic"]:
+    def resolved_database_bootstrap_mode(self) -> Literal["create_all"]:
         if self.database_bootstrap_mode != "auto":
             return self.database_bootstrap_mode
-        return "alembic" if self.database_url.startswith("postgresql+") else "create_all"
+        return "create_all"
 
     @property
     def resolved_artifact_store_backend(self) -> Literal["disabled", "local", "s3"]:
